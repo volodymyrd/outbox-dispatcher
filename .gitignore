@@ -1,2 +1,7 @@
 .DS_Strore
 .idea
+
+
+# Added by cargo
+
+/target
