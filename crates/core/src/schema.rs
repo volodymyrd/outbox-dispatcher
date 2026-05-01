@@ -7,26 +7,44 @@ use uuid::Uuid;
 /// Raw row from `outbox_events` as fetched by the scheduler.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RawEvent {
+    /// Internal monotonic ID used for cursor-based polling.
     pub id: i64,
+    /// Stable external identifier for the event.
     pub event_id: Uuid,
+    /// The event type version (e.g., "user.signup.v1").
     pub kind: String,
+    /// Category, class, or domain model of the entity (e.g., "user", "order").
+    /// Namespaces the `aggregate_id` to prevent collisions across domains.
     pub aggregate_type: String,
+    /// Unique ID of the specific aggregate instance (e.g., the specific user's UUID).
+    /// Combined with `aggregate_type`, this enables efficient "All events for X" queries
+    /// and allows receivers to enforce strict chronological ordering per entity.
     pub aggregate_id: Uuid,
+    /// The actual event data.
     pub payload: serde_json::Value,
+    /// Contextual information (request IDs, actor context).
     pub metadata: serde_json::Value,
+    /// Array of callback definitions to be expanded.
     pub callbacks: serde_json::Value,
+    /// The user or system that triggered the event.
     pub actor_id: Option<Uuid>,
+    /// Used to link events in a distributed trace.
     pub correlation_id: Option<Uuid>,
+    /// The event that directly caused this event.
     pub causation_id: Option<Uuid>,
+    /// When the event was originally written.
     pub created_at: DateTime<Utc>,
     /// Computed in SQL as `octet_length(payload::text)::bigint`.
     pub payload_size_bytes: i64,
 }
 
+/// Determines how the dispatcher decides if a delivery is finished.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CompletionMode {
+    /// Delivery is done as soon as the receiver returns HTTP 2xx.
     Managed,
+    /// Delivery stays "pending" after HTTP 2xx until the receiver explicitly completes it.
     External,
 }
 
@@ -48,25 +66,40 @@ impl std::fmt::Display for CompletionMode {
 /// One delivery target attached to an event, parsed from `outbox_events.callbacks`.
 #[derive(Debug, Clone)]
 pub struct CallbackTarget {
+    /// Unique name within the event's callback list (e.g., "send_welcome_email").
     pub name: String,
+    /// The destination HTTPS URL.
     pub url: String,
+    /// Whether this is a managed or external-completion callback.
     pub mode: CompletionMode,
+    /// ID used to look up the HMAC secret for signing.
     pub signing_key_id: Option<String>,
+    /// Custom non-reserved HTTP headers to include in the request.
     pub headers: HashMap<String, String>,
+    /// Maximum number of retries before dead-lettering.
     pub max_attempts: u32,
+    /// List of durations to wait between successive retries.
     pub backoff: Vec<Duration>,
+    /// Hard timeout for the HTTP request itself.
     pub timeout: Duration,
+    /// Optional window for external completion before auto-redelivery.
     pub external_completion_timeout: Option<Duration>,
+    /// Max cycles the external-timeout sweeper will run before dead-lettering.
     pub max_completion_cycles: u32,
 }
 
 /// A delivery row joined with its parent event data, ready to be dispatched.
 #[derive(Debug, Clone)]
 pub struct DueDelivery {
+    /// The ID of the specific delivery attempt row.
     pub delivery_id: i64,
+    /// The ID of the source event.
     pub event_id: Uuid,
+    /// Number of times we have attempted this specific delivery.
     pub attempts: i32,
+    /// The parsed configuration for this specific target.
     pub target: CallbackTarget,
+    /// Event metadata used to construct the webhook headers and body.
     pub kind: String,
     pub aggregate_type: String,
     pub aggregate_id: Uuid,
@@ -78,7 +111,7 @@ pub struct DueDelivery {
     pub created_at: DateTime<Utc>,
 }
 
-/// The payload passed to `Callback::deliver`.
+/// The standardized payload passed to `Callback::deliver`.
 #[derive(Debug, Clone)]
 pub struct EventForDelivery {
     pub delivery_id: i64,
@@ -86,7 +119,10 @@ pub struct EventForDelivery {
     pub kind: String,
     pub callback_name: String,
     pub mode: CompletionMode,
+    /// Category of the aggregate this event belongs to.
     pub aggregate_type: String,
+    /// Unique ID of the specific aggregate instance. Receivers can use this
+    /// for internal routing or to acquire a lock before processing the payload.
     pub aggregate_id: Uuid,
     pub payload: serde_json::Value,
     pub metadata: serde_json::Value,
@@ -94,18 +130,22 @@ pub struct EventForDelivery {
     pub correlation_id: Option<Uuid>,
     pub causation_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    /// The current attempt index (1-based).
     pub attempt: i32,
 }
 
 /// Cursor + limit for admin list endpoints.
 #[derive(Debug, Clone, Default)]
 pub struct PageParams {
+    /// Number of items to return.
     pub limit: i64,
-    /// Opaque cursor: last seen delivery id (for keyset pagination, results < cursor).
+    /// Keyset pagination cursor (delivery ID).
     pub cursor: Option<i64>,
+    /// Optional filter by callback name.
     pub callback_name: Option<String>,
 }
 
+/// Administrative view for a dead-lettered delivery.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct DeadLetterRow {
     pub delivery_id: i64,
@@ -119,6 +159,7 @@ pub struct DeadLetterRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Administrative view for an external-mode delivery awaiting completion.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct ExternalPendingRow {
     pub delivery_id: i64,
@@ -130,6 +171,7 @@ pub struct ExternalPendingRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Full raw state of a delivery row.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct DeliveryRow {
     pub id: i64,
@@ -148,13 +190,14 @@ pub struct DeliveryRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Detailed aggregate view for admin troubleshooting.
 #[derive(Debug, Clone, Serialize)]
 pub struct EventWithDeliveries {
     pub event: RawEventSerializable,
     pub deliveries: Vec<DeliveryRow>,
 }
 
-/// A serializable view of `RawEvent` (omits `payload_size_bytes`).
+/// Serialized view of an event, suitable for API responses.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct RawEventSerializable {
     pub id: i64,
@@ -171,18 +214,22 @@ pub struct RawEventSerializable {
     pub created_at: DateTime<Utc>,
 }
 
-/// Counts returned by the external-completion timeout sweeper.
+/// Metrics report from the external-completion timeout sweeper.
 #[derive(Debug, Default)]
 pub struct SweepReport {
+    /// Number of deliveries reset to pending.
     pub reset: u64,
+    /// Number of deliveries moved to dead-letter after cycle exhaustion.
     pub exhausted: u64,
 }
 
-/// The only error variant from a callback — every failure is transient.
+/// The standardized error returned by delivery implementations.
 #[derive(Debug)]
 pub enum CallbackError {
+    /// A failure that should be retried according to the backoff policy.
     Transient {
         reason: String,
+        /// Suggestion from the receiver on when to try again (e.g. Retry-After).
         retry_after: Option<Duration>,
     },
 }
