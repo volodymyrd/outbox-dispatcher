@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE outbox_deliveries\n            SET dead_letter = TRUE,\n                last_error  = 'abandoned by operator'\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "44877e79574248e7b5620dc619ed58cb20bd87b30734799fc326ab2572ca0716"
+}

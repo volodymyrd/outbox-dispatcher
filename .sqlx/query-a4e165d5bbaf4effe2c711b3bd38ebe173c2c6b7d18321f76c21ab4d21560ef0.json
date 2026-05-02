@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE outbox_deliveries\n            SET processed_at = COALESCE(processed_at, now())\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a4e165d5bbaf4effe2c711b3bd38ebe173c2c6b7d18321f76c21ab4d21560ef0"
+}

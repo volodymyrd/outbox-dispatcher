@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE outbox_deliveries\n            SET locked_until    = $1,\n                attempts        = attempts + 1,\n                last_attempt_at = now()\n            WHERE id            = $2\n              AND (locked_until IS NULL OR locked_until < now())\n              AND dispatched_at IS NULL\n              AND dead_letter   = FALSE\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a24bc3e7c2b93e627ac6bcf011d2f65c5665a6607402f1d33c4b6b1872226d86"
+}

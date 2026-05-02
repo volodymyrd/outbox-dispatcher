@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO outbox_deliveries\n                    (event_id, callback_name, completion_mode, available_at)\n                VALUES ($1, $2, $3, now())\n                ON CONFLICT (event_id, callback_name) DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c3b1fb386d562e193c1358682dc21e5bdf88d652e00e7d55e6da0d51bf614768"
+}
