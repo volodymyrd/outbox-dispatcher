@@ -49,15 +49,35 @@ cargo sort --workspace
 | `crates/bin/src/main.rs`              | CLI entry point, migration runner, service bootstrap                   |
 | `migrations/0001_initial_schema.sql`  | Complete V1 schema                                                     |
 
-## Running migrations (requires DATABASE_URL)
+## Local database (Docker)
 
 ```bash
-# Full URL format: postgres://user:password@host:5432/dbname
-DATABASE_URL=postgres://... cargo run -- migrate
-DATABASE_URL=postgres://... cargo run              # starts service (migrations run automatically)
-DATABASE_URL=postgres://... cargo run -- --skip-migrations  # skip migrations on startup
-cargo run -- migrations dump                       # print embedded SQL to stdout
-RUST_LOG=debug cargo run                           # verbose logging
+docker compose up -d                    # start Postgres on port 5434
+docker compose down                     # stop
+```
+
+Credentials are in `.env` (gitignored). Copy from `.env.example` if needed:
+`DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher`
+
+## Running migrations
+
+```bash
+DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher cargo run -- migrate
+DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher cargo run
+DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher cargo run -- --skip-migrations
+cargo run -- migrations dump            # print embedded SQL to stdout
+RUST_LOG=debug cargo run               # verbose logging
+```
+
+## sqlx offline mode
+
+The `.sqlx/` directory contains cached query metadata and is checked into version control.
+Builds without `DATABASE_URL` use it automatically (`SQLX_OFFLINE=true`).
+
+After adding or changing any sqlx query macro, regenerate the cache:
+
+```bash
+DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher cargo sqlx prepare --workspace
 ```
 
 ## Integration tests (Phases 2+)
@@ -90,8 +110,7 @@ cargo test --test '*'
 - `CallbackError` has **only** the `Transient` variant — no permanent failures.
 - `signing_key_id` is resolved at **dispatch time**, not schedule time (tolerates deploy skew).
 - `locked_until` prevents duplicate dispatch across replicas; committed before the HTTP call.
-- **sqlx offline mode**: Phase 1 uses runtime queries (`sqlx::query_as::<_, T>()`). Offline mode (`.sqlx/` dir +
-  `SQLX_OFFLINE=true`) will be configured once a test database is available.
+- **sqlx offline mode**: `.sqlx/` cache is checked in; builds work without `DATABASE_URL`. Regenerate after any query change with `cargo sqlx prepare --workspace`.
 
 ### Comments
 
