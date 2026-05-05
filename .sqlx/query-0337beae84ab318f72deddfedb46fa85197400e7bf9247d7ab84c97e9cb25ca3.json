@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH to_update AS (\n                SELECT\n                    d.id,\n                    d.completion_cycles,\n                    d.dispatched_at,\n                    d.available_at,\n                    d.attempts,\n                    cb_match.max_cycles\n                FROM outbox_deliveries d\n                JOIN outbox_events e ON e.event_id = d.event_id\n                JOIN LATERAL (\n                    SELECT\n                        (cb->>'external_completion_timeout_seconds')::int AS timeout_s,\n                        COALESCE((cb->>'max_completion_cycles')::int, $2) AS max_cycles\n                    FROM jsonb_array_elements(e.callbacks) cb\n                    WHERE cb->>'name' = d.callback_name\n                    LIMIT 1\n                ) cb_match ON cb_match.timeout_s IS NOT NULL\n                WHERE d.completion_mode = 'external'\n                  AND d.dispatched_at   IS NOT NULL\n                  AND d.processed_at    IS NULL\n                  AND d.dead_letter     = FALSE\n                  AND d.dispatched_at + (cb_match.timeout_s || ' seconds')::interval < $1\n            )\n            UPDATE outbox_deliveries\n            SET completion_cycles = to_update.completion_cycles + 1,\n                dispatched_at = CASE\n                    WHEN to_update.completion_cycles + 1 >= to_update.max_cycles\n                    THEN to_update.dispatched_at\n                    ELSE NULL\n                END,\n                available_at = CASE\n                    WHEN to_update.completion_cycles + 1 >= to_update.max_cycles\n                    THEN to_update.available_at\n                    ELSE $1\n                END,\n                attempts = CASE\n                    WHEN to_update.completion_cycles + 1 >= to_update.max_cycles\n                    THEN to_update.attempts\n                    ELSE 0\n                END,\n                last_error = CASE\n                    WHEN to_update.completion_cycles + 1 >= to_update.max_cycles\n                    THEN 'external_completion_cycles_exhausted'\n                    ELSE NULL\n                END,\n                dead_letter  = (to_update.completion_cycles + 1 >= to_update.max_cycles),\n                locked_until = NULL\n            FROM to_update\n            WHERE outbox_deliveries.id = to_update.id\n            RETURNING outbox_deliveries.id AS \"id!\", outbox_deliveries.dead_letter AS \"dead_letter!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "dead_letter!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "0337beae84ab318f72deddfedb46fa85197400e7bf9247d7ab84c97e9cb25ca3"
+}

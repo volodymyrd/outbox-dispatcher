@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                d.id           AS delivery_id,\n                d.event_id,\n                d.attempts,\n                d.callback_name,\n                e.kind,\n                e.aggregate_type,\n                e.aggregate_id,\n                e.payload,\n                e.metadata,\n                e.actor_id,\n                e.correlation_id,\n                e.causation_id,\n                e.created_at,\n                e.callbacks\n            FROM outbox_deliveries d\n            JOIN outbox_events e USING (event_id)\n            WHERE d.dispatched_at IS NULL\n              AND d.processed_at  IS NULL\n              AND d.dead_letter   = FALSE\n              AND d.available_at  <= now()\n              AND (d.locked_until IS NULL OR d.locked_until < now())\n            ORDER BY d.available_at, d.id\n            LIMIT $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "delivery_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "event_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "callback_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "aggregate_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "aggregate_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "payload",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 8,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 9,
+        "name": "actor_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "correlation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 11,
+        "name": "causation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "callbacks",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "1fc7849eb50be10e9f4e96abfe5f650c8f828ae9f611953168faa5dbb560abc8"
+}

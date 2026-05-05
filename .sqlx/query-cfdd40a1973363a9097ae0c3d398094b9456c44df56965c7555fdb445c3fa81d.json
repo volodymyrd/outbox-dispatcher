@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE outbox_deliveries\n            SET last_error   = $2,\n                available_at = $3,\n                dead_letter  = $4,\n                locked_until = NULL\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Timestamptz",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cfdd40a1973363a9097ae0c3d398094b9456c44df56965c7555fdb445c3fa81d"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE outbox_deliveries\n            SET dispatched_at = now(),\n                processed_at  = now(),\n                locked_until  = NULL\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "13bb955962d599a2b335efb8b133a6423cb474415638e778fcb2eff982b9b176"
+}
