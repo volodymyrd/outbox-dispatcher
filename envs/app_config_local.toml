@@ -1,0 +1,13 @@
+# Local developer machine overrides (APP_ENV=local).
+# DATABASE_URL should be set in .env or shell.
+
+[database]
+max_connections = 5
+
+[dispatch]
+allow_insecure_urls = true
+allow_unsigned_callbacks = true
+
+[log]
+format = "pretty"
+filter = "debug,sqlx=warn,outbox_dispatcher=debug,outbox_dispatcher_core=debug"

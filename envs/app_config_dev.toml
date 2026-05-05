@@ -1,0 +1,9 @@
+# Remote development environment overrides (APP_ENV=dev).
+# DATABASE_URL is expected from the deployment environment.
+
+[database]
+max_connections = 10
+
+[log]
+format = "json"
+filter = "info,outbox_dispatcher=debug,outbox_dispatcher_core=debug"

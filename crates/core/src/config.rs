@@ -135,22 +135,67 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// Load config by layering:
-    /// 1. `{dir}/app_config.toml` (base, required)
-    /// 2. `{dir}/app_config_{env}.toml` (env-specific, optional)
-    /// 3. `APP__*` environment variables (e.g. `APP__DATABASE__MAX_CONNECTIONS`)
-    /// 4. `DATABASE_URL` env var overrides `database.url`
+    /// Load config by layering (later sources override earlier ones):
+    /// 1. `{dir}/app_config.toml` — base defaults, required
+    /// 2. `{dir}/app_config_{env}.toml` — environment overrides, optional
+    /// 3. `.env.toml` — local secrets (gitignored), optional
+    /// 4. `APP__*` environment variables (e.g. `APP__DATABASE__URL`)
     ///
     /// `dir` defaults to `"envs"` but can be overridden via `APP_CONFIG_DIR`.
+    /// `DATABASE_URL` is also accepted as a conventional env var alias for `database.url`.
     pub fn load(env: &str) -> Result<Self, config::ConfigError> {
         let dir = std::env::var("APP_CONFIG_DIR").unwrap_or_else(|_| "envs".into());
         config::Config::builder()
             .add_source(config::File::with_name(&format!("{dir}/app_config")))
             .add_source(config::File::with_name(&format!("{dir}/app_config_{env}")).required(false))
+            .add_source(config::File::with_name(".env.toml").required(false))
             .add_source(config::Environment::with_prefix("APP").separator("__"))
             .set_override_option("database.url", std::env::var("DATABASE_URL").ok())?
             .build()?
             .try_deserialize()
+    }
+
+    /// Validate the loaded config and return all problems as a list of human-readable messages.
+    ///
+    /// Call this immediately after [`Self::load`] before starting the service so operators
+    /// get a clear, actionable error instead of a cryptic low-level failure later.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if self.database.url.trim().is_empty() {
+            errors.push(
+                "database.url is not set — provide it via the DATABASE_URL env var \
+                 or APP__DATABASE__URL"
+                    .to_string(),
+            );
+        }
+        if self.database.max_connections == 0 {
+            errors.push("database.max_connections must be > 0".to_string());
+        }
+        if self.dispatch.batch_size <= 0 {
+            errors.push("dispatch.batch_size must be > 0".to_string());
+        }
+        if self.dispatch.max_attempts == 0 {
+            errors.push("dispatch.max_attempts must be > 0".to_string());
+        }
+        if self.dispatch.backoff_secs.is_empty() {
+            errors.push("dispatch.backoff_secs must contain at least one value".to_string());
+        }
+        if self.dispatch.external_timeout_sweep_interval_secs < 10 {
+            errors.push("dispatch.external_timeout_sweep_interval_secs must be >= 10".to_string());
+        }
+        if self.dispatch.payload_size_limit_bytes < 1024 {
+            errors.push("dispatch.payload_size_limit_bytes must be >= 1024 (1 KB)".to_string());
+        }
+        if self.log.filter.trim().is_empty() {
+            errors.push("log.filter must not be empty".to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -395,5 +440,112 @@ filter = "info"
             .unwrap();
 
         assert_eq!(cfg.database.url, "postgres://from-env/db");
+    }
+
+    // ── validate() tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_passes_for_valid_config() {
+        let cfg = build_config(full_toml());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_database_url() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.url = String::new();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("database.url")));
+    }
+
+    #[test]
+    fn test_validate_whitespace_database_url() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.url = "   ".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("database.url")));
+    }
+
+    #[test]
+    fn test_validate_zero_max_connections() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.max_connections = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("max_connections")));
+    }
+
+    #[test]
+    fn test_validate_zero_batch_size() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.batch_size = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("batch_size")));
+    }
+
+    #[test]
+    fn test_validate_zero_max_attempts() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_attempts = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("max_attempts")));
+    }
+
+    #[test]
+    fn test_validate_empty_backoff_secs() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.backoff_secs = vec![];
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("backoff_secs")));
+    }
+
+    #[test]
+    fn test_validate_empty_log_filter() {
+        let mut cfg = build_config(full_toml());
+        cfg.log.filter = String::new();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("log.filter")));
+    }
+
+    #[test]
+    fn test_validate_sweep_interval_below_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.external_timeout_sweep_interval_secs = 9;
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("external_timeout_sweep_interval_secs"))
+        );
+    }
+
+    #[test]
+    fn test_validate_sweep_interval_at_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.external_timeout_sweep_interval_secs = 10;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_payload_size_below_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.payload_size_limit_bytes = 1023;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("payload_size_limit_bytes")));
+    }
+
+    #[test]
+    fn test_validate_payload_size_at_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.payload_size_limit_bytes = 1024;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_collects_multiple_errors() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.url = String::new();
+        cfg.database.max_connections = 0;
+        cfg.dispatch.batch_size = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.len() >= 3);
     }
 }

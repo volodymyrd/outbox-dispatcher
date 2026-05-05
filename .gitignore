@@ -1,6 +1,7 @@
 .DS_Strore
 .idea
 .env
+.env.toml
 
 
 # Added by cargo

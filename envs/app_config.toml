@@ -1,0 +1,24 @@
+# Base configuration — shared across all environments.
+# Set database.url via the DATABASE_URL env var or APP__DATABASE__URL.
+
+[database]
+url = ""
+max_connections = 10
+
+[dispatch]
+poll_interval_secs = 5
+batch_size = 50
+max_attempts = 6
+backoff_secs = [30, 120, 600, 3600, 21600, 86400]
+handler_timeout_secs = 30
+lock_buffer_secs = 10
+external_timeout_sweep_interval_secs = 60
+max_completion_cycles = 20
+payload_size_limit_bytes = 1048576
+notify_channel = "outbox_events_new"
+allow_insecure_urls = false
+allow_unsigned_callbacks = false
+
+[log]
+format = "json"
+filter = "info"
