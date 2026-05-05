@@ -44,9 +44,16 @@ cargo sort --workspace
 |---------------------------------------|------------------------------------------------------------------------|
 | `crates/core/src/repo.rs`             | `Repo` trait definition + full `PgRepo` impl                           |
 | `crates/core/src/schema.rs`           | All public data types (`RawEvent`, `CallbackTarget`, `DueDelivery`, …) |
+| `crates/core/src/error.rs`            | `Error` enum + `Result<T>` alias for the core crate                    |
 | `crates/core/src/retry.rs`            | `compute_next_available_at` (backoff + jitter)                         |
+| `crates/core/src/dispatch.rs`         | Dispatch loop (Phase 4 stub)                                           |
+| `crates/core/src/scheduler.rs`        | LISTEN/NOTIFY scheduler (Phase 3 stub)                                 |
+| `crates/core/src/timeout_sweep.rs`    | External-completion timeout sweeper (Phase 5 stub)                     |
 | `crates/http-callback/src/signing.rs` | HMAC-SHA256 `sign` + constant-time `verify`                            |
+| `crates/http-callback/src/client.rs`  | reqwest webhook client (Phase 4 stub)                                  |
 | `crates/bin/src/main.rs`              | CLI entry point, migration runner, service bootstrap                   |
+| `crates/admin-api/src/routes.rs`      | Admin HTTP routes (Phase 6 stub)                                       |
+| `crates/admin-api/src/auth.rs`        | Bearer-token middleware via `subtle` constant-time compare (Phase 6)   |
 | `migrations/0001_initial_schema.sql`  | Complete V1 schema                                                     |
 
 ## Local database (Docker)
@@ -56,8 +63,21 @@ docker compose up -d                    # start Postgres on port 5434
 docker compose down                     # stop
 ```
 
-Credentials are in `.env` (gitignored). Copy from `.env.example` if needed:
+Credentials are in `.env.toml` (gitignored). Copy the template comments from `.env.toml` itself:
 `DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher`
+
+## Configuration
+
+Config is loaded in three layers (highest priority last wins):
+
+| File | Required | Purpose |
+|------|----------|---------|
+| `envs/app_config.toml` | Yes | Base defaults for all envs |
+| `envs/app_config_{APP_ENV}.toml` | No | Per-env overrides (`APP_ENV` defaults to `local`) |
+| `.env.toml` | No | Local secrets — gitignored, never commit |
+
+`APP_ENV` selects the environment layer (`local` / `dev` / `prod`).
+Set `database.url` via `.env.toml` or the `DATABASE_URL` env var.
 
 ## Running migrations
 
@@ -145,7 +165,7 @@ cargo test --test '*'
 
 ### Testing
 
-- Unit tests use `mockall` (mock traits via `#[automock]`)
+- Unit tests will use `mockall` (mock traits via `#[automock]`) — add to workspace deps when writing Phase 2+ unit tests
 - Target >90% coverage per module
 - Test both happy path AND all error branches
 - No live DB in unit tests — mock the repo trait
