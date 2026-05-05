@@ -23,6 +23,8 @@
 //! comparison (`==`) would leak the secret one byte at a time by returning early on the first mismatch.
 //! The `verify` function here uses `hmac::Mac::verify_slice` to securely compare the digests.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -41,6 +43,12 @@ pub fn sign(secret: &[u8], timestamp_secs: u64, body: &[u8]) -> String {
 ///
 /// Uses `hmac::Mac::verify_slice` to avoid timing side-channels — never `==`
 /// on hex strings.
+///
+/// The caller is responsible for:
+/// 1. Extracting the `t=<unix_ts>` field from `header_value` and passing it as
+///    `timestamp_secs`. A mismatch between the two means the computed HMAC will
+///    not match, so the signature will correctly fail verification.
+/// 2. Enforcing a replay window (e.g. reject if `|now() - timestamp_secs| > 300s`).
 pub fn verify(secret: &[u8], timestamp_secs: u64, body: &[u8], header_value: &str) -> bool {
     // Parse "t=<ts>,v1=<hex>"
     let hex_digest = match parse_v1_digest(header_value) {
@@ -56,6 +64,37 @@ pub fn verify(secret: &[u8], timestamp_secs: u64, body: &[u8], header_value: &st
     mac.update(format!("{timestamp_secs}.").as_bytes());
     mac.update(body);
     mac.verify_slice(&decoded).is_ok()
+}
+
+/// High-level verifier that handles timestamp extraction and replay-window enforcement.
+///
+/// Receivers should call this instead of [`verify`] directly. It:
+/// 1. Parses `t=<unix_ts>` from the header.
+/// 2. Rejects the request if the timestamp is older than `max_age`.
+/// 3. Delegates HMAC verification to [`verify`] in constant time.
+///
+/// Returns `true` only when the signature is valid **and** within the replay window.
+pub fn verify_header(secret: &[u8], body: &[u8], header_value: &str, max_age: Duration) -> bool {
+    let Some(ts) = parse_t_field(header_value) else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(ts) > max_age.as_secs() {
+        return false;
+    }
+    verify(secret, ts, body, header_value)
+}
+
+fn parse_t_field(header_value: &str) -> Option<u64> {
+    for part in header_value.split(',') {
+        if let Some(ts) = part.trim().strip_prefix("t=") {
+            return ts.parse().ok();
+        }
+    }
+    None
 }
 
 fn parse_v1_digest(header_value: &str) -> Option<&str> {
@@ -87,6 +126,67 @@ mod tests {
         let ts = 1_714_229_400_u64;
         let header = sign(SECRET, ts, body);
         assert!(!verify(b"wrong-secret", ts, body, &header));
+    }
+
+    #[test]
+    fn verify_header_roundtrip() {
+        let body = b"{\"hello\":\"world\"}";
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let header = sign(SECRET, ts, body);
+        assert!(verify_header(
+            SECRET,
+            body,
+            &header,
+            Duration::from_secs(300)
+        ));
+    }
+
+    #[test]
+    fn verify_header_rejects_old_signature() {
+        let body = b"{\"hello\":\"world\"}";
+        // timestamp one hour in the past
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(3601);
+        let header = sign(SECRET, ts, body);
+        assert!(!verify_header(
+            SECRET,
+            body,
+            &header,
+            Duration::from_secs(300)
+        ));
+    }
+
+    #[test]
+    fn verify_header_rejects_wrong_secret() {
+        let body = b"{\"hello\":\"world\"}";
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let header = sign(SECRET, ts, body);
+        assert!(!verify_header(
+            b"wrong-secret",
+            body,
+            &header,
+            Duration::from_secs(300)
+        ));
+    }
+
+    #[test]
+    fn verify_header_rejects_missing_t_field() {
+        // A header with v1= but no t= is rejected before HMAC verification.
+        assert!(!verify_header(
+            SECRET,
+            b"body",
+            "v1=aabbcc",
+            Duration::from_secs(300)
+        ));
     }
 
     #[test]

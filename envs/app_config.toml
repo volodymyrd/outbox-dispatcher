@@ -4,6 +4,7 @@
 [database]
 url = ""
 max_connections = 10
+acquire_timeout_secs = 10
 
 [dispatch]
 poll_interval_secs = 5

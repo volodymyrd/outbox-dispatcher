@@ -65,6 +65,11 @@ pub trait Repo: Send + Sync {
 
     /// Atomically sets `locked_until` and increments `attempts`; returns false if
     /// someone else took the row concurrently.
+    ///
+    /// Note: the `DueDelivery.attempts` visible to the caller reflects the count
+    /// *before* this call. The in-progress attempt is `attempts + 1`. Callers must
+    /// account for this when checking whether the next failure should dead-letter
+    /// (i.e. compare `attempts + 1 >= max_attempts`, not `attempts >= max_attempts`).
     async fn lock_delivery(&self, id: i64, until: DateTime<Utc>) -> Result<bool>;
 
     /// Managed-mode success: sets both `dispatched_at` and `processed_at`.
@@ -85,6 +90,10 @@ pub trait Repo: Send + Sync {
     // ── External-completion timeout sweep ──────────────────────────────────
 
     /// Resets hung external-mode rows for redelivery or dead-letters exhausted ones.
+    ///
+    /// Only rows whose callback spec includes `external_completion_timeout_seconds` are
+    /// evaluated; rows without that field are intentionally skipped (treated as
+    /// "wait forever" for external completion).
     async fn reset_hung_external(
         &self,
         now: DateTime<Utc>,
@@ -108,6 +117,11 @@ pub trait Repo: Send + Sync {
     ) -> Result<Vec<ExternalPendingRow>>;
 
     /// Resets all mutable columns so the delivery re-enters the pending queue.
+    ///
+    /// Does not guard against an in-flight dispatcher that currently holds a lock on
+    /// this row. Callers (admin API) should ensure the row is not actively locked
+    /// before calling this. A `locked_until` guard will be added when the admin API
+    /// is implemented in Phase 6.
     async fn retry_delivery(&self, id: i64) -> Result<bool>;
 
     /// Sets `processed_at = COALESCE(processed_at, now())`. Idempotent.
@@ -245,6 +259,13 @@ impl Repo for PgRepo {
     }
 
     async fn ensure_deliveries(&self, event_id: Uuid, callbacks: &[CallbackTarget]) -> Result<()> {
+        if callbacks.is_empty() {
+            return Ok(());
+        }
+        // Transaction ensures all-or-nothing insertion across the callback list.
+        // For the typical single-callback case this adds one BEGIN/COMMIT round-trip;
+        // acceptable given the small callback fan-out and correctness benefit.
+        let mut tx = self.pool.begin().await?;
         for cb in callbacks {
             sqlx::query!(
                 r#"
@@ -257,9 +278,10 @@ impl Repo for PgRepo {
                 cb.name,
                 cb.mode.as_str(),
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -269,12 +291,7 @@ impl Repo for PgRepo {
         callback_name: &str,
         reason: &str,
     ) -> Result<()> {
-        // Truncate reason to 4 KB to match the last_error column convention.
-        let reason = if reason.len() > 4096 {
-            &reason[..4096]
-        } else {
-            reason
-        };
+        let reason = truncate_at_char_boundary(reason, 4096);
         sqlx::query!(
             r#"
             INSERT INTO outbox_deliveries
@@ -407,11 +424,7 @@ impl Repo for PgRepo {
         available_at: DateTime<Utc>,
         dead_letter: bool,
     ) -> Result<()> {
-        let error = if error.len() > 4096 {
-            &error[..4096]
-        } else {
-            error
-        };
+        let error = truncate_at_char_boundary(error, 4096);
         sqlx::query!(
             r#"
             UPDATE outbox_deliveries
@@ -712,6 +725,19 @@ impl Repo for PgRepo {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
+/// Returns the longest prefix of `s` whose byte length does not exceed `max_bytes`,
+/// always cutting on a UTF-8 character boundary to avoid a panic.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Finds a callback by name in the event's callbacks JSONB array and parses it.
 fn extract_callback_target(
     callbacks: &serde_json::Value,
@@ -733,4 +759,150 @@ fn extract_callback_target(
 
     let spec: RawCallbackSpec = serde_json::from_value(spec_value.clone())?;
     Ok(spec.into_target(defaults))
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn defaults() -> DispatchDefaults {
+        DispatchDefaults::default()
+    }
+
+    // ── truncate_at_char_boundary ─────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate_at_char_boundary("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_boundary() {
+        assert_eq!(truncate_at_char_boundary("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_at_byte_limit() {
+        assert_eq!(truncate_at_char_boundary("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_does_not_split_multibyte_char() {
+        // "é" is U+00E9, encoded as two bytes [0xC3, 0xA9].
+        // Truncating at byte 1 would split the codepoint; the helper must back up to 0.
+        let s = "é";
+        assert_eq!(s.len(), 2);
+        let result = truncate_at_char_boundary(s, 1);
+        assert!(s.is_char_boundary(result.len()));
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn truncate_multibyte_prefix_preserved() {
+        // "héllo" — 'é' is 2 bytes; total 6 bytes.
+        let s = "héllo";
+        let result = truncate_at_char_boundary(s, 4);
+        // bytes 0..4 cover 'h','é'(2b),'l' — but 'é' at byte 1-2, 'l' at byte 3 → 4 is OK
+        assert!(s.is_char_boundary(result.len()));
+        assert!(result.len() <= 4);
+    }
+
+    #[test]
+    fn truncate_zero_max_bytes_returns_empty() {
+        assert_eq!(truncate_at_char_boundary("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_does_not_split_4byte_emoji() {
+        // '🦀' is U+1F980, encoded as 4 bytes [0xF0, 0x9F, 0xA6, 0x80].
+        // Any limit 1-3 must walk back to 0; limit 4 yields the whole char.
+        let s = "🦀";
+        assert_eq!(s.len(), 4);
+        assert_eq!(truncate_at_char_boundary(s, 3), "");
+        assert_eq!(truncate_at_char_boundary(s, 4), "🦀");
+    }
+
+    // ── extract_callback_target ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_callback_target_minimal_spec() {
+        let callbacks = json!([
+            {"name": "notify", "url": "https://example.com/hook"}
+        ]);
+        let target = extract_callback_target(&callbacks, "notify", &defaults()).unwrap();
+        assert_eq!(target.name, "notify");
+        assert_eq!(target.url, "https://example.com/hook");
+        assert_eq!(target.mode, crate::schema::CompletionMode::Managed);
+        assert_eq!(target.max_attempts, defaults().max_attempts);
+    }
+
+    #[test]
+    fn extract_callback_target_not_an_array() {
+        let callbacks = json!({"name": "notify", "url": "https://example.com"});
+        let err = extract_callback_target(&callbacks, "notify", &defaults()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn extract_callback_target_missing_name() {
+        let callbacks = json!([
+            {"name": "other", "url": "https://example.com/other"}
+        ]);
+        let err = extract_callback_target(&callbacks, "notify", &defaults()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::CallbackTargetMissing(_)));
+    }
+
+    #[test]
+    fn extract_callback_target_malformed_spec() {
+        // missing required "url" field
+        let callbacks = json!([{"name": "notify"}]);
+        let err = extract_callback_target(&callbacks, "notify", &defaults()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::Serialization(_)));
+    }
+
+    #[test]
+    fn extract_callback_target_overrides_defaults() {
+        let callbacks = json!([{
+            "name": "notify",
+            "url": "https://example.com/hook",
+            "mode": "external",
+            "max_attempts": 3,
+            "backoff_seconds": [10, 20],
+            "timeout_seconds": 5,
+            "max_completion_cycles": 7
+        }]);
+        let target = extract_callback_target(&callbacks, "notify", &defaults()).unwrap();
+        assert_eq!(target.mode, crate::schema::CompletionMode::External);
+        assert_eq!(target.max_attempts, 3);
+        assert_eq!(
+            target.backoff,
+            vec![Duration::from_secs(10), Duration::from_secs(20)]
+        );
+        assert_eq!(target.timeout, Duration::from_secs(5));
+        assert_eq!(target.max_completion_cycles, 7);
+    }
+
+    #[test]
+    fn extract_callback_target_signing_key_id() {
+        let callbacks = json!([{
+            "name": "notify",
+            "url": "https://example.com/hook",
+            "signing_key_id": "key-abc"
+        }]);
+        let target = extract_callback_target(&callbacks, "notify", &defaults()).unwrap();
+        assert_eq!(target.signing_key_id.as_deref(), Some("key-abc"));
+    }
+
+    #[test]
+    fn extract_callback_target_picks_correct_entry_from_multi() {
+        let callbacks = json!([
+            {"name": "alpha", "url": "https://alpha.example.com"},
+            {"name": "beta",  "url": "https://beta.example.com"}
+        ]);
+        let target = extract_callback_target(&callbacks, "beta", &defaults()).unwrap();
+        assert_eq!(target.url, "https://beta.example.com");
+    }
 }

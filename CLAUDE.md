@@ -112,16 +112,16 @@ cargo test --test '*'
 
 ## Implementation phases
 
-| Phase | Status          | Description                                                                       |
-|-------|-----------------|-----------------------------------------------------------------------------------|
-| 1     | **In Progress** | Workspace scaffold, migration SQL, `Repo` trait, full `PgRepo`, migration runner  |
-| 2     | Todo            | YAML config parsing, domain types, `parse_callbacks`, payload-size helper         |
-| 3     | Todo            | `LISTEN/NOTIFY` wake source, cursor recovery, scheduler                           |
-| 4     | Todo            | `Callback` trait, `HttpCallback`, managed dispatch, HMAC signing at dispatch time |
-| 5     | Todo            | External mode, completion sweeper                                                 |
-| 6     | Todo            | Admin HTTP API (axum)                                                             |
-| 7     | Todo            | Prometheus metrics, structured logging, OpenTelemetry, retention worker           |
-| 8     | Todo            | Docker, CI/CD, docs                                                               |
+| Phase | Status   | Description                                                                       |
+|-------|----------|-----------------------------------------------------------------------------------|
+| 1     | **DONE** | Workspace scaffold, migration SQL, `Repo` trait, full `PgRepo`, migration runner  |
+| 2     | Todo     | YAML config parsing, domain types, `parse_callbacks`, payload-size helper         |
+| 3     | Todo     | `LISTEN/NOTIFY` wake source, cursor recovery, scheduler                           |
+| 4     | Todo     | `Callback` trait, `HttpCallback`, managed dispatch, HMAC signing at dispatch time |
+| 5     | Todo     | External mode, completion sweeper                                                 |
+| 6     | Todo     | Admin HTTP API (axum)                                                             |
+| 7     | Todo     | Prometheus metrics, structured logging, OpenTelemetry, retention worker           |
+| 8     | Todo     | Docker, CI/CD, docs                                                               |
 
 ## Key design notes
 

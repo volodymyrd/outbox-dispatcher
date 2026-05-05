@@ -57,10 +57,17 @@ impl Default for DispatchConfig {
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
+fn default_acquire_timeout_secs() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
+    /// How long to wait for a free connection before returning an error.
+    #[serde(default = "default_acquire_timeout_secs")]
+    pub acquire_timeout_secs: u64,
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
@@ -172,6 +179,9 @@ impl AppConfig {
         if self.database.max_connections == 0 {
             errors.push("database.max_connections must be > 0".to_string());
         }
+        if self.database.acquire_timeout_secs == 0 {
+            errors.push("database.acquire_timeout_secs must be > 0".to_string());
+        }
         if self.dispatch.batch_size <= 0 {
             errors.push("dispatch.batch_size must be > 0".to_string());
         }
@@ -219,6 +229,7 @@ mod tests {
 [database]
 url = "postgres://user:pass@localhost/db"
 max_connections = 10
+acquire_timeout_secs = 10
 
 [dispatch]
 poll_interval_secs = 5
@@ -472,6 +483,44 @@ filter = "info"
         cfg.database.max_connections = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.iter().any(|e| e.contains("max_connections")));
+    }
+
+    #[test]
+    fn test_database_config_acquire_timeout_secs_default() {
+        // Configs without the field should use the serde default (10).
+        let toml_without_timeout = r#"
+[database]
+url = "postgres://user:pass@localhost/db"
+max_connections = 5
+
+[dispatch]
+poll_interval_secs = 5
+batch_size = 50
+max_attempts = 6
+backoff_secs = [30]
+handler_timeout_secs = 30
+lock_buffer_secs = 10
+external_timeout_sweep_interval_secs = 60
+max_completion_cycles = 20
+payload_size_limit_bytes = 1048576
+notify_channel = "outbox_events_new"
+allow_insecure_urls = false
+allow_unsigned_callbacks = false
+
+[log]
+format = "json"
+filter = "info"
+"#;
+        let cfg = build_config(toml_without_timeout);
+        assert_eq!(cfg.database.acquire_timeout_secs, 10);
+    }
+
+    #[test]
+    fn test_validate_zero_acquire_timeout_secs() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.acquire_timeout_secs = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("acquire_timeout_secs")));
     }
 
     #[test]

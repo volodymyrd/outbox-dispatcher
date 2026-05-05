@@ -1,9 +1,11 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use outbox_dispatcher_core::config::{AppConfig, DatabaseConfig, LogConfig, LogFormat};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Migrations embedded at compile time from the workspace-root `migrations/` directory.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -39,8 +41,10 @@ enum MigrationsAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse CLI first so `--help` and `--version` work without a valid config.
+    let cli = Cli::parse();
+
     let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "local".to_string());
-    eprintln!("env: {app_env}");
 
     let config = AppConfig::load(&app_env)
         .with_context(|| format!("failed to load app config for env '{app_env}'"))?;
@@ -52,10 +56,17 @@ async fn main() -> Result<()> {
         anyhow::bail!("invalid configuration ({} error(s))", errors.len());
     }
 
-    init_tracing(&config.log);
+    init_tracing(&config.log).context("initialising tracing subscriber")?;
     info!(env = %app_env, "outbox-dispatcher starting");
 
-    let cli = Cli::parse();
+    if config.dispatch.allow_insecure_urls {
+        warn!("allow_insecure_urls is enabled — HTTP (non-TLS) callback URLs are accepted");
+    }
+    if config.dispatch.allow_unsigned_callbacks {
+        warn!(
+            "allow_unsigned_callbacks is enabled — callbacks without a signing_key_id are accepted"
+        );
+    }
 
     match cli.command {
         Some(Command::Migrations {
@@ -148,6 +159,7 @@ fn dump_migrations() {
 async fn connect_pool(db: &DatabaseConfig) -> Result<PgPool> {
     PgPoolOptions::new()
         .max_connections(db.max_connections)
+        .acquire_timeout(Duration::from_secs(db.acquire_timeout_secs))
         .connect(&db.url)
         .await
         .context("connecting to Postgres")
@@ -155,19 +167,25 @@ async fn connect_pool(db: &DatabaseConfig) -> Result<PgPool> {
 
 // ── Observability ──────────────────────────────────────────────────────────────
 
-fn init_tracing(log: &LogConfig) {
-    let filter = tracing_subscriber::EnvFilter::new(
+fn init_tracing(log: &LogConfig) -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::try_new(
         std::env::var("RUST_LOG").unwrap_or_else(|_| log.filter.clone()),
-    );
+    )
+    .context("invalid log filter directive")?;
     match log.format {
         LogFormat::Json => {
             tracing_subscriber::fmt()
                 .json()
                 .with_env_filter(filter)
-                .init();
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
         }
         LogFormat::Pretty => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .try_init()
+                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
         }
     }
+    Ok(())
 }
