@@ -1,3 +1,28 @@
+//! Webhook Signature Generation and Verification.
+//!
+//! # Why do we need signing?
+//!
+//! The `outbox-dispatcher` delivers events to downstream HTTP endpoints. Because these
+//! endpoints are often exposed to the internet, receivers need a way to cryptographically
+//! verify that an incoming webhook was legitimately sent by the dispatcher and not a
+//! malicious actor spoofing requests.
+//!
+//! This module implements an HMAC-SHA256 signing scheme (similar to Stripe's webhook signing)
+//! that provides three critical security guarantees:
+//!
+//! 1. **Authenticity:** Only a party possessing the shared secret can generate a valid signature.
+//! 2. **Integrity:** The signature is computed over the exact byte representation of the request body,
+//!    ensuring the payload hasn't been tampered with in transit.
+//! 3. **Replay Protection:** The signed payload is prefixed with a UNIX timestamp. Receivers
+//!    should parse this timestamp and reject requests that are too old (e.g., older than 5 minutes),
+//!    preventing attackers from capturing and re-sending historical webhooks.
+//!
+//! # Constant-Time Verification
+//!
+//! To prevent timing attacks, signatures must be compared in constant time. A naive string
+//! comparison (`==`) would leak the secret one byte at a time by returning early on the first mismatch.
+//! The `verify` function here uses `hmac::Mac::verify_slice` to securely compare the digests.
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
