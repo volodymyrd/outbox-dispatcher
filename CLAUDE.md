@@ -111,16 +111,28 @@ cargo test --test '*'
 - `signing_key_id` is resolved at **dispatch time**, not schedule time (tolerates deploy skew).
 - `locked_until` prevents duplicate dispatch across replicas; committed before the HTTP call.
 - **sqlx offline mode**: `.sqlx/` cache is checked in; builds work without `DATABASE_URL`. Regenerate after any query change with `cargo sqlx prepare --workspace`.
+- **Migration locking**: `MIGRATOR.run()` already takes its own Postgres advisory lock internally on its own connection. Do **not** wrap it manually with `pg_advisory_lock` via `.execute(pool)` — the pool hands out a different connection each call, so the lock is held on a connection that no longer participates in the migration.
+- **Downgrade guard**: `validate_schema` queries `_sqlx_migrations`; treat Postgres SQLSTATE `42P01` (undefined_table) as "no migrations applied" so `--skip-migrations` works on a fresh DB.
+- **HMAC body bytes**: feed the raw payload to HMAC via `mac.update(body)`. Never `String::from_utf8_lossy(body)` (mutates non-UTF-8 with U+FFFD) or `format!("{ts}.{body}")` (allocates the full payload). Stream `format!("{ts}.")` then `body`.
+- **Retry index guard**: clamp with `attempt.max(1) as usize - 1` before indexing the backoff schedule — `(attempt - 1) as usize` silently wraps to `usize::MAX` if `attempt == 0` and pegs to the longest backoff.
+- **Session-bound state**: advisory locks, `SET LOCAL`, and `LISTEN` are tied to the underlying `PgConnection`. Acquire from `pool.acquire()` and reuse the same `&mut conn` for the whole sequence — never `.execute(pool)` in pieces.
+
+## Code Conventions
 
 ### Comments
 
 - Use comments sparingly — only for complex or non-obvious logic; self-documenting code is preferred
 
-## Code Conventions
-
 ### Errors
 
-- Use `thiserror` for all error types in library crates
+- Use `thiserror` for all error types in library crates (`core`, `http-callback`, `admin-api`)
+- Use `anyhow` in `crates/bin` for startup-flow errors; attach context with `.with_context(|| ...)` rather than bare `?`
+
+### Async / Tokio
+
+- No blocking calls inside `async fn` — no sync file I/O, no `std::thread::sleep`, no blocking HTTP clients
+- Never hold a lock across an `.await` point
+- Use `tokio::sync` primitives in async code, not `std::sync::Mutex` / `RwLock`
 
 ### Database
 
