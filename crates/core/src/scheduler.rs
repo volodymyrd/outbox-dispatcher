@@ -1,3 +1,26 @@
+//! Callback Parsing and Structural Validation.
+//!
+//! # Why do we need this?
+//!
+//! The `outbox-dispatcher` reads events from a database where the destination
+//! webhooks (`callbacks`) are stored as raw JSON. Because this JSON is generated
+//! by upstream publisher applications, the dispatcher must treat it as untrusted input.
+//!
+//! If we attempted to dispatch webhooks without upfront validation:
+//! - A malformed URL would cause the HTTP client to fail repeatedly, wasting retries.
+//! - A publisher could inject an `Authorization` header, bypassing the HMAC signing scheme.
+//! - A publisher could inject `\r\n` characters into a header, executing an HTTP Request Smuggling attack.
+//!
+//! # Upfront Dead-Lettering
+//!
+//! This module structurally validates every callback *before* it is scheduled.
+//! If a callback definition is structurally invalid (e.g., missing a URL, invalid scheme,
+//! out-of-bounds timeout), it is separated into the `invalid` list.
+//!
+//! The scheduler will immediately write these invalid callbacks to the database as
+//! `dead_letter = TRUE`, ensuring they never enter the dispatch retry loop, while
+//! valid callbacks from the same event proceed normally.
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
