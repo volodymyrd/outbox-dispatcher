@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::error::ValidationErrors;
+
 /// Dispatch-loop settings (domain type; no serde — converted from [`DispatchSettings`]).
 #[derive(Debug, Clone)]
 pub struct DispatchConfig {
@@ -325,7 +327,7 @@ impl AppConfig {
     ///
     /// Call this immediately after [`Self::load`] before starting the service so operators
     /// get a clear, actionable error instead of a cryptic low-level failure later.
-    pub fn validate(&self) -> Result<(), Vec<String>> {
+    pub fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errors = Vec::new();
 
         if self.database.url.trim().is_empty() {
@@ -412,7 +414,7 @@ impl AppConfig {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(errors)
+            Err(ValidationErrors(errors))
         }
     }
 }
@@ -684,7 +686,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.database.url = String::new();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("database.url")));
+        assert!(errs.0.iter().any(|e| e.contains("database.url")));
     }
 
     #[test]
@@ -692,7 +694,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.database.url = "   ".to_string();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("database.url")));
+        assert!(errs.0.iter().any(|e| e.contains("database.url")));
     }
 
     #[test]
@@ -700,7 +702,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.database.max_connections = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("max_connections")));
+        assert!(errs.0.iter().any(|e| e.contains("max_connections")));
     }
 
     #[test]
@@ -738,7 +740,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.database.acquire_timeout_secs = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("acquire_timeout_secs")));
+        assert!(errs.0.iter().any(|e| e.contains("acquire_timeout_secs")));
     }
 
     #[test]
@@ -746,7 +748,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.batch_size = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("batch_size")));
+        assert!(errs.0.iter().any(|e| e.contains("batch_size")));
     }
 
     #[test]
@@ -754,7 +756,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.max_attempts = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("max_attempts")));
+        assert!(errs.0.iter().any(|e| e.contains("max_attempts")));
     }
 
     #[test]
@@ -762,7 +764,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.backoff_secs = vec![];
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("backoff_secs")));
+        assert!(errs.0.iter().any(|e| e.contains("backoff_secs")));
     }
 
     #[test]
@@ -770,7 +772,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.log.filter = String::new();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("log.filter")));
+        assert!(errs.0.iter().any(|e| e.contains("log.filter")));
     }
 
     #[test]
@@ -779,7 +781,8 @@ filter = "info"
         cfg.dispatch.external_timeout_sweep_interval_secs = 9;
         let errs = cfg.validate().unwrap_err();
         assert!(
-            errs.iter()
+            errs.0
+                .iter()
                 .any(|e| e.contains("external_timeout_sweep_interval_secs"))
         );
     }
@@ -796,7 +799,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 1023;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("payload_size_limit_bytes")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("payload_size_limit_bytes"))
+        );
     }
 
     #[test]
@@ -813,7 +820,7 @@ filter = "info"
         cfg.database.max_connections = 0;
         cfg.dispatch.batch_size = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.len() >= 3);
+        assert!(errs.0.len() >= 3);
     }
 
     // ── New section defaults ───────────────────────────────────────────────────
@@ -941,7 +948,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.http_client.connect_timeout_secs = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("connect_timeout_secs")));
+        assert!(errs.0.iter().any(|e| e.contains("connect_timeout_secs")));
     }
 
     #[test]
@@ -949,7 +956,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.http_client.user_agent = String::new();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("user_agent")));
+        assert!(errs.0.iter().any(|e| e.contains("user_agent")));
     }
 
     #[test]
@@ -966,7 +973,11 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.processed_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("processed_retention_days")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("processed_retention_days"))
+        );
     }
 
     #[test]
@@ -976,7 +987,8 @@ filter = "info"
         cfg.retention.dead_letter_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(
-            errs.iter()
+            errs.0
+                .iter()
                 .any(|e| e.contains("dead_letter_retention_days"))
         );
     }
@@ -987,7 +999,7 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.cleanup_interval_secs = 59;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("cleanup_interval_secs")));
+        assert!(errs.0.iter().any(|e| e.contains("cleanup_interval_secs")));
     }
 
     #[test]
@@ -1004,7 +1016,7 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.batch_limit = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("batch_limit")));
+        assert!(errs.0.iter().any(|e| e.contains("batch_limit")));
     }
 
     #[test]
@@ -1013,7 +1025,7 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.batch_limit = 10_001;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("batch_limit")));
+        assert!(errs.0.iter().any(|e| e.contains("batch_limit")));
     }
 
     #[test]
@@ -1047,7 +1059,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.poll_interval_secs = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("poll_interval_secs")));
+        assert!(errs.0.iter().any(|e| e.contains("poll_interval_secs")));
     }
 
     #[test]
@@ -1055,7 +1067,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.handler_timeout_secs = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("handler_timeout_secs")));
+        assert!(errs.0.iter().any(|e| e.contains("handler_timeout_secs")));
     }
 
     #[test]
@@ -1063,7 +1075,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.max_completion_cycles = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("max_completion_cycles")));
+        assert!(errs.0.iter().any(|e| e.contains("max_completion_cycles")));
     }
 
     #[test]
@@ -1071,7 +1083,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.backoff_secs = vec![0, 60];
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("backoff_secs")));
+        assert!(errs.0.iter().any(|e| e.contains("backoff_secs")));
     }
 
     #[test]
@@ -1079,7 +1091,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.notify_channel = String::new();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("notify_channel")));
+        assert!(errs.0.iter().any(|e| e.contains("notify_channel")));
     }
 
     #[test]
@@ -1087,7 +1099,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.notify_channel = "   ".to_string();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("notify_channel")));
+        assert!(errs.0.iter().any(|e| e.contains("notify_channel")));
     }
 
     #[test]
@@ -1095,7 +1107,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 104_857_601;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("payload_size_limit_bytes")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("payload_size_limit_bytes"))
+        );
     }
 
     #[test]
@@ -1110,7 +1126,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.admin.auth_token = String::new();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("auth_token")));
+        assert!(errs.0.iter().any(|e| e.contains("auth_token")));
     }
 
     #[test]
@@ -1118,7 +1134,7 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.admin.auth_token = "   ".to_string();
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("auth_token")));
+        assert!(errs.0.iter().any(|e| e.contains("auth_token")));
     }
 
     #[test]
@@ -1126,6 +1142,6 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.max_callbacks_per_event = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("max_callbacks_per_event")));
+        assert!(errs.0.iter().any(|e| e.contains("max_callbacks_per_event")));
     }
 }

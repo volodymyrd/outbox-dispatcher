@@ -38,6 +38,7 @@ use base64::prelude::*;
 use zeroize::Zeroizing;
 
 use crate::config::SigningKeyConfig;
+use crate::error::ValidationErrors;
 
 const MIN_SECRET_BYTES: usize = 32;
 // HMAC-SHA256 pre-hashes keys longer than its 64-byte block size; 256 is a generous misconfig
@@ -70,7 +71,9 @@ impl KeyRing {
     /// Both standard and URL-safe Base64 encodings are accepted (with or without padding).
     /// Leading/trailing/internal whitespace in the env var value is stripped before decoding,
     /// which accommodates wrapped secrets from Kubernetes Secrets and Docker env files.
-    pub fn load(signing_keys: &HashMap<String, SigningKeyConfig>) -> Result<Self, Vec<String>> {
+    pub fn load(
+        signing_keys: &HashMap<String, SigningKeyConfig>,
+    ) -> Result<Self, ValidationErrors> {
         Self::load_internal(signing_keys, |env| {
             std::env::var(env).map_err(|e| match e {
                 std::env::VarError::NotPresent => "is not set".to_string(),
@@ -86,7 +89,7 @@ impl KeyRing {
     fn load_internal<F>(
         signing_keys: &HashMap<String, SigningKeyConfig>,
         env_resolver: F,
-    ) -> Result<Self, Vec<String>>
+    ) -> Result<Self, ValidationErrors>
     where
         F: Fn(&str) -> Result<String, String>,
     {
@@ -103,11 +106,13 @@ impl KeyRing {
                 }
                 Ok(val) => {
                     let cleaned: String = val.chars().filter(|c| !c.is_whitespace()).collect();
-                    match BASE64_STANDARD
-                        .decode(&cleaned)
-                        .or_else(|_| BASE64_URL_SAFE.decode(&cleaned))
-                        .or_else(|_| BASE64_URL_SAFE_NO_PAD.decode(&cleaned))
-                    {
+                    let decoded = BASE64_STANDARD.decode(&cleaned).or_else(|first_err| {
+                        BASE64_URL_SAFE
+                            .decode(&cleaned)
+                            .or_else(|_| BASE64_URL_SAFE_NO_PAD.decode(&cleaned))
+                            .map_err(|_| first_err)
+                    });
+                    match decoded {
                         Err(e) => {
                             errors.push(format!(
                                 "signing_keys[{id}]: failed to base64-decode secret from '{}': {e}",
@@ -141,7 +146,7 @@ impl KeyRing {
         if errors.is_empty() {
             Ok(Self { keys })
         } else {
-            Err(errors)
+            Err(ValidationErrors(errors))
         }
     }
 
@@ -211,8 +216,8 @@ mod tests {
 
         let errs =
             KeyRing::load_internal(&signing_keys, |_| Err("is not set".to_string())).unwrap_err();
-        assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("MISSING_ENV"));
+        assert_eq!(errs.0.len(), 1);
+        assert!(errs.0[0].contains("MISSING_ENV"));
     }
 
     #[test]
@@ -225,8 +230,8 @@ mod tests {
             .collect();
 
         let errs = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap_err();
-        assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("base64-decode"));
+        assert_eq!(errs.0.len(), 1);
+        assert!(errs.0[0].contains("base64-decode"));
     }
 
     #[test]
@@ -239,8 +244,8 @@ mod tests {
             .collect();
 
         let errs = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap_err();
-        assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("minimum is 32"));
+        assert_eq!(errs.0.len(), 1);
+        assert!(errs.0[0].contains("minimum is 32"));
     }
 
     #[test]
@@ -256,8 +261,8 @@ mod tests {
             envs.get(k).cloned().ok_or_else(|| "is not set".to_string())
         })
         .unwrap_err();
-        assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("maximum is"));
+        assert_eq!(errs.0.len(), 1);
+        assert!(errs.0[0].contains("maximum is"));
     }
 
     #[test]
@@ -271,7 +276,7 @@ mod tests {
             .collect();
 
         let errs = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap_err();
-        assert_eq!(errs.len(), 2);
+        assert_eq!(errs.0.len(), 2);
     }
 
     #[test]
@@ -341,8 +346,8 @@ mod tests {
         );
 
         let errs = KeyRing::load(&signing_keys).unwrap_err();
-        assert_eq!(errs.len(), 1);
-        assert!(errs[0].contains("__OUTBOX_DISPATCHER_TEST_NONEXISTENT_VAR__"));
+        assert_eq!(errs.0.len(), 1);
+        assert!(errs.0[0].contains("__OUTBOX_DISPATCHER_TEST_NONEXISTENT_VAR__"));
     }
 
     #[test]
@@ -359,5 +364,27 @@ mod tests {
         let kr = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap();
         assert!(kr.contains("k"));
         assert_eq!(kr.get("k").unwrap().len(), 32);
+    }
+
+    #[test]
+    fn debug_output_redacts_secret_bytes() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("my-key".to_string(), make_key_cfg("REDACT_ENV"));
+
+        let envs: HashMap<&str, &str> = [("REDACT_ENV", valid_32_byte_b64())].into_iter().collect();
+
+        let kr = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap();
+        let debug_str = format!("{kr:?}");
+        assert!(debug_str.contains("my-key"), "key id must appear in debug");
+        // The base64 secret must never appear verbatim.
+        assert!(
+            !debug_str.contains(valid_32_byte_b64()),
+            "raw base64 secret must not appear in debug output"
+        );
+        // Decoded bytes should not appear either.
+        assert!(
+            !debug_str.contains("AAAA"),
+            "decoded secret bytes must not appear in debug output"
+        );
     }
 }

@@ -33,10 +33,12 @@ const MAX_EXTERNAL_TIMEOUT_SECS: u64 = 7 * 86_400;
 const MAX_PER_CALLBACK_ATTEMPTS: u64 = 50;
 const MAX_HANDLER_TIMEOUT_SECS: u64 = 300;
 const MAX_COMPLETION_CYCLES_LIMIT: u64 = 1_000;
+const MAX_BACKOFF_ELEMENT_SECS: u64 = 7 * 86_400;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Result of structurally parsing and validating a callbacks JSON array.
+#[derive(Debug)]
 pub struct ParsedCallbacks {
     /// Callbacks that passed all structural checks and are ready for scheduling.
     pub valid: Vec<CallbackTarget>,
@@ -104,7 +106,7 @@ pub fn parse_callbacks(
 ///
 /// This prefix (`source_payload_too_large:`) is documented so operators can filter
 /// dispatcher-side rejections from receiver-side HTTP 413 responses.
-pub fn payload_too_large_error(actual_bytes: u64, limit_bytes: u64) -> String {
+pub fn payload_too_large_error(actual_bytes: i64, limit_bytes: i64) -> String {
     format!(
         "source_payload_too_large: {actual_bytes} bytes > {limit_bytes} bytes \
          (rejected by dispatcher before send)"
@@ -230,6 +232,12 @@ fn validate_url(
     let parsed = url::Url::parse(url_str)
         .map_err(|_| format!("invalid_callback: url '{url_str}' is structurally malformed"))?;
 
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "invalid_callback: url '{url_str}' must not contain userinfo (username/password)"
+        ));
+    }
+
     let scheme = parsed.scheme();
     match (scheme, allow_insecure) {
         ("https", _) | ("http", true) => {}
@@ -263,7 +271,19 @@ fn is_private_host(host: url::Host<&str>) -> bool {
         url::Host::Ipv4(ip) => {
             ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
         }
-        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => {
+            // Unwrap IPv4-mapped addresses (e.g. ::ffff:127.0.0.1) and apply IPv4 rules.
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified();
+            }
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
         url::Host::Domain(_) => false, // hostname targets: SSRF via DNS requires a dispatch-time check
     }
 }
@@ -393,6 +413,12 @@ fn parse_backoff(
             })?;
             if n == 0 {
                 return Err("invalid_callback: backoff_seconds elements must be > 0".to_string());
+            }
+            if n > MAX_BACKOFF_ELEMENT_SECS {
+                return Err(format!(
+                    "invalid_callback: backoff_seconds elements must be <= \
+                     {MAX_BACKOFF_ELEMENT_SECS}; got {n}"
+                ));
             }
             Ok(Duration::from_secs(n))
         })
@@ -1241,5 +1267,134 @@ mod tests {
         let result = parse_callbacks(&cbs, &config);
         assert_eq!(result.valid.len(), 2);
         assert!(result.invalid.is_empty());
+    }
+
+    // ── URL userinfo (credentials) ────────────────────────────────────────────
+
+    #[test]
+    fn url_with_username_and_password_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://user:secret@example.com/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("userinfo"));
+    }
+
+    #[test]
+    fn url_with_username_only_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://user@example.com/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("userinfo"));
+    }
+
+    // ── IPv6 SSRF: additional blocked ranges ─────────────────────────────────
+
+    #[test]
+    fn ipv6_unique_local_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[fc00::1]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn ipv6_link_local_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[fe80::1]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn ipv6_unspecified_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[::]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[::ffff:127.0.0.1]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_private_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[::ffff:192.168.1.1]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    // ── backoff element ceiling ───────────────────────────────────────────────
+
+    #[test]
+    fn backoff_element_exceeds_max_rejected() {
+        let too_large = MAX_BACKOFF_ELEMENT_SECS + 1;
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "backoff_seconds": [60, too_large]
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(
+            result.invalid[0]
+                .1
+                .contains("backoff_seconds elements must be <=")
+        );
+    }
+
+    #[test]
+    fn backoff_element_at_max_accepted() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "backoff_seconds": [MAX_BACKOFF_ELEMENT_SECS]
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.valid.len(), 1);
+    }
+
+    // ── ParsedCallbacks is Debug ──────────────────────────────────────────────
+
+    #[test]
+    fn parsed_callbacks_implements_debug() {
+        let result = parse_callbacks(&json!([valid_callback()]), &default_config());
+        let s = format!("{result:?}");
+        assert!(s.contains("ParsedCallbacks"));
     }
 }

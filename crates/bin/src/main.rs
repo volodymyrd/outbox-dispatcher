@@ -50,10 +50,10 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to load app config for env '{app_env}'"))?;
 
     if let Err(errors) = config.validate() {
-        for e in &errors {
+        for e in &errors.0 {
             eprintln!("config error: {e}");
         }
-        anyhow::bail!("invalid configuration ({} error(s))", errors.len());
+        anyhow::bail!("invalid configuration ({} error(s))", errors.0.len());
     }
 
     init_tracing(&config.log).context("initialising tracing subscriber")?;
