@@ -30,7 +30,8 @@ use crate::schema::{CallbackTarget, CompletionMode};
 // ── Limits ────────────────────────────────────────────────────────────────────
 
 const MAX_EXTERNAL_TIMEOUT_SECS: u64 = 7 * 86_400;
-const MAX_PER_CALLBACK_ATTEMPTS: u64 = 50;
+/// Hard ceiling on per-callback `max_attempts`; also enforced by [`AppConfig::validate`].
+pub const MAX_PER_CALLBACK_ATTEMPTS: u64 = 50;
 const MAX_HANDLER_TIMEOUT_SECS: u64 = 300;
 const MAX_COMPLETION_CYCLES_LIMIT: u64 = 1_000;
 const MAX_BACKOFF_ELEMENT_SECS: u64 = 7 * 86_400;
@@ -291,7 +292,9 @@ fn is_private_host(host: url::Host<&str>) -> bool {
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
         }
-        url::Host::Domain(_) => false, // hostname targets: SSRF via DNS requires a dispatch-time check
+        // TODO(phase4-ssrf): domain targets bypass SSRF checks here; dispatch-time DNS resolution
+        // must block RFC-1918/loopback/link-local resolutions before Phase 4 ships.
+        url::Host::Domain(_) => false,
     }
 }
 
@@ -349,11 +352,14 @@ const RESERVED_HEADERS: &[&str] = &[
 ];
 
 fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, String>, String> {
+    let Some(val) = val else {
+        return Ok(HashMap::new());
+    };
+    let obj = val
+        .as_object()
+        .ok_or_else(|| "invalid_callback: headers must be a JSON object".to_string())?;
     let mut headers = HashMap::new();
     let mut seen_lower: HashSet<String> = HashSet::new();
-    let Some(obj) = val.and_then(|v| v.as_object()) else {
-        return Ok(headers);
-    };
     for (k, v) in obj {
         if !is_valid_header_name(k) {
             return Err(format!(
@@ -1097,6 +1103,29 @@ mod tests {
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
         assert!(result.invalid[0].1.contains("control characters"));
+    }
+
+    #[test]
+    fn headers_must_be_object_rejected() {
+        for bad_headers in [
+            json!("Authorization: Bearer x"),
+            json!(["X-A", "v"]),
+            json!(42),
+        ] {
+            let cb = json!({
+                "name": "abc",
+                "url": "https://example.com/",
+                "signing_key_id": "k",
+                "headers": bad_headers
+            });
+            let result = parse_callbacks(&json!([cb]), &default_config());
+            assert_eq!(
+                result.invalid.len(),
+                1,
+                "non-object headers must be rejected"
+            );
+            assert!(result.invalid[0].1.contains("JSON object"));
+        }
     }
 
     #[test]

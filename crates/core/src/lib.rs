@@ -9,12 +9,15 @@ pub mod schema;
 pub mod timeout_sweep;
 
 pub use config::{
-    AdminConfig, AppConfig, DispatchConfig, HttpClientConfig, RetentionConfig, SigningKeyConfig,
+    AdminConfig, AppConfig, DatabaseConfig, DispatchConfig, HttpClientConfig, LogConfig, LogFormat,
+    RetentionConfig, SigningKeyConfig,
 };
 pub use error::{Error, Result, ValidationErrors};
 pub use keyring::KeyRing;
 pub use repo::{DispatchDefaults, PgRepo, Repo};
-pub use scheduler::{ParsedCallbacks, parse_callbacks, payload_too_large_error};
+pub use scheduler::{
+    MAX_PER_CALLBACK_ATTEMPTS, ParsedCallbacks, parse_callbacks, payload_too_large_error,
+};
 pub use schema::{
     CallbackError, CallbackTarget, CompletionMode, DeadLetterRow, DeliveryRow, DueDelivery,
     EventForDelivery, EventWithDeliveries, ExternalPendingRow, PageParams, RawEvent,

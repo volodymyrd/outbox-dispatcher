@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::ValidationErrors;
+use crate::scheduler::MAX_PER_CALLBACK_ATTEMPTS;
 
 /// Dispatch-loop settings (domain type; no serde — converted from [`DispatchSettings`]).
 #[derive(Debug, Clone)]
@@ -388,6 +389,12 @@ impl AppConfig {
         }
         if self.dispatch.max_attempts == 0 {
             errors.push("dispatch.max_attempts must be > 0".to_string());
+        }
+        if self.dispatch.max_attempts as u64 > MAX_PER_CALLBACK_ATTEMPTS {
+            errors.push(format!(
+                "dispatch.max_attempts must be <= {MAX_PER_CALLBACK_ATTEMPTS} \
+                 (per-callback cap)"
+            ));
         }
         if self.dispatch.handler_timeout_secs == 0 {
             errors.push("dispatch.handler_timeout_secs must be > 0".to_string());
@@ -797,6 +804,21 @@ filter = "info"
         cfg.dispatch.max_attempts = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.0.iter().any(|e| e.contains("max_attempts")));
+    }
+
+    #[test]
+    fn test_validate_max_attempts_above_per_callback_cap() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_attempts = 51;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("max_attempts")));
+    }
+
+    #[test]
+    fn test_validate_max_attempts_at_per_callback_cap() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_attempts = 50;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

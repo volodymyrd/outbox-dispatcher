@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use outbox_dispatcher_core::KeyRing;
-use outbox_dispatcher_core::config::{AppConfig, DatabaseConfig, LogConfig, LogFormat};
+use outbox_dispatcher_core::{AppConfig, DatabaseConfig, KeyRing, LogConfig, LogFormat};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};

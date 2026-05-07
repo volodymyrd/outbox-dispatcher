@@ -95,12 +95,21 @@ impl KeyRing {
     {
         let mut errors = Vec::new();
         let mut keys = HashMap::new();
+        let mut seen_envs: HashMap<String, String> = HashMap::new();
 
         // Sort by id for deterministic error ordering in ValidationErrors.
         let mut entries: Vec<_> = signing_keys.iter().collect();
         entries.sort_by_key(|(id, _)| id.as_str());
 
         for (id, cfg) in entries {
+            if let Some(prior_id) = seen_envs.get(&cfg.secret_env) {
+                errors.push(format!(
+                    "signing_keys[{id}]: secret_env '{}' is already used by key '{prior_id}'",
+                    cfg.secret_env
+                ));
+                continue;
+            }
+            seen_envs.insert(cfg.secret_env.clone(), id.clone());
             match env_resolver(&cfg.secret_env) {
                 Err(reason) => {
                     errors.push(format!(
@@ -114,6 +123,7 @@ impl KeyRing {
                         Zeroizing::new(val.chars().filter(|c| !c.is_whitespace()).collect());
                     let decoded = BASE64_STANDARD
                         .decode(cleaned.as_str())
+                        .or_else(|_| BASE64_STANDARD_NO_PAD.decode(cleaned.as_str()))
                         .or_else(|first_err| {
                             BASE64_URL_SAFE
                                 .decode(cleaned.as_str())
@@ -359,6 +369,22 @@ mod tests {
     }
 
     #[test]
+    fn standard_no_pad_base64_is_accepted() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k".to_string(), make_key_cfg("STD_NO_PAD_ENV"));
+
+        // Strip '=' padding from the standard base64 string.
+        let no_pad = valid_32_byte_b64().trim_end_matches('=');
+        // Confirm there is no '+' or '/' (url-safe chars) — stays in standard alphabet.
+        assert!(!no_pad.contains('+') && !no_pad.contains('/') && !no_pad.contains('-'));
+        let envs: HashMap<&str, &str> = [("STD_NO_PAD_ENV", no_pad)].into_iter().collect();
+
+        let kr = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap();
+        assert!(kr.contains("k"));
+        assert_eq!(kr.get("k").unwrap().len(), 32);
+    }
+
+    #[test]
     fn url_safe_no_pad_base64_is_accepted() {
         // K8s often emits unpadded URL-safe base64; verify we accept it without the trailing '='.
         let mut signing_keys = HashMap::new();
@@ -394,6 +420,20 @@ mod tests {
             !debug_str.contains("AAAA"),
             "decoded secret bytes must not appear in debug output"
         );
+    }
+
+    #[test]
+    fn duplicate_secret_env_returns_error() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k1".to_string(), make_key_cfg("SHARED_ENV"));
+        signing_keys.insert("k2".to_string(), make_key_cfg("SHARED_ENV"));
+
+        let envs: HashMap<&str, &str> = [("SHARED_ENV", valid_32_byte_b64())].into_iter().collect();
+
+        let errs = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap_err();
+        assert_eq!(errs.0.len(), 1);
+        assert!(errs.0[0].contains("SHARED_ENV"));
+        assert!(errs.0[0].contains("already used"));
     }
 
     #[test]
