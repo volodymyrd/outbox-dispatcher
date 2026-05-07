@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::error::ValidationErrors;
-use crate::scheduler::MAX_PER_CALLBACK_ATTEMPTS;
+use crate::scheduler::{
+    MAX_BACKOFF_ELEMENT_SECS, MAX_COMPLETION_CYCLES_LIMIT, MAX_HANDLER_TIMEOUT_SECS,
+    MAX_PER_CALLBACK_ATTEMPTS,
+};
 
 /// Dispatch-loop settings (domain type; no serde — converted from [`DispatchSettings`]).
 #[derive(Debug, Clone)]
@@ -399,16 +402,35 @@ impl AppConfig {
         if self.dispatch.handler_timeout_secs == 0 {
             errors.push("dispatch.handler_timeout_secs must be > 0".to_string());
         }
+        if self.dispatch.handler_timeout_secs > MAX_HANDLER_TIMEOUT_SECS {
+            errors.push(format!(
+                "dispatch.handler_timeout_secs must be <= {MAX_HANDLER_TIMEOUT_SECS}"
+            ));
+        }
         if self.dispatch.lock_buffer_secs == 0 {
             errors.push("dispatch.lock_buffer_secs must be > 0".to_string());
         }
         if self.dispatch.max_completion_cycles == 0 {
             errors.push("dispatch.max_completion_cycles must be > 0".to_string());
         }
+        if self.dispatch.max_completion_cycles as u64 > MAX_COMPLETION_CYCLES_LIMIT {
+            errors.push(format!(
+                "dispatch.max_completion_cycles must be <= {MAX_COMPLETION_CYCLES_LIMIT}"
+            ));
+        }
         if self.dispatch.backoff_secs.is_empty() {
             errors.push("dispatch.backoff_secs must contain at least one value".to_string());
         } else if self.dispatch.backoff_secs.contains(&0) {
             errors.push("dispatch.backoff_secs entries must all be > 0".to_string());
+        } else if self
+            .dispatch
+            .backoff_secs
+            .iter()
+            .any(|&s| s > MAX_BACKOFF_ELEMENT_SECS)
+        {
+            errors.push(format!(
+                "dispatch.backoff_secs entries must all be <= {MAX_BACKOFF_ELEMENT_SECS}"
+            ));
         }
         if self.dispatch.external_timeout_sweep_interval_secs < 10 {
             errors.push("dispatch.external_timeout_sweep_interval_secs must be >= 10".to_string());
@@ -437,11 +459,28 @@ impl AppConfig {
                     .to_string(),
             );
         }
+        if self.admin.bind.parse::<std::net::SocketAddr>().is_err() {
+            errors.push(format!(
+                "admin.bind '{}' is not a valid socket address (expected host:port, e.g. 0.0.0.0:9090)",
+                self.admin.bind
+            ));
+        }
         if self.http_client.connect_timeout_secs == 0 {
             errors.push("http_client.connect_timeout_secs must be > 0".to_string());
         }
         if self.http_client.user_agent.trim().is_empty() {
             errors.push("http_client.user_agent must not be empty".to_string());
+        } else if self
+            .http_client
+            .user_agent
+            .bytes()
+            .any(|b| (b < 0x20 && b != b'\t') || b >= 0x7f)
+        {
+            errors.push(
+                "http_client.user_agent contains invalid characters \
+                 (control characters and non-ASCII bytes are not allowed)"
+                    .to_string(),
+            );
         }
         if self.retention.enabled {
             if self.retention.processed_retention_days == 0 {
@@ -1266,5 +1305,159 @@ filter = "info"
             .unwrap();
         let debug = format!("{:?}", cfg.admin);
         assert!(debug.contains("<unset>"));
+    }
+
+    // ── Fix #1: upper-bound validation ───────────────────────────────────────
+
+    #[test]
+    fn test_validate_handler_timeout_secs_above_max() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.handler_timeout_secs = MAX_HANDLER_TIMEOUT_SECS + 1;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("handler_timeout_secs")));
+    }
+
+    #[test]
+    fn test_validate_handler_timeout_secs_at_max() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.handler_timeout_secs = MAX_HANDLER_TIMEOUT_SECS;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_max_completion_cycles_above_max() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_completion_cycles = (MAX_COMPLETION_CYCLES_LIMIT + 1) as u32;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("max_completion_cycles")));
+    }
+
+    #[test]
+    fn test_validate_max_completion_cycles_at_max() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_completion_cycles = MAX_COMPLETION_CYCLES_LIMIT as u32;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_backoff_secs_element_above_max() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.backoff_secs = vec![MAX_BACKOFF_ELEMENT_SECS + 1];
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("backoff_secs")));
+    }
+
+    #[test]
+    fn test_validate_backoff_secs_element_at_max() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.backoff_secs = vec![MAX_BACKOFF_ELEMENT_SECS];
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── Fix #4: user_agent header-safety ─────────────────────────────────────
+
+    #[test]
+    fn test_validate_user_agent_with_control_chars_rejected() {
+        let mut cfg = build_config(full_toml());
+        cfg.http_client.user_agent = "bot/1.0\r\nX-Evil: yes".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("user_agent")));
+    }
+
+    #[test]
+    fn test_validate_user_agent_normal_string_accepted() {
+        let mut cfg = build_config(full_toml());
+        cfg.http_client.user_agent = "outbox-dispatcher/2.0".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── Fix #5: admin.bind SocketAddr validation ──────────────────────────────
+
+    #[test]
+    fn test_validate_admin_bind_invalid_format_rejected() {
+        let mut cfg = build_config(full_toml());
+        cfg.admin.bind = "not-a-socket-addr".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("admin.bind")));
+    }
+
+    #[test]
+    fn test_validate_admin_bind_valid_format_accepted() {
+        let mut cfg = build_config(full_toml());
+        cfg.admin.bind = "127.0.0.1:8080".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── Fix #6: AppConfig::load file-layering test ────────────────────────────
+    //
+    // These tests mutate process-global env vars (APP_CONFIG_DIR, DATABASE_URL).
+    // They must not run concurrently; LOAD_MUTEX serialises them within this test binary.
+
+    use std::sync::Mutex;
+    static LOAD_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_load_reads_base_config_from_disk() {
+        use std::io::Write;
+        let _guard = LOAD_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut f = std::fs::File::create(dir.path().join("app_config.toml")).unwrap();
+        write!(f, "{}", full_toml()).unwrap();
+
+        // SAFETY: protected by LOAD_MUTEX; no concurrent thread touches these vars.
+        unsafe { std::env::set_var("APP_CONFIG_DIR", dir.path().to_str().unwrap()) };
+        let cfg = AppConfig::load("local").expect("load failed");
+        unsafe { std::env::remove_var("APP_CONFIG_DIR") };
+
+        assert_eq!(cfg.database.url, "postgres://user:pass@localhost/db");
+        assert_eq!(cfg.dispatch.batch_size, 50);
+        assert_eq!(cfg.log.filter, "info");
+    }
+
+    #[test]
+    fn test_load_env_layer_overrides_base() {
+        use std::io::Write;
+        let _guard = LOAD_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut base = std::fs::File::create(dir.path().join("app_config.toml")).unwrap();
+        write!(base, "{}", full_toml()).unwrap();
+
+        let env_override = "[dispatch]\nbatch_size = 99\n";
+        let mut env_file =
+            std::fs::File::create(dir.path().join("app_config_staging.toml")).unwrap();
+        write!(env_file, "{env_override}").unwrap();
+
+        // SAFETY: protected by LOAD_MUTEX; no concurrent thread touches these vars.
+        unsafe { std::env::set_var("APP_CONFIG_DIR", dir.path().to_str().unwrap()) };
+        let cfg = AppConfig::load("staging").expect("load failed");
+        unsafe { std::env::remove_var("APP_CONFIG_DIR") };
+
+        assert_eq!(cfg.dispatch.batch_size, 99);
+        assert_eq!(cfg.database.url, "postgres://user:pass@localhost/db");
+    }
+
+    #[test]
+    fn test_load_database_url_env_var_overrides_file() {
+        use std::io::Write;
+        let _guard = LOAD_MUTEX.lock().unwrap();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut f = std::fs::File::create(dir.path().join("app_config.toml")).unwrap();
+        write!(f, "{}", full_toml()).unwrap();
+
+        // SAFETY: protected by LOAD_MUTEX; no concurrent thread touches these vars.
+        unsafe {
+            std::env::set_var("APP_CONFIG_DIR", dir.path().to_str().unwrap());
+            std::env::set_var("DATABASE_URL", "postgres://from-env/db");
+        }
+        let cfg = AppConfig::load("local").expect("load failed");
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("APP_CONFIG_DIR");
+        }
+
+        assert_eq!(cfg.database.url, "postgres://from-env/db");
     }
 }

@@ -16,6 +16,7 @@ pub use error::{Error, Result, ValidationErrors};
 pub use keyring::KeyRing;
 pub use repo::{DispatchDefaults, PgRepo, Repo};
 pub use scheduler::{
+    MAX_BACKOFF_ELEMENT_SECS, MAX_COMPLETION_CYCLES_LIMIT, MAX_HANDLER_TIMEOUT_SECS,
     MAX_PER_CALLBACK_ATTEMPTS, ParsedCallbacks, parse_callbacks, payload_too_large_error,
 };
 pub use schema::{

@@ -14,10 +14,6 @@ pub enum Error {
     /// Encountered structurally invalid data in a row.
     #[error("Invalid data: {0}")]
     InvalidData(String),
-
-    /// One or more startup / structural validation failures.
-    #[error(transparent)]
-    Validation(#[from] ValidationErrors),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

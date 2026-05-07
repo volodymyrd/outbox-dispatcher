@@ -32,9 +32,12 @@ use crate::schema::{CallbackTarget, CompletionMode};
 const MAX_EXTERNAL_TIMEOUT_SECS: u64 = 7 * 86_400;
 /// Hard ceiling on per-callback `max_attempts`; also enforced by [`AppConfig::validate`].
 pub const MAX_PER_CALLBACK_ATTEMPTS: u64 = 50;
-const MAX_HANDLER_TIMEOUT_SECS: u64 = 300;
-const MAX_COMPLETION_CYCLES_LIMIT: u64 = 1_000;
-const MAX_BACKOFF_ELEMENT_SECS: u64 = 7 * 86_400;
+/// Hard ceiling on per-callback `timeout_seconds`; also enforced by [`AppConfig::validate`].
+pub const MAX_HANDLER_TIMEOUT_SECS: u64 = 300;
+/// Hard ceiling on per-callback `max_completion_cycles`; also enforced by [`AppConfig::validate`].
+pub const MAX_COMPLETION_CYCLES_LIMIT: u64 = 1_000;
+/// Hard ceiling on each element of per-callback `backoff_seconds`; also enforced by [`AppConfig::validate`].
+pub const MAX_BACKOFF_ELEMENT_SECS: u64 = 7 * 86_400;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -128,16 +131,21 @@ fn parse_one_callback(
         )
     })?;
 
-    let name = obj
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            (
+    let name = match obj.get("name") {
+        None => {
+            return Err((
                 format!("[{index}]"),
                 "invalid_callback: missing required field 'name'".to_string(),
+            ));
+        }
+        Some(v) => v.as_str().ok_or_else(|| {
+            (
+                format!("[{index}]"),
+                "invalid_callback: 'name' must be a string".to_string(),
             )
-        })?
-        .to_string();
+        })?,
+    }
+    .to_string();
 
     if !is_valid_callback_name(&name) {
         return Err((
@@ -146,16 +154,21 @@ fn parse_one_callback(
         ));
     }
 
-    let url = obj
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            (
+    let url = match obj.get("url") {
+        None => {
+            return Err((
                 name.clone(),
                 "invalid_callback: missing required field 'url'".to_string(),
+            ));
+        }
+        Some(v) => v.as_str().ok_or_else(|| {
+            (
+                name.clone(),
+                "invalid_callback: 'url' must be a string".to_string(),
             )
-        })?
-        .to_string();
+        })?,
+    }
+    .to_string();
 
     validate_url(
         &url,
@@ -292,10 +305,23 @@ fn is_private_host(host: url::Host<&str>) -> bool {
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
         }
-        // TODO(phase4-ssrf): domain targets bypass SSRF checks here; dispatch-time DNS resolution
-        // must block RFC-1918/loopback/link-local resolutions before Phase 4 ships.
-        url::Host::Domain(_) => false,
+        // Domain targets bypass DNS-level SSRF checks at parse time; dispatch-time DNS
+        // resolution (Phase 4) is the real fix. Block the most dangerous well-known names now.
+        url::Host::Domain(d) => is_blocked_domain(d),
     }
+}
+
+/// Returns `true` for domain names that are definitively private or SSRF-dangerous.
+///
+/// This is a stopgap denylist; full protection requires dispatch-time DNS resolution (Phase 4).
+fn is_blocked_domain(d: &str) -> bool {
+    let lower = d.to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".local")
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".lan")
+        || lower.ends_with(".home.arpa")
 }
 
 fn parse_mode(mode_str: Option<&str>) -> Result<CompletionMode, String> {
@@ -756,7 +782,7 @@ mod tests {
     fn http_url_accepted_when_insecure_allowed() {
         let cb = json!({
             "name": "abc",
-            "url": "http://localhost:8080/hook",
+            "url": "http://example.com:8080/hook",
             "signing_key_id": "k"
         });
         let result = parse_callbacks(&json!([cb]), &insecure_config());
@@ -1477,5 +1503,116 @@ mod tests {
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
         assert!(result.invalid[0].1.contains("illegal characters"));
+    }
+
+    // ── Fix #7: domain-name denylist (SSRF stopgap) ──────────────────────────
+
+    #[test]
+    fn localhost_domain_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://localhost/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn dot_local_domain_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://intranet.local/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn dot_internal_domain_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://metadata.google.internal/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn dot_lan_domain_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://router.lan/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn dot_localhost_subdomain_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://app.localhost/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn public_domain_accepted_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.valid.len(), 1);
+    }
+
+    #[test]
+    fn blocked_domain_accepted_when_allow_private_ip_targets_set() {
+        let config = DispatchConfig {
+            allow_private_ip_targets: true,
+            allow_unsigned_callbacks: true,
+            ..Default::default()
+        };
+        let cb = json!({ "name": "abc", "url": "https://localhost/hook" });
+        let result = parse_callbacks(&json!([cb]), &config);
+        assert_eq!(result.valid.len(), 1);
+    }
+
+    // ── Fix #8: type errors for name/url fields ───────────────────────────────
+
+    #[test]
+    fn name_present_but_non_string_goes_to_invalid() {
+        let cb = json!({ "name": 42, "url": "https://example.com/", "signing_key_id": "k" });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(
+            result.invalid[0].1.contains("must be a string"),
+            "got: {}",
+            result.invalid[0].1
+        );
+    }
+
+    #[test]
+    fn url_present_but_non_string_goes_to_invalid() {
+        let cb = json!({ "name": "abc", "url": 123, "signing_key_id": "k" });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(
+            result.invalid[0].1.contains("must be a string"),
+            "got: {}",
+            result.invalid[0].1
+        );
     }
 }

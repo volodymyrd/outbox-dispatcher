@@ -102,6 +102,10 @@ impl KeyRing {
         entries.sort_by_key(|(id, _)| id.as_str());
 
         for (id, cfg) in entries {
+            if cfg.secret_env.trim().is_empty() {
+                errors.push(format!("signing_keys[{id}]: secret_env must not be empty"));
+                continue;
+            }
             if let Some(prior_id) = seen_envs.get(&cfg.secret_env) {
                 errors.push(format!(
                     "signing_keys[{id}]: secret_env '{}' is already used by key '{prior_id}'",
@@ -458,5 +462,33 @@ mod tests {
             errs.0[2].contains("signing_keys[zzz]"),
             "third error must be zzz"
         );
+    }
+
+    // ── Fix #3: empty secret_env produces clear error ─────────────────────────
+
+    #[test]
+    fn empty_secret_env_returns_clear_error() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k".to_string(), make_key_cfg(""));
+
+        let errs =
+            KeyRing::load_internal(&signing_keys, |_| Err("is not set".to_string())).unwrap_err();
+        assert_eq!(errs.0.len(), 1);
+        assert!(
+            errs.0[0].contains("secret_env must not be empty"),
+            "got: {}",
+            errs.0[0]
+        );
+    }
+
+    #[test]
+    fn whitespace_only_secret_env_returns_clear_error() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k".to_string(), make_key_cfg("   "));
+
+        let errs =
+            KeyRing::load_internal(&signing_keys, |_| Err("is not set".to_string())).unwrap_err();
+        assert_eq!(errs.0.len(), 1);
+        assert!(errs.0[0].contains("secret_env must not be empty"));
     }
 }
