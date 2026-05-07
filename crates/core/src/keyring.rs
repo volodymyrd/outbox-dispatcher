@@ -40,6 +40,8 @@ use zeroize::Zeroizing;
 use crate::config::SigningKeyConfig;
 
 const MIN_SECRET_BYTES: usize = 32;
+// HMAC-SHA256 pre-hashes keys longer than its 64-byte block size; 256 is a generous misconfig
+// ceiling, not a claim that keys beyond 64 bytes provide extra security.
 const MAX_SECRET_BYTES: usize = 256;
 
 /// Resolved keyring: maps signing key ids to their decoded HMAC secret bytes.
@@ -65,36 +67,46 @@ impl KeyRing {
     /// Returns all errors as a list if any env var is missing, fails to base64-decode,
     /// or is shorter than 32 / longer than 256 bytes after decoding.
     ///
-    /// Both standard and URL-safe Base64 encodings are accepted.
+    /// Both standard and URL-safe Base64 encodings are accepted (with or without padding).
+    /// Leading/trailing/internal whitespace in the env var value is stripped before decoding,
+    /// which accommodates wrapped secrets from Kubernetes Secrets and Docker env files.
     pub fn load(signing_keys: &HashMap<String, SigningKeyConfig>) -> Result<Self, Vec<String>> {
-        Self::load_internal(signing_keys, |env| std::env::var(env))
+        Self::load_internal(signing_keys, |env| {
+            std::env::var(env).map_err(|e| match e {
+                std::env::VarError::NotPresent => "is not set".to_string(),
+                std::env::VarError::NotUnicode(_) => {
+                    "is set but contains non-UTF-8 bytes".to_string()
+                }
+            })
+        })
     }
 
     /// Internal builder that accepts a custom environment resolver, enabling safe parallel testing
     /// without mutating the global process environment.
-    fn load_internal<F, E>(
+    fn load_internal<F>(
         signing_keys: &HashMap<String, SigningKeyConfig>,
         env_resolver: F,
     ) -> Result<Self, Vec<String>>
     where
-        F: Fn(&str) -> Result<String, E>,
+        F: Fn(&str) -> Result<String, String>,
     {
         let mut errors = Vec::new();
         let mut keys = HashMap::new();
 
         for (id, cfg) in signing_keys {
             match env_resolver(&cfg.secret_env) {
-                Err(_) => {
+                Err(reason) => {
                     errors.push(format!(
-                        "signing_keys[{id}]: env var '{}' is not set",
+                        "signing_keys[{id}]: env var '{}' {reason}",
                         cfg.secret_env
                     ));
                 }
                 Ok(val) => {
-                    let trimmed = val.trim();
+                    let cleaned: String = val.chars().filter(|c| !c.is_whitespace()).collect();
                     match BASE64_STANDARD
-                        .decode(trimmed)
-                        .or_else(|_| BASE64_URL_SAFE.decode(trimmed))
+                        .decode(&cleaned)
+                        .or_else(|_| BASE64_URL_SAFE.decode(&cleaned))
+                        .or_else(|_| BASE64_URL_SAFE_NO_PAD.decode(&cleaned))
                     {
                         Err(e) => {
                             errors.push(format!(
@@ -163,13 +175,18 @@ mod tests {
 
     fn resolver<'a>(
         envs: &'a HashMap<&'a str, &'a str>,
-    ) -> impl Fn(&str) -> Result<String, ()> + 'a {
-        |k| envs.get(k).map(|s| s.to_string()).ok_or(())
+    ) -> impl Fn(&str) -> Result<String, String> + 'a {
+        |k| {
+            envs.get(k)
+                .map(|s| s.to_string())
+                .ok_or_else(|| "is not set".to_string())
+        }
     }
 
     #[test]
     fn load_empty_signing_keys_succeeds() {
-        let kr = KeyRing::load_internal::<_, ()>(&HashMap::new(), |_| Err(())).unwrap();
+        let kr =
+            KeyRing::load_internal(&HashMap::new(), |_| Err("is not set".to_string())).unwrap();
         assert!(kr.get("any").is_none());
     }
 
@@ -192,7 +209,8 @@ mod tests {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("MISSING_ENV"));
 
-        let errs = KeyRing::load_internal::<_, ()>(&signing_keys, |_| Err(())).unwrap_err();
+        let errs =
+            KeyRing::load_internal(&signing_keys, |_| Err("is not set".to_string())).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("MISSING_ENV"));
     }
@@ -234,8 +252,10 @@ mod tests {
         let large_b64 = "QUFB".repeat(86);
         let envs: HashMap<&str, String> = [("LARGE_ENV", large_b64)].into_iter().collect();
 
-        let errs =
-            KeyRing::load_internal(&signing_keys, |k| envs.get(k).cloned().ok_or(())).unwrap_err();
+        let errs = KeyRing::load_internal(&signing_keys, |k| {
+            envs.get(k).cloned().ok_or_else(|| "is not set".to_string())
+        })
+        .unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("maximum is"));
     }
@@ -256,7 +276,8 @@ mod tests {
 
     #[test]
     fn get_unknown_key_returns_none() {
-        let kr = KeyRing::load_internal::<_, ()>(&HashMap::new(), |_| Err(())).unwrap();
+        let kr =
+            KeyRing::load_internal(&HashMap::new(), |_| Err("is not set".to_string())).unwrap();
         assert!(kr.get("no-such-key").is_none());
         assert!(!kr.contains("no-such-key"));
     }
@@ -269,8 +290,30 @@ mod tests {
         let spaced = format!("  {}  ", valid_32_byte_b64());
         let envs: HashMap<&str, String> = [("WHITESPACE_ENV", spaced)].into_iter().collect();
 
-        let kr = KeyRing::load_internal(&signing_keys, |k| envs.get(k).cloned().ok_or(())).unwrap();
+        let kr = KeyRing::load_internal(&signing_keys, |k| {
+            envs.get(k).cloned().ok_or_else(|| "is not set".to_string())
+        })
+        .unwrap();
         assert!(kr.contains("k"));
+    }
+
+    #[test]
+    fn key_with_internal_whitespace_is_accepted() {
+        // Simulates a K8s secret that was base64-encoded with line breaks (every 76 chars).
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k".to_string(), make_key_cfg("WRAPPED_ENV"));
+
+        // Insert newlines inside the base64 string as k8s multi-line secrets do.
+        let b64 = valid_32_byte_b64();
+        let wrapped = format!("{}\n{}", &b64[..22], &b64[22..]);
+        let envs: HashMap<&str, String> = [("WRAPPED_ENV", wrapped)].into_iter().collect();
+
+        let kr = KeyRing::load_internal(&signing_keys, |k| {
+            envs.get(k).cloned().ok_or_else(|| "is not set".to_string())
+        })
+        .unwrap();
+        assert!(kr.contains("k"));
+        assert_eq!(kr.get("k").unwrap().len(), 32);
     }
 
     #[test]
@@ -300,5 +343,21 @@ mod tests {
         let errs = KeyRing::load(&signing_keys).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("__OUTBOX_DISPATCHER_TEST_NONEXISTENT_VAR__"));
+    }
+
+    #[test]
+    fn url_safe_no_pad_base64_is_accepted() {
+        // K8s often emits unpadded URL-safe base64; verify we accept it without the trailing '='.
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k".to_string(), make_key_cfg("URL_SAFE_NO_PAD_ENV"));
+
+        // valid_32_byte_b64() decoded then re-encoded without padding.
+        // "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=" → strip '=' → no-pad form.
+        let no_pad = valid_32_byte_b64().trim_end_matches('=');
+        let envs: HashMap<&str, &str> = [("URL_SAFE_NO_PAD_ENV", no_pad)].into_iter().collect();
+
+        let kr = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap();
+        assert!(kr.contains("k"));
+        assert_eq!(kr.get("k").unwrap().len(), 32);
     }
 }

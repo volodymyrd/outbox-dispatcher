@@ -28,6 +28,10 @@ pub struct DispatchConfig {
     pub allow_insecure_urls: bool,
     /// If true, allows callbacks that omit the `signing_key_id` field.
     pub allow_unsigned_callbacks: bool,
+    /// If true, allows callback URLs targeting private/loopback IP addresses (SSRF guard bypass).
+    pub allow_private_ip_targets: bool,
+    /// Maximum number of callbacks per event; excess callbacks are immediately dead-lettered.
+    pub max_callbacks_per_event: u32,
 }
 
 impl Default for DispatchConfig {
@@ -52,6 +56,8 @@ impl Default for DispatchConfig {
             notify_channel: "outbox_events_new".to_string(),
             allow_insecure_urls: false,
             allow_unsigned_callbacks: false,
+            allow_private_ip_targets: false,
+            max_callbacks_per_event: 32,
         }
     }
 }
@@ -91,6 +97,10 @@ pub struct LogConfig {
     pub filter: String,
 }
 
+fn default_max_callbacks_per_event() -> u32 {
+    32
+}
+
 // ── Dispatch settings (TOML-friendly) ────────────────────────────────────────
 
 /// Deserializable mirror of [`DispatchConfig`] that stores durations as seconds.
@@ -109,6 +119,13 @@ pub struct DispatchSettings {
     pub notify_channel: String,
     pub allow_insecure_urls: bool,
     pub allow_unsigned_callbacks: bool,
+    /// If true, allows callback URLs that target private/loopback IP addresses.
+    /// Off by default; only enable in dev/integration-test environments.
+    #[serde(default)]
+    pub allow_private_ip_targets: bool,
+    /// Maximum number of callbacks allowed per event. Events with more are immediately dead-lettered.
+    #[serde(default = "default_max_callbacks_per_event")]
+    pub max_callbacks_per_event: u32,
 }
 
 impl From<DispatchSettings> for DispatchConfig {
@@ -132,6 +149,8 @@ impl From<DispatchSettings> for DispatchConfig {
             notify_channel: s.notify_channel,
             allow_insecure_urls: s.allow_insecure_urls,
             allow_unsigned_callbacks: s.allow_unsigned_callbacks,
+            allow_private_ip_targets: s.allow_private_ip_targets,
+            max_callbacks_per_event: s.max_callbacks_per_event,
         }
     }
 }
@@ -253,6 +272,7 @@ impl Default for RetentionConfig {
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
     pub dispatch: DispatchSettings,
@@ -293,7 +313,9 @@ impl AppConfig {
             )?
             .set_override_option(
                 "admin.auth_token",
-                std::env::var("ADMIN_TOKEN").ok().filter(|s| !s.is_empty()),
+                std::env::var("ADMIN_TOKEN")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
             )?
             .build()?
             .try_deserialize()
@@ -319,14 +341,25 @@ impl AppConfig {
         if self.database.acquire_timeout_secs == 0 {
             errors.push("database.acquire_timeout_secs must be > 0".to_string());
         }
+        if self.dispatch.poll_interval_secs == 0 {
+            errors.push("dispatch.poll_interval_secs must be > 0".to_string());
+        }
         if self.dispatch.batch_size <= 0 {
             errors.push("dispatch.batch_size must be > 0".to_string());
         }
         if self.dispatch.max_attempts == 0 {
             errors.push("dispatch.max_attempts must be > 0".to_string());
         }
+        if self.dispatch.handler_timeout_secs == 0 {
+            errors.push("dispatch.handler_timeout_secs must be > 0".to_string());
+        }
+        if self.dispatch.max_completion_cycles == 0 {
+            errors.push("dispatch.max_completion_cycles must be > 0".to_string());
+        }
         if self.dispatch.backoff_secs.is_empty() {
             errors.push("dispatch.backoff_secs must contain at least one value".to_string());
+        } else if self.dispatch.backoff_secs.contains(&0) {
+            errors.push("dispatch.backoff_secs entries must all be > 0".to_string());
         }
         if self.dispatch.external_timeout_sweep_interval_secs < 10 {
             errors.push("dispatch.external_timeout_sweep_interval_secs must be >= 10".to_string());
@@ -334,8 +367,26 @@ impl AppConfig {
         if self.dispatch.payload_size_limit_bytes < 1024 {
             errors.push("dispatch.payload_size_limit_bytes must be >= 1024 (1 KB)".to_string());
         }
+        if self.dispatch.payload_size_limit_bytes > 104_857_600 {
+            errors.push(
+                "dispatch.payload_size_limit_bytes must be <= 104857600 (100 MB)".to_string(),
+            );
+        }
+        if self.dispatch.notify_channel.trim().is_empty() {
+            errors.push("dispatch.notify_channel must not be empty".to_string());
+        }
+        if self.dispatch.max_callbacks_per_event == 0 {
+            errors.push("dispatch.max_callbacks_per_event must be > 0".to_string());
+        }
         if self.log.filter.trim().is_empty() {
             errors.push("log.filter must not be empty".to_string());
+        }
+        if self.admin.auth_token.trim().is_empty() {
+            errors.push(
+                "admin.auth_token is empty — set ADMIN_TOKEN env var or APP__ADMIN__AUTH_TOKEN; \
+                 the admin API must not run without a bearer token"
+                    .to_string(),
+            );
         }
         if self.http_client.connect_timeout_secs == 0 {
             errors.push("http_client.connect_timeout_secs must be > 0".to_string());
@@ -401,10 +452,16 @@ payload_size_limit_bytes = 1048576
 notify_channel = "outbox_events_new"
 allow_insecure_urls = false
 allow_unsigned_callbacks = false
+allow_private_ip_targets = false
+max_callbacks_per_event = 32
 
 [log]
 format = "json"
 filter = "info"
+
+[admin]
+bind = "0.0.0.0:9090"
+auth_token = "test-token"
 "#
     }
 
@@ -473,6 +530,8 @@ filter = "debug"
         assert_eq!(d.notify_channel, "outbox_events_new");
         assert!(!d.allow_insecure_urls);
         assert!(!d.allow_unsigned_callbacks);
+        assert!(!d.allow_private_ip_targets);
+        assert_eq!(d.max_callbacks_per_event, 32);
     }
 
     #[test]
@@ -501,6 +560,8 @@ filter = "debug"
         assert_eq!(dc.notify_channel, "outbox_events_new");
         assert!(!dc.allow_insecure_urls);
         assert!(!dc.allow_unsigned_callbacks);
+        assert!(!dc.allow_private_ip_targets);
+        assert_eq!(dc.max_callbacks_per_event, 32);
     }
 
     #[test]
@@ -759,7 +820,31 @@ filter = "info"
 
     #[test]
     fn test_admin_defaults_when_absent() {
-        let cfg = build_config(full_toml());
+        // Build a config that intentionally omits the [admin] section to verify serde defaults.
+        let toml_no_admin = r#"
+[database]
+url = "postgres://user:pass@localhost/db"
+max_connections = 10
+
+[dispatch]
+poll_interval_secs = 5
+batch_size = 50
+max_attempts = 6
+backoff_secs = [30]
+handler_timeout_secs = 30
+lock_buffer_secs = 10
+external_timeout_sweep_interval_secs = 60
+max_completion_cycles = 20
+payload_size_limit_bytes = 1048576
+notify_channel = "outbox_events_new"
+allow_insecure_urls = false
+allow_unsigned_callbacks = false
+
+[log]
+format = "json"
+filter = "info"
+"#;
+        let cfg = build_config(toml_no_admin);
         assert_eq!(cfg.admin.bind, "0.0.0.0:9090");
         assert_eq!(cfg.admin.auth_token, "");
     }
@@ -790,11 +875,20 @@ filter = "info"
 
     #[test]
     fn test_admin_config_from_toml() {
-        let toml = format!(
-            "{}\n\n[admin]\nbind = \"127.0.0.1:8080\"\nauth_token = \"secret\"",
-            full_toml()
-        );
-        let cfg = build_config(&toml);
+        // Layer an override on top of full_toml() using a second source to avoid duplicate [admin] headers.
+        let cfg: AppConfig = config::Config::builder()
+            .add_source(config::File::from_str(
+                full_toml(),
+                config::FileFormat::Toml,
+            ))
+            .add_source(config::File::from_str(
+                "[admin]\nbind = \"127.0.0.1:8080\"\nauth_token = \"secret\"",
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
         assert_eq!(cfg.admin.bind, "127.0.0.1:8080");
         assert_eq!(cfg.admin.auth_token, "secret");
     }
@@ -932,11 +1026,106 @@ filter = "info"
 
     #[test]
     fn test_validate_passes_with_full_config() {
-        let toml = format!(
-            "{}\n\n[admin]\nbind = \"0.0.0.0:9090\"\nauth_token = \"tok\"\n\n[http_client]\nconnect_timeout_secs = 5\nuser_agent = \"test/1.0\"\nallow_insecure_tls = false\n\n[retention]\nenabled = true\nprocessed_retention_days = 7\ndead_letter_retention_days = 30\ncleanup_interval_secs = 3600\nbatch_limit = 1000",
-            full_toml()
-        );
-        let cfg = build_config(&toml);
+        // full_toml() already includes [admin]; layer http_client and retention via a second source.
+        let cfg: AppConfig = config::Config::builder()
+            .add_source(config::File::from_str(full_toml(), config::FileFormat::Toml))
+            .add_source(config::File::from_str(
+                "[http_client]\nconnect_timeout_secs = 5\nuser_agent = \"test/1.0\"\nallow_insecure_tls = false\n\n[retention]\nenabled = true\nprocessed_retention_days = 7\ndead_letter_retention_days = 30\ncleanup_interval_secs = 3600\nbatch_limit = 1000",
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── New validate() checks ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_poll_interval_secs_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.poll_interval_secs = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("poll_interval_secs")));
+    }
+
+    #[test]
+    fn test_validate_handler_timeout_secs_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.handler_timeout_secs = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("handler_timeout_secs")));
+    }
+
+    #[test]
+    fn test_validate_max_completion_cycles_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_completion_cycles = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("max_completion_cycles")));
+    }
+
+    #[test]
+    fn test_validate_backoff_secs_contains_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.backoff_secs = vec![0, 60];
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("backoff_secs")));
+    }
+
+    #[test]
+    fn test_validate_notify_channel_empty() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.notify_channel = String::new();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("notify_channel")));
+    }
+
+    #[test]
+    fn test_validate_notify_channel_whitespace() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.notify_channel = "   ".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("notify_channel")));
+    }
+
+    #[test]
+    fn test_validate_payload_size_above_maximum() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.payload_size_limit_bytes = 104_857_601;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("payload_size_limit_bytes")));
+    }
+
+    #[test]
+    fn test_validate_payload_size_at_maximum() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.payload_size_limit_bytes = 104_857_600;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_admin_auth_token_empty() {
+        let mut cfg = build_config(full_toml());
+        cfg.admin.auth_token = String::new();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("auth_token")));
+    }
+
+    #[test]
+    fn test_validate_admin_auth_token_whitespace() {
+        let mut cfg = build_config(full_toml());
+        cfg.admin.auth_token = "   ".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("auth_token")));
+    }
+
+    #[test]
+    fn test_validate_max_callbacks_per_event_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_callbacks_per_event = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("max_callbacks_per_event")));
     }
 }

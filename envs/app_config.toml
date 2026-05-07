@@ -19,6 +19,8 @@ payload_size_limit_bytes = 1048576
 notify_channel = "outbox_events_new"
 allow_insecure_urls = false
 allow_unsigned_callbacks = false
+allow_private_ip_targets = false
+max_callbacks_per_event = 32
 
 [log]
 format = "json"

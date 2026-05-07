@@ -69,6 +69,18 @@ pub fn parse_callbacks(
         return ParsedCallbacks { valid, invalid };
     };
 
+    if array.len() > config.max_callbacks_per_event as usize {
+        invalid.push((
+            "<root>".to_string(),
+            format!(
+                "invalid_callback: too many callbacks in event ({}); max is {}",
+                array.len(),
+                config.max_callbacks_per_event
+            ),
+        ));
+        return ParsedCallbacks { valid, invalid };
+    }
+
     for (i, element) in array.iter().enumerate() {
         match parse_one_callback(element, i, config) {
             Ok(target) => {
@@ -142,7 +154,12 @@ fn parse_one_callback(
         })?
         .to_string();
 
-    validate_url(&url, config.allow_insecure_urls).map_err(|r| (name.clone(), r))?;
+    validate_url(
+        &url,
+        config.allow_insecure_urls,
+        config.allow_private_ip_targets,
+    )
+    .map_err(|r| (name.clone(), r))?;
 
     let mode =
         parse_mode(obj.get("mode").and_then(|v| v.as_str())).map_err(|r| (name.clone(), r))?;
@@ -205,25 +222,49 @@ fn is_valid_callback_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
 }
 
-fn validate_url(url_str: &str, allow_insecure: bool) -> Result<(), String> {
+fn validate_url(
+    url_str: &str,
+    allow_insecure: bool,
+    allow_private_ip_targets: bool,
+) -> Result<(), String> {
     let parsed = url::Url::parse(url_str)
         .map_err(|_| format!("invalid_callback: url '{url_str}' is structurally malformed"))?;
 
     let scheme = parsed.scheme();
-    if scheme == "https" {
-        return Ok(());
+    match (scheme, allow_insecure) {
+        ("https", _) | ("http", true) => {}
+        _ => {
+            return Err(if allow_insecure {
+                format!(
+                    "invalid_callback: url must use http:// or https:// scheme; got '{url_str}'"
+                )
+            } else {
+                format!("invalid_callback: url must use https:// scheme; got '{url_str}'")
+            });
+        }
     }
-    if allow_insecure && scheme == "http" {
-        return Ok(());
+
+    let host = parsed
+        .host()
+        .ok_or_else(|| format!("invalid_callback: url '{url_str}' has no host"))?;
+
+    if !allow_private_ip_targets && is_private_host(host) {
+        return Err(format!(
+            "invalid_callback: url '{url_str}' targets a private or loopback address \
+             (set allow_private_ip_targets=true to allow local targets)"
+        ));
     }
-    if allow_insecure {
-        Err(format!(
-            "invalid_callback: url must use http:// or https:// scheme; got '{url_str}'"
-        ))
-    } else {
-        Err(format!(
-            "invalid_callback: url must use https:// scheme; got '{url_str}'"
-        ))
+
+    Ok(())
+}
+
+fn is_private_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+        url::Host::Domain(_) => false, // hostname targets: SSRF via DNS requires a dispatch-time check
     }
 }
 
@@ -264,8 +305,25 @@ fn is_valid_header_name(name: &str) -> bool {
         })
 }
 
+// Headers that the dispatcher or HTTP stack controls; publishers must not override them.
+const RESERVED_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "host",
+    "content-length",
+    "content-type",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "expect",
+    "te",
+    "trailer",
+    "proxy-authorization",
+];
+
 fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, String>, String> {
     let mut headers = HashMap::new();
+    let mut seen_lower: HashSet<String> = HashSet::new();
     let Some(obj) = val.and_then(|v| v.as_object()) else {
         return Ok(headers);
     };
@@ -276,9 +334,14 @@ fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, Stri
             ));
         }
         let k_lower = k.to_ascii_lowercase();
-        if k_lower == "authorization" || k_lower == "cookie" || k_lower.starts_with("x-outbox-") {
+        if RESERVED_HEADERS.contains(&k_lower.as_str()) || k_lower.starts_with("x-outbox-") {
             return Err(format!(
                 "invalid_callback: header '{k}' is reserved and cannot be set"
+            ));
+        }
+        if !seen_lower.insert(k_lower) {
+            return Err(format!(
+                "invalid_callback: header '{k}' is a duplicate (header names are case-insensitive)"
             ));
         }
         let val_str = v
@@ -1012,5 +1075,171 @@ mod tests {
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
         assert!(result.invalid[0].1.contains("malformed"));
+    }
+
+    // ── H2: additional reserved headers ──────────────────────────────────────
+
+    #[test]
+    fn reserved_host_header_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "Host": "evil.example.com" }
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("reserved"));
+    }
+
+    #[test]
+    fn reserved_content_length_header_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "Content-Length": "0" }
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("reserved"));
+    }
+
+    #[test]
+    fn reserved_transfer_encoding_header_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "Transfer-Encoding": "chunked" }
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("reserved"));
+    }
+
+    // ── L1: case-insensitive duplicate header detection ───────────────────────
+
+    #[test]
+    fn duplicate_header_name_case_insensitive_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "X-Service": "a", "x-service": "b" }
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("duplicate"));
+    }
+
+    // ── H3: URL host and SSRF checks ─────────────────────────────────────────
+
+    #[test]
+    fn loopback_ipv4_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://127.0.0.1/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn private_ipv4_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://192.168.1.1/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn link_local_ipv4_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://169.254.169.254/latest/meta-data/",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn loopback_ipv6_rejected_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[::1]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn private_ip_accepted_when_allow_private_ip_targets_set() {
+        let config = DispatchConfig {
+            allow_private_ip_targets: true,
+            allow_unsigned_callbacks: true,
+            ..Default::default()
+        };
+        let cb = json!({
+            "name": "abc",
+            "url": "https://127.0.0.1/hook"
+        });
+        let result = parse_callbacks(&json!([cb]), &config);
+        assert_eq!(result.valid.len(), 1);
+    }
+
+    #[test]
+    fn public_ip_accepted_by_default() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://93.184.216.34/",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.valid.len(), 1);
+    }
+
+    // ── L6: max_callbacks_per_event ───────────────────────────────────────────
+
+    #[test]
+    fn too_many_callbacks_rejected() {
+        let config = DispatchConfig {
+            max_callbacks_per_event: 2,
+            ..Default::default()
+        };
+        let cbs = json!([
+            { "name": "abc", "url": "https://a.example.com/", "signing_key_id": "k" },
+            { "name": "def", "url": "https://b.example.com/", "signing_key_id": "k" },
+            { "name": "ghi", "url": "https://c.example.com/", "signing_key_id": "k" }
+        ]);
+        let result = parse_callbacks(&cbs, &config);
+        assert!(result.valid.is_empty());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("too many callbacks"));
+    }
+
+    #[test]
+    fn callbacks_at_max_limit_accepted() {
+        let config = DispatchConfig {
+            max_callbacks_per_event: 2,
+            ..Default::default()
+        };
+        let cbs = json!([
+            { "name": "abc", "url": "https://a.example.com/", "signing_key_id": "k" },
+            { "name": "def", "url": "https://b.example.com/", "signing_key_id": "k" }
+        ]);
+        let result = parse_callbacks(&cbs, &config);
+        assert_eq!(result.valid.len(), 2);
+        assert!(result.invalid.is_empty());
     }
 }
