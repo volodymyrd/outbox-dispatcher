@@ -96,7 +96,11 @@ impl KeyRing {
         let mut errors = Vec::new();
         let mut keys = HashMap::new();
 
-        for (id, cfg) in signing_keys {
+        // Sort by id for deterministic error ordering in ValidationErrors.
+        let mut entries: Vec<_> = signing_keys.iter().collect();
+        entries.sort_by_key(|(id, _)| id.as_str());
+
+        for (id, cfg) in entries {
             match env_resolver(&cfg.secret_env) {
                 Err(reason) => {
                     errors.push(format!(
@@ -105,13 +109,17 @@ impl KeyRing {
                     ));
                 }
                 Ok(val) => {
-                    let cleaned: String = val.chars().filter(|c| !c.is_whitespace()).collect();
-                    let decoded = BASE64_STANDARD.decode(&cleaned).or_else(|first_err| {
-                        BASE64_URL_SAFE
-                            .decode(&cleaned)
-                            .or_else(|_| BASE64_URL_SAFE_NO_PAD.decode(&cleaned))
-                            .map_err(|_| first_err)
-                    });
+                    let val = Zeroizing::new(val);
+                    let cleaned: Zeroizing<String> =
+                        Zeroizing::new(val.chars().filter(|c| !c.is_whitespace()).collect());
+                    let decoded = BASE64_STANDARD
+                        .decode(cleaned.as_str())
+                        .or_else(|first_err| {
+                            BASE64_URL_SAFE
+                                .decode(cleaned.as_str())
+                                .or_else(|_| BASE64_URL_SAFE_NO_PAD.decode(cleaned.as_str()))
+                                .map_err(|_| first_err)
+                        });
                     match decoded {
                         Err(e) => {
                             errors.push(format!(
@@ -385,6 +393,30 @@ mod tests {
         assert!(
             !debug_str.contains("AAAA"),
             "decoded secret bytes must not appear in debug output"
+        );
+    }
+
+    #[test]
+    fn load_errors_are_in_deterministic_key_order() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("zzz".to_string(), make_key_cfg("MISSING_ZZZ"));
+        signing_keys.insert("aaa".to_string(), make_key_cfg("MISSING_AAA"));
+        signing_keys.insert("mmm".to_string(), make_key_cfg("MISSING_MMM"));
+
+        let errs =
+            KeyRing::load_internal(&signing_keys, |_| Err("is not set".to_string())).unwrap_err();
+        assert_eq!(errs.0.len(), 3);
+        assert!(
+            errs.0[0].contains("signing_keys[aaa]"),
+            "first error must be aaa"
+        );
+        assert!(
+            errs.0[1].contains("signing_keys[mmm]"),
+            "second error must be mmm"
+        );
+        assert!(
+            errs.0[2].contains("signing_keys[zzz]"),
+            "third error must be zzz"
         );
     }
 }

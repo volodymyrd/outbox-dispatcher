@@ -59,7 +59,7 @@ impl Default for DispatchConfig {
             allow_insecure_urls: false,
             allow_unsigned_callbacks: false,
             allow_private_ip_targets: false,
-            max_callbacks_per_event: 32,
+            max_callbacks_per_event: DEFAULT_MAX_CALLBACKS_PER_EVENT,
         }
     }
 }
@@ -70,7 +70,7 @@ fn default_acquire_timeout_secs() -> u64 {
     10
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
@@ -78,6 +78,24 @@ pub struct DatabaseConfig {
     /// How long to wait for a free connection before returning an error.
     #[serde(default = "default_acquire_timeout_secs")]
     pub acquire_timeout_secs: u64,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL embeds the database password; never expose it in debug output.
+        f.debug_struct("DatabaseConfig")
+            .field(
+                "url",
+                &if self.url.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("max_connections", &self.max_connections)
+            .field("acquire_timeout_secs", &self.acquire_timeout_secs)
+            .finish()
+    }
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
@@ -99,8 +117,10 @@ pub struct LogConfig {
     pub filter: String,
 }
 
+const DEFAULT_MAX_CALLBACKS_PER_EVENT: u32 = 32;
+
 fn default_max_callbacks_per_event() -> u32 {
-    32
+    DEFAULT_MAX_CALLBACKS_PER_EVENT
 }
 
 // ── Dispatch settings (TOML-friendly) ────────────────────────────────────────
@@ -173,7 +193,7 @@ fn default_admin_bind() -> String {
     "0.0.0.0:9090".to_string()
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     #[serde(default = "default_admin_bind")]
@@ -181,6 +201,23 @@ pub struct AdminConfig {
     /// Bearer token required by all admin endpoints. Set via `ADMIN_TOKEN` env var.
     #[serde(default)]
     pub auth_token: String,
+}
+
+impl std::fmt::Debug for AdminConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // auth_token is a bearer secret; never expose it in debug output.
+        f.debug_struct("AdminConfig")
+            .field("bind", &self.bind)
+            .field(
+                "auth_token",
+                &if self.auth_token.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .finish()
+    }
 }
 
 impl Default for AdminConfig {
@@ -354,6 +391,9 @@ impl AppConfig {
         }
         if self.dispatch.handler_timeout_secs == 0 {
             errors.push("dispatch.handler_timeout_secs must be > 0".to_string());
+        }
+        if self.dispatch.lock_buffer_secs == 0 {
+            errors.push("dispatch.lock_buffer_secs must be > 0".to_string());
         }
         if self.dispatch.max_completion_cycles == 0 {
             errors.push("dispatch.max_completion_cycles must be > 0".to_string());
@@ -1143,5 +1183,66 @@ filter = "info"
         cfg.dispatch.max_callbacks_per_event = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.0.iter().any(|e| e.contains("max_callbacks_per_event")));
+    }
+
+    #[test]
+    fn test_validate_lock_buffer_secs_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.lock_buffer_secs = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("lock_buffer_secs")));
+    }
+
+    #[test]
+    fn test_database_config_debug_redacts_url() {
+        let cfg = build_config(full_toml());
+        let debug = format!("{:?}", cfg.database);
+        assert!(
+            !debug.contains("postgres://"),
+            "DB URL must not appear in Debug output"
+        );
+        assert!(
+            !debug.contains("user:pass"),
+            "DB password must not appear in Debug output"
+        );
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_database_config_debug_shows_unset_for_empty_url() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.url = String::new();
+        let debug = format!("{:?}", cfg.database);
+        assert!(debug.contains("<unset>"));
+    }
+
+    #[test]
+    fn test_admin_config_debug_redacts_auth_token() {
+        let cfg = build_config(full_toml());
+        let debug = format!("{:?}", cfg.admin);
+        assert!(
+            !debug.contains("test-token"),
+            "auth_token must not appear in Debug output"
+        );
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_admin_config_debug_shows_unset_for_empty_token() {
+        let cfg: AppConfig = config::Config::builder()
+            .add_source(config::File::from_str(
+                full_toml(),
+                config::FileFormat::Toml,
+            ))
+            .add_source(config::File::from_str(
+                "[admin]\nauth_token = \"\"",
+                config::FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        let debug = format!("{:?}", cfg.admin);
+        assert!(debug.contains("<unset>"));
     }
 }

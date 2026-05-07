@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use outbox_dispatcher_core::KeyRing;
 use outbox_dispatcher_core::config::{AppConfig, DatabaseConfig, LogConfig, LogFormat};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -54,6 +55,14 @@ async fn main() -> Result<()> {
             eprintln!("config error: {e}");
         }
         anyhow::bail!("invalid configuration ({} error(s))", errors.0.len());
+    }
+
+    // Fail fast if any configured signing key cannot be resolved from its env var.
+    if let Err(errors) = KeyRing::load(&config.signing_keys) {
+        for e in &errors.0 {
+            eprintln!("signing key error: {e}");
+        }
+        anyhow::bail!("invalid signing keys ({} error(s))", errors.0.len());
     }
 
     init_tracing(&config.log).context("initialising tracing subscriber")?;

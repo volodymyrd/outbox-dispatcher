@@ -272,13 +272,18 @@ fn is_private_host(host: url::Host<&str>) -> bool {
             ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
         }
         url::Host::Ipv6(ip) => {
-            // Unwrap IPv4-mapped addresses (e.g. ::ffff:127.0.0.1) and apply IPv4 rules.
-            if let Some(v4) = ip.to_ipv4_mapped() {
-                return v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified();
+            // `to_ipv4()` inherently extracts the underlying IPv4 address from BOTH
+            // IPv4-mapped (::ffff:x/96) and IPv4-compatible (::x/96) addresses.
+            if let Some(v4) = ip.to_ipv4() {
+                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                {
+                    return true;
+                }
             }
+
+            // Fall through to native IPv6 checks.
+            // (Note: `::1` yields `0.0.0.1` from `to_ipv4()`, which skips the v4 checks
+            // above and is correctly caught right here by `is_loopback()`).
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
@@ -369,10 +374,11 @@ fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, Stri
             .ok_or_else(|| format!("invalid_callback: header '{k}' value must be a string"))?;
         if val_str
             .bytes()
-            .any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+            .any(|b| (b < 0x20 && b != b'\t') || b >= 0x7f)
         {
             return Err(format!(
-                "invalid_callback: header '{k}' value contains illegal control characters"
+                "invalid_callback: header '{k}' value contains illegal characters \
+                 (control characters and non-ASCII bytes are not allowed)"
             ));
         }
         headers.insert(k.clone(), val_str.to_string());
@@ -1396,5 +1402,49 @@ mod tests {
         let result = parse_callbacks(&json!([valid_callback()]), &default_config());
         let s = format!("{result:?}");
         assert!(s.contains("ParsedCallbacks"));
+    }
+
+    // ── IPv4-compatible IPv6 SSRF ─────────────────────────────────────────────
+
+    #[test]
+    fn ipv4_compatible_ipv6_loopback_rejected_by_default() {
+        // ::127.0.0.1 is a deprecated IPv4-compatible address — must be blocked.
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[::127.0.0.1]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    #[test]
+    fn ipv4_compatible_ipv6_private_rejected_by_default() {
+        // ::192.168.1.1 in IPv4-compatible form — must be blocked.
+        let cb = json!({
+            "name": "abc",
+            "url": "https://[::192.168.1.1]/hook",
+            "signing_key_id": "k"
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("private or loopback"));
+    }
+
+    // ── Header obs-text (non-ASCII bytes) ────────────────────────────────────
+
+    #[test]
+    fn header_value_with_obs_text_rejected() {
+        // 0x80..=0xFF are RFC 9110 "obs-text" — obsolete and rejected here.
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "X-Custom": "caf\u{00e9}" }
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("illegal characters"));
     }
 }
