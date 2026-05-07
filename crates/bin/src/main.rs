@@ -67,6 +67,12 @@ async fn main() -> Result<()> {
             "allow_unsigned_callbacks is enabled — callbacks without a signing_key_id are accepted"
         );
     }
+    if config.http_client.allow_insecure_tls {
+        warn!(
+            "http_client.allow_insecure_tls is enabled — TLS certificate verification is \
+             DISABLED; this is for development only and must NOT be used in production"
+        );
+    }
 
     match cli.command {
         Some(Command::Migrations {

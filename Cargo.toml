@@ -17,6 +17,7 @@ repository = "https://github.com/volodymyrd/outbox-dispatcher"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"] }
@@ -37,4 +38,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }

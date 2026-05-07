@@ -1521,6 +1521,7 @@ name = "outbox-dispatcher-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "config",
  "rand 0.10.1",
@@ -1529,6 +1530,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tracing",
+ "url",
  "uuid",
 ]
 

@@ -23,3 +23,25 @@ allow_unsigned_callbacks = false
 [log]
 format = "json"
 filter = "info"
+
+[admin]
+bind = "0.0.0.0:9090"
+# auth_token is required for admin endpoints; set via ADMIN_TOKEN env var or .env.toml
+
+[http_client]
+connect_timeout_secs = 5
+user_agent = "outbox-dispatcher/1.0"
+allow_insecure_tls = false
+
+[retention]
+enabled = false
+processed_retention_days = 7
+dead_letter_retention_days = 30
+cleanup_interval_secs = 3600
+batch_limit = 1000
+
+# Signing keys: maps key id -> env var name holding the base64-encoded HMAC secret.
+# Example:
+# [signing_keys]
+# "welcome-v1" = { secret_env = "WELCOME_HMAC_SECRET" }
+[signing_keys]
