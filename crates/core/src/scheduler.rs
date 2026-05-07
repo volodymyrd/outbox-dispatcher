@@ -274,11 +274,13 @@ fn is_private_host(host: url::Host<&str>) -> bool {
         url::Host::Ipv6(ip) => {
             // `to_ipv4()` inherently extracts the underlying IPv4 address from BOTH
             // IPv4-mapped (::ffff:x/96) and IPv4-compatible (::x/96) addresses.
-            if let Some(v4) = ip.to_ipv4() {
-                if v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                {
-                    return true;
-                }
+            if let Some(v4) = ip.to_ipv4()
+                && (v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified())
+            {
+                return true;
             }
 
             // Fall through to native IPv6 checks.
