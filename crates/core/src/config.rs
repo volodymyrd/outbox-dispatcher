@@ -63,6 +63,7 @@ fn default_acquire_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
@@ -82,6 +83,7 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     pub format: LogFormat,
     /// Tracing filter string (e.g. `"info,outbox_dispatcher_core=debug"`).
@@ -93,6 +95,7 @@ pub struct LogConfig {
 
 /// Deserializable mirror of [`DispatchConfig`] that stores durations as seconds.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DispatchSettings {
     pub poll_interval_secs: u64,
     pub batch_size: i64,
@@ -137,6 +140,7 @@ impl From<DispatchSettings> for DispatchConfig {
 
 /// One entry in the `signing_keys` map: names the env var that holds the HMAC secret.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SigningKeyConfig {
     /// Name of the environment variable that contains the base64-encoded HMAC secret.
     pub secret_env: String,
@@ -149,6 +153,7 @@ fn default_admin_bind() -> String {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     #[serde(default = "default_admin_bind")]
     pub bind: String,
@@ -177,6 +182,7 @@ fn default_user_agent() -> String {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpClientConfig {
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
@@ -216,6 +222,7 @@ fn default_batch_limit() -> u64 {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -278,8 +285,16 @@ impl AppConfig {
             .add_source(config::File::with_name(&format!("{dir}/app_config_{env}")).required(false))
             .add_source(config::File::with_name(".env.toml").required(false))
             .add_source(config::Environment::with_prefix("APP").separator("__"))
-            .set_override_option("database.url", std::env::var("DATABASE_URL").ok())?
-            .set_override_option("admin.auth_token", std::env::var("ADMIN_TOKEN").ok())?
+            .set_override_option(
+                "database.url",
+                std::env::var("DATABASE_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
+            )?
+            .set_override_option(
+                "admin.auth_token",
+                std::env::var("ADMIN_TOKEN").ok().filter(|s| !s.is_empty()),
+            )?
             .build()?
             .try_deserialize()
     }

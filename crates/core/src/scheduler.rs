@@ -27,6 +27,13 @@ use std::time::Duration;
 use crate::config::DispatchConfig;
 use crate::schema::{CallbackTarget, CompletionMode};
 
+// ── Limits ────────────────────────────────────────────────────────────────────
+
+const MAX_EXTERNAL_TIMEOUT_SECS: u64 = 7 * 86_400;
+const MAX_PER_CALLBACK_ATTEMPTS: u64 = 50;
+const MAX_HANDLER_TIMEOUT_SECS: u64 = 300;
+const MAX_COMPLETION_CYCLES_LIMIT: u64 = 1_000;
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Result of structurally parsing and validating a callbacks JSON array.
@@ -54,18 +61,20 @@ pub fn parse_callbacks(
     let mut invalid = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
 
-    let array = match callbacks_json.as_array() {
-        Some(a) => a,
-        None => return ParsedCallbacks { valid, invalid },
+    let Some(array) = callbacks_json.as_array() else {
+        invalid.push((
+            "<root>".to_string(),
+            "invalid_callback: top-level callbacks value is not a JSON array".to_string(),
+        ));
+        return ParsedCallbacks { valid, invalid };
     };
 
     for (i, element) in array.iter().enumerate() {
         match parse_one_callback(element, i, config) {
             Ok(target) => {
-                let name = target.name.clone();
-                if !seen_names.insert(name.clone()) {
+                if !seen_names.insert(target.name.clone()) {
                     invalid.push((
-                        name,
+                        target.name,
                         "invalid_callback: duplicate callback name within event".to_string(),
                     ));
                 } else {
@@ -83,7 +92,7 @@ pub fn parse_callbacks(
 ///
 /// This prefix (`source_payload_too_large:`) is documented so operators can filter
 /// dispatcher-side rejections from receiver-side HTTP 413 responses.
-pub fn payload_too_large_error(actual_bytes: i64, limit_bytes: i64) -> String {
+pub fn payload_too_large_error(actual_bytes: u64, limit_bytes: u64) -> String {
     format!(
         "source_payload_too_large: {actual_bytes} bytes > {limit_bytes} bytes \
          (rejected by dispatcher before send)"
@@ -91,8 +100,6 @@ pub fn payload_too_large_error(actual_bytes: i64, limit_bytes: i64) -> String {
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
-
-const MAX_EXTERNAL_TIMEOUT_SECS: u64 = 7 * 86_400;
 
 fn parse_one_callback(
     element: &serde_json::Value,
@@ -168,11 +175,11 @@ fn parse_one_callback(
         parse_external_timeout(obj.get("external_completion_timeout_seconds"))
             .map_err(|r| (name.clone(), r))?;
 
-    let max_completion_cycles = obj
-        .get("max_completion_cycles")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or(config.max_completion_cycles);
+    let max_completion_cycles = parse_max_completion_cycles(
+        obj.get("max_completion_cycles"),
+        config.max_completion_cycles,
+    )
+    .map_err(|r| (name.clone(), r))?;
 
     Ok(CallbackTarget {
         name,
@@ -230,12 +237,44 @@ fn parse_mode(mode_str: Option<&str>) -> Result<CompletionMode, String> {
     }
 }
 
+/// Returns true if `name` consists only of RFC 7230 tchar characters.
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+}
+
 fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, String>, String> {
     let mut headers = HashMap::new();
     let Some(obj) = val.and_then(|v| v.as_object()) else {
         return Ok(headers);
     };
     for (k, v) in obj {
+        if !is_valid_header_name(k) {
+            return Err(format!(
+                "invalid_callback: header name '{k}' contains invalid characters"
+            ));
+        }
         let k_lower = k.to_ascii_lowercase();
         if k_lower == "authorization" || k_lower == "cookie" || k_lower.starts_with("x-outbox-") {
             return Err(format!(
@@ -245,9 +284,12 @@ fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, Stri
         let val_str = v
             .as_str()
             .ok_or_else(|| format!("invalid_callback: header '{k}' value must be a string"))?;
-        if val_str.contains('\r') || val_str.contains('\n') {
+        if val_str
+            .bytes()
+            .any(|b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
             return Err(format!(
-                "invalid_callback: header '{k}' value contains illegal newline characters"
+                "invalid_callback: header '{k}' value contains illegal control characters"
             ));
         }
         headers.insert(k.clone(), val_str.to_string());
@@ -260,9 +302,9 @@ fn parse_max_attempts(val: Option<&serde_json::Value>, default: u32) -> Result<u
     let n = v
         .as_u64()
         .ok_or_else(|| "invalid_callback: max_attempts must be a positive integer".to_string())?;
-    if !(1..=50).contains(&n) {
+    if !(1..=MAX_PER_CALLBACK_ATTEMPTS).contains(&n) {
         return Err(format!(
-            "invalid_callback: max_attempts must be between 1 and 50; got {n}"
+            "invalid_callback: max_attempts must be between 1 and {MAX_PER_CALLBACK_ATTEMPTS}; got {n}"
         ));
     }
     Ok(n as u32)
@@ -299,9 +341,9 @@ fn parse_timeout(val: Option<&serde_json::Value>, default: Duration) -> Result<D
     let n = v.as_u64().ok_or_else(|| {
         "invalid_callback: timeout_seconds must be a positive integer".to_string()
     })?;
-    if !(1..=300).contains(&n) {
+    if !(1..=MAX_HANDLER_TIMEOUT_SECS).contains(&n) {
         return Err(format!(
-            "invalid_callback: timeout_seconds must be between 1 and 300; got {n}"
+            "invalid_callback: timeout_seconds must be between 1 and {MAX_HANDLER_TIMEOUT_SECS}; got {n}"
         ));
     }
     Ok(Duration::from_secs(n))
@@ -320,6 +362,23 @@ fn parse_external_timeout(val: Option<&serde_json::Value>) -> Result<Option<Dura
         ));
     }
     Ok(Some(Duration::from_secs(n)))
+}
+
+fn parse_max_completion_cycles(
+    val: Option<&serde_json::Value>,
+    default: u32,
+) -> Result<u32, String> {
+    let Some(v) = val else { return Ok(default) };
+    let n = v.as_u64().ok_or_else(|| {
+        "invalid_callback: max_completion_cycles must be a positive integer".to_string()
+    })?;
+    if !(1..=MAX_COMPLETION_CYCLES_LIMIT).contains(&n) {
+        return Err(format!(
+            "invalid_callback: max_completion_cycles must be between 1 and \
+             {MAX_COMPLETION_CYCLES_LIMIT}; got {n}"
+        ));
+    }
+    Ok(n as u32)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -421,10 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn non_array_returns_empty_result() {
+    fn non_array_returns_invalid_result() {
         let result = parse_callbacks(&json!({}), &default_config());
         assert!(result.valid.is_empty());
-        assert!(result.invalid.is_empty());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("not a JSON array"));
     }
 
     #[test]
@@ -680,6 +740,19 @@ mod tests {
     }
 
     #[test]
+    fn invalid_header_name_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "X Custom": "value" }
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("header name"));
+    }
+
+    #[test]
     fn max_attempts_out_of_range_rejected() {
         for bad in [0_u64, 51] {
             let cb = json!({
@@ -801,6 +874,42 @@ mod tests {
     }
 
     #[test]
+    fn max_completion_cycles_out_of_range_rejected() {
+        for bad in [0_u64, MAX_COMPLETION_CYCLES_LIMIT + 1] {
+            let cb = json!({
+                "name": "abc",
+                "url": "https://example.com/",
+                "signing_key_id": "k",
+                "max_completion_cycles": bad
+            });
+            let result = parse_callbacks(&json!([cb]), &default_config());
+            assert_eq!(
+                result.invalid.len(),
+                1,
+                "max_completion_cycles={bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn max_completion_cycles_boundary_values_accepted() {
+        for good in [1_u64, MAX_COMPLETION_CYCLES_LIMIT] {
+            let cb = json!({
+                "name": "abc",
+                "url": "https://example.com/",
+                "signing_key_id": "k",
+                "max_completion_cycles": good
+            });
+            let result = parse_callbacks(&json!([cb]), &default_config());
+            assert_eq!(
+                result.valid.len(),
+                1,
+                "max_completion_cycles={good} should be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_names_second_goes_to_invalid() {
         let cbs = json!([
             { "name": "abc", "url": "https://a.example.com/", "signing_key_id": "k" },
@@ -868,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn header_value_with_newline_rejected() {
+    fn header_value_with_control_chars_rejected() {
         let cb = json!({
             "name": "abc",
             "url": "https://example.com/",
@@ -877,7 +986,20 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("newline"));
+        assert!(result.invalid[0].1.contains("control characters"));
+    }
+
+    #[test]
+    fn header_value_with_null_byte_rejected() {
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "X-Custom": "value\u{0000}" }
+        });
+        let result = parse_callbacks(&json!([cb]), &default_config());
+        assert_eq!(result.invalid.len(), 1);
+        assert!(result.invalid[0].1.contains("control characters"));
     }
 
     #[test]

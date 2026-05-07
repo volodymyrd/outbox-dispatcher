@@ -19,8 +19,12 @@
 //!
 //! - **Minimum Entropy:** It strictly rejects any secret that decodes to less than 32 bytes,
 //!   protecting the webhook signatures from offline brute-force attacks.
-//! - **Safe Base64 Decoding:** It expects standard Base64 encoding, stripping accidental whitespace
-//!   introduced by orchestration systems (like Kubernetes Secrets or Docker env files).
+//! - **Maximum Size:** It rejects secrets larger than 256 decoded bytes, guarding against
+//!   misconfiguration (HMAC hashes oversized keys internally, masking the mistake).
+//! - **Safe Base64 Decoding:** It accepts both standard and URL-safe Base64, stripping accidental
+//!   whitespace introduced by orchestration systems (like Kubernetes Secrets or Docker env files).
+//! - **Memory Zeroization:** Secret bytes are stored in a `Zeroizing<Vec<u8>>` wrapper that
+//!   overwrites the allocation with zeroes on drop, preventing secrets from lingering in memory.
 //! - **Leak Prevention:** It implements a custom `std::fmt::Debug` that completely redacts the
 //!   secret bytes. If a developer accidentally logs the `AppConfig` or `KeyRing` struct,
 //!   the credentials will never be written to application logs.
@@ -31,15 +35,19 @@
 use std::collections::HashMap;
 
 use base64::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::config::SigningKeyConfig;
+
+const MIN_SECRET_BYTES: usize = 32;
+const MAX_SECRET_BYTES: usize = 256;
 
 /// Resolved keyring: maps signing key ids to their decoded HMAC secret bytes.
 ///
 /// Built at startup by calling [`KeyRing::load`], which reads each secret from
 /// its designated environment variable and validates the minimum length.
 pub struct KeyRing {
-    keys: HashMap<String, Vec<u8>>,
+    keys: HashMap<String, Zeroizing<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for KeyRing {
@@ -55,7 +63,9 @@ impl KeyRing {
     /// Build the keyring from config, reading and validating each secret from its env var.
     ///
     /// Returns all errors as a list if any env var is missing, fails to base64-decode,
-    /// or is shorter than 32 bytes after decoding.
+    /// or is shorter than 32 / longer than 256 bytes after decoding.
+    ///
+    /// Both standard and URL-safe Base64 encodings are accepted.
     pub fn load(signing_keys: &HashMap<String, SigningKeyConfig>) -> Result<Self, Vec<String>> {
         Self::load_internal(signing_keys, |env| std::env::var(env))
     }
@@ -80,24 +90,39 @@ impl KeyRing {
                         cfg.secret_env
                     ));
                 }
-                Ok(val) => match BASE64_STANDARD.decode(val.trim()) {
-                    Err(e) => {
-                        errors.push(format!(
-                            "signing_keys[{id}]: failed to base64-decode secret from '{}': {e}",
-                            cfg.secret_env
-                        ));
+                Ok(val) => {
+                    let trimmed = val.trim();
+                    match BASE64_STANDARD
+                        .decode(trimmed)
+                        .or_else(|_| BASE64_URL_SAFE.decode(trimmed))
+                    {
+                        Err(e) => {
+                            errors.push(format!(
+                                "signing_keys[{id}]: failed to base64-decode secret from '{}': {e}",
+                                cfg.secret_env
+                            ));
+                        }
+                        Ok(bytes) => {
+                            if bytes.len() < MIN_SECRET_BYTES {
+                                errors.push(format!(
+                                    "signing_keys[{id}]: secret from '{}' is {} bytes after \
+                                     decoding; minimum is {MIN_SECRET_BYTES}",
+                                    cfg.secret_env,
+                                    bytes.len()
+                                ));
+                            } else if bytes.len() > MAX_SECRET_BYTES {
+                                errors.push(format!(
+                                    "signing_keys[{id}]: secret from '{}' is {} bytes after \
+                                     decoding; maximum is {MAX_SECRET_BYTES}",
+                                    cfg.secret_env,
+                                    bytes.len()
+                                ));
+                            } else {
+                                keys.insert(id.clone(), Zeroizing::new(bytes));
+                            }
+                        }
                     }
-                    Ok(bytes) if bytes.len() < 32 => {
-                        errors.push(format!(
-                            "signing_keys[{id}]: secret from '{}' is {} bytes after decoding; minimum is 32",
-                            cfg.secret_env,
-                            bytes.len()
-                        ));
-                    }
-                    Ok(bytes) => {
-                        keys.insert(id.clone(), bytes);
-                    }
-                },
+                }
             }
         }
 
@@ -110,7 +135,7 @@ impl KeyRing {
 
     /// Look up the secret bytes for a signing key id.
     pub fn get(&self, id: &str) -> Option<&[u8]> {
-        self.keys.get(id).map(Vec::as_slice)
+        self.keys.get(id).map(|z| z.as_slice())
     }
 
     /// Returns `true` if the keyring contains the given key id.
@@ -201,6 +226,21 @@ mod tests {
     }
 
     #[test]
+    fn load_too_large_secret_returns_error() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k".to_string(), make_key_cfg("LARGE_ENV"));
+
+        // "QUFB" × 86 = 344 base64 chars = 258 decoded bytes, exceeds MAX_SECRET_BYTES=256
+        let large_b64 = "QUFB".repeat(86);
+        let envs: HashMap<&str, String> = [("LARGE_ENV", large_b64)].into_iter().collect();
+
+        let errs =
+            KeyRing::load_internal(&signing_keys, |k| envs.get(k).cloned().ok_or(())).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("maximum is"));
+    }
+
+    #[test]
     fn load_collects_multiple_errors() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k1".to_string(), make_key_cfg("MISSING_ENV"));
@@ -231,5 +271,34 @@ mod tests {
 
         let kr = KeyRing::load_internal(&signing_keys, |k| envs.get(k).cloned().ok_or(())).unwrap();
         assert!(kr.contains("k"));
+    }
+
+    #[test]
+    fn url_safe_base64_is_accepted() {
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert("k".to_string(), make_key_cfg("URL_SAFE_ENV"));
+
+        // URL-safe base64 of [0xFB; 32]: contains '-' and '_' which are invalid in standard base64.
+        // Computed: [0xFB,0xFB,0xFB] → "-_vv" in URL-safe; 32 bytes = 30+2, last group "-_s=".
+        let url_safe = "-_vv-_vv-_vv-_vv-_vv-_vv-_vv-_vv-_vv-_vv-_s=";
+        let envs: HashMap<&str, &str> = [("URL_SAFE_ENV", url_safe)].into_iter().collect();
+
+        let kr = KeyRing::load_internal(&signing_keys, resolver(&envs)).unwrap();
+        assert!(kr.contains("k"));
+        assert_eq!(kr.get("k").unwrap().len(), 32);
+    }
+
+    #[test]
+    fn load_public_api_missing_env_var_returns_error() {
+        // Tests the public `load` function using a sentinel var name guaranteed not to exist.
+        let mut signing_keys = HashMap::new();
+        signing_keys.insert(
+            "k".to_string(),
+            make_key_cfg("__OUTBOX_DISPATCHER_TEST_NONEXISTENT_VAR__"),
+        );
+
+        let errs = KeyRing::load(&signing_keys).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("__OUTBOX_DISPATCHER_TEST_NONEXISTENT_VAR__"));
     }
 }
