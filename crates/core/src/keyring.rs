@@ -1,3 +1,33 @@
+//! Cryptographic Secret Management and Resolution.
+//!
+//! # Why do we need this?
+//!
+//! To securely sign outgoing webhooks, the dispatcher needs access to shared HMAC secrets.
+//! Storing these secrets directly in the database alongside the `outbox_events` is a critical
+//! security anti-pattern: if the database is ever compromised, the attacker would simultaneously
+//! gain the payload data *and* the cryptographic keys needed to forge malicious webhook payloads.
+//!
+//! Instead, the dispatcher uses a decoupled `KeyRing` approach:
+//! 1. The database (`callbacks` JSON) only stores a reference string: `"signing_key_id": "key-v1"`.
+//! 2. The configuration maps this ID to an environment variable name: `secret_env: "APP_SECRET_KEY_V1"`.
+//! 3. This `KeyRing` module reads the environment variable, decodes the secret, and holds it in memory.
+//!
+//! # Security Guarantees
+//!
+//! This module acts as a strict gateway for cryptographic material, enforcing several protections
+//! before the application is even allowed to start:
+//!
+//! - **Minimum Entropy:** It strictly rejects any secret that decodes to less than 32 bytes,
+//!   protecting the webhook signatures from offline brute-force attacks.
+//! - **Safe Base64 Decoding:** It expects standard Base64 encoding, stripping accidental whitespace
+//!   introduced by orchestration systems (like Kubernetes Secrets or Docker env files).
+//! - **Leak Prevention:** It implements a custom `std::fmt::Debug` that completely redacts the
+//!   secret bytes. If a developer accidentally logs the `AppConfig` or `KeyRing` struct,
+//!   the credentials will never be written to application logs.
+//! - **Fail-Fast Startup:** By using `load()`, it validates *all* configured keys during the
+//!   boot sequence and aggregates errors, preventing the dispatcher from crashing mid-dispatch
+//!   due to a missing environment variable.
+
 use std::collections::HashMap;
 
 use base64::prelude::*;
