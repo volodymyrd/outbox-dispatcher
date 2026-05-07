@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Dispatch-loop settings (domain type; no serde — converted from [`DispatchSettings`]).
@@ -132,6 +133,116 @@ impl From<DispatchSettings> for DispatchConfig {
     }
 }
 
+// ── Signing keys ─────────────────────────────────────────────────────────────
+
+/// One entry in the `signing_keys` map: names the env var that holds the HMAC secret.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SigningKeyConfig {
+    /// Name of the environment variable that contains the base64-encoded HMAC secret.
+    pub secret_env: String,
+}
+
+// ── Admin API ─────────────────────────────────────────────────────────────────
+
+fn default_admin_bind() -> String {
+    "0.0.0.0:9090".to_string()
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AdminConfig {
+    #[serde(default = "default_admin_bind")]
+    pub bind: String,
+    /// Bearer token required by all admin endpoints. Set via `ADMIN_TOKEN` env var.
+    #[serde(default)]
+    pub auth_token: String,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_admin_bind(),
+            auth_token: String::new(),
+        }
+    }
+}
+
+// ── HTTP client ───────────────────────────────────────────────────────────────
+
+fn default_connect_timeout_secs() -> u64 {
+    5
+}
+
+fn default_user_agent() -> String {
+    "outbox-dispatcher/1.0".to_string()
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HttpClientConfig {
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+    /// Disables TLS certificate verification. Dev-only; logs a loud warning at startup.
+    #[serde(default)]
+    pub allow_insecure_tls: bool,
+}
+
+impl Default for HttpClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: default_connect_timeout_secs(),
+            user_agent: default_user_agent(),
+            allow_insecure_tls: false,
+        }
+    }
+}
+
+// ── Retention ─────────────────────────────────────────────────────────────────
+
+fn default_processed_retention_days() -> u64 {
+    7
+}
+
+fn default_dead_letter_retention_days() -> u64 {
+    30
+}
+
+fn default_cleanup_interval_secs() -> u64 {
+    3600
+}
+
+fn default_batch_limit() -> u64 {
+    1000
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RetentionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_processed_retention_days")]
+    pub processed_retention_days: u64,
+    #[serde(default = "default_dead_letter_retention_days")]
+    pub dead_letter_retention_days: u64,
+    /// How often the retention worker runs, in seconds.
+    #[serde(default = "default_cleanup_interval_secs")]
+    pub cleanup_interval_secs: u64,
+    /// Maximum rows deleted per cleanup cycle.
+    #[serde(default = "default_batch_limit")]
+    pub batch_limit: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            processed_retention_days: default_processed_retention_days(),
+            dead_letter_retention_days: default_dead_letter_retention_days(),
+            cleanup_interval_secs: default_cleanup_interval_secs(),
+            batch_limit: default_batch_limit(),
+        }
+    }
+}
+
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -139,6 +250,15 @@ pub struct AppConfig {
     pub database: DatabaseConfig,
     pub dispatch: DispatchSettings,
     pub log: LogConfig,
+    /// Signing keyring: maps key id → env var name holding the base64-encoded HMAC secret.
+    #[serde(default)]
+    pub signing_keys: HashMap<String, SigningKeyConfig>,
+    #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
+    pub http_client: HttpClientConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 impl AppConfig {
@@ -150,6 +270,7 @@ impl AppConfig {
     ///
     /// `dir` defaults to `"envs"` but can be overridden via `APP_CONFIG_DIR`.
     /// `DATABASE_URL` is also accepted as a conventional env var alias for `database.url`.
+    /// `ADMIN_TOKEN` is also accepted as an alias for `admin.auth_token`.
     pub fn load(env: &str) -> Result<Self, config::ConfigError> {
         let dir = std::env::var("APP_CONFIG_DIR").unwrap_or_else(|_| "envs".into());
         config::Config::builder()
@@ -158,6 +279,7 @@ impl AppConfig {
             .add_source(config::File::with_name(".env.toml").required(false))
             .add_source(config::Environment::with_prefix("APP").separator("__"))
             .set_override_option("database.url", std::env::var("DATABASE_URL").ok())?
+            .set_override_option("admin.auth_token", std::env::var("ADMIN_TOKEN").ok())?
             .build()?
             .try_deserialize()
     }
@@ -199,6 +321,26 @@ impl AppConfig {
         }
         if self.log.filter.trim().is_empty() {
             errors.push("log.filter must not be empty".to_string());
+        }
+        if self.http_client.connect_timeout_secs == 0 {
+            errors.push("http_client.connect_timeout_secs must be > 0".to_string());
+        }
+        if self.http_client.user_agent.trim().is_empty() {
+            errors.push("http_client.user_agent must not be empty".to_string());
+        }
+        if self.retention.enabled {
+            if self.retention.processed_retention_days == 0 {
+                errors.push("retention.processed_retention_days must be >= 1".to_string());
+            }
+            if self.retention.dead_letter_retention_days == 0 {
+                errors.push("retention.dead_letter_retention_days must be >= 1".to_string());
+            }
+            if self.retention.cleanup_interval_secs < 60 {
+                errors.push("retention.cleanup_interval_secs must be >= 60 (1 minute)".to_string());
+            }
+            if self.retention.batch_limit == 0 || self.retention.batch_limit > 10_000 {
+                errors.push("retention.batch_limit must be between 1 and 10000".to_string());
+            }
         }
 
         if errors.is_empty() {
@@ -596,5 +738,190 @@ filter = "info"
         cfg.dispatch.batch_size = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.len() >= 3);
+    }
+
+    // ── New section defaults ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_admin_defaults_when_absent() {
+        let cfg = build_config(full_toml());
+        assert_eq!(cfg.admin.bind, "0.0.0.0:9090");
+        assert_eq!(cfg.admin.auth_token, "");
+    }
+
+    #[test]
+    fn test_http_client_defaults_when_absent() {
+        let cfg = build_config(full_toml());
+        assert_eq!(cfg.http_client.connect_timeout_secs, 5);
+        assert_eq!(cfg.http_client.user_agent, "outbox-dispatcher/1.0");
+        assert!(!cfg.http_client.allow_insecure_tls);
+    }
+
+    #[test]
+    fn test_retention_defaults_when_absent() {
+        let cfg = build_config(full_toml());
+        assert!(!cfg.retention.enabled);
+        assert_eq!(cfg.retention.processed_retention_days, 7);
+        assert_eq!(cfg.retention.dead_letter_retention_days, 30);
+        assert_eq!(cfg.retention.cleanup_interval_secs, 3600);
+        assert_eq!(cfg.retention.batch_limit, 1000);
+    }
+
+    #[test]
+    fn test_signing_keys_defaults_empty_when_absent() {
+        let cfg = build_config(full_toml());
+        assert!(cfg.signing_keys.is_empty());
+    }
+
+    #[test]
+    fn test_admin_config_from_toml() {
+        let toml = format!(
+            "{}\n\n[admin]\nbind = \"127.0.0.1:8080\"\nauth_token = \"secret\"",
+            full_toml()
+        );
+        let cfg = build_config(&toml);
+        assert_eq!(cfg.admin.bind, "127.0.0.1:8080");
+        assert_eq!(cfg.admin.auth_token, "secret");
+    }
+
+    #[test]
+    fn test_http_client_config_from_toml() {
+        let toml = format!(
+            "{}\n\n[http_client]\nconnect_timeout_secs = 10\nuser_agent = \"custom/2.0\"\nallow_insecure_tls = true",
+            full_toml()
+        );
+        let cfg = build_config(&toml);
+        assert_eq!(cfg.http_client.connect_timeout_secs, 10);
+        assert_eq!(cfg.http_client.user_agent, "custom/2.0");
+        assert!(cfg.http_client.allow_insecure_tls);
+    }
+
+    #[test]
+    fn test_retention_config_from_toml() {
+        let toml = format!(
+            "{}\n\n[retention]\nenabled = true\nprocessed_retention_days = 3\ndead_letter_retention_days = 14\ncleanup_interval_secs = 120\nbatch_limit = 500",
+            full_toml()
+        );
+        let cfg = build_config(&toml);
+        assert!(cfg.retention.enabled);
+        assert_eq!(cfg.retention.processed_retention_days, 3);
+        assert_eq!(cfg.retention.dead_letter_retention_days, 14);
+        assert_eq!(cfg.retention.cleanup_interval_secs, 120);
+        assert_eq!(cfg.retention.batch_limit, 500);
+    }
+
+    #[test]
+    fn test_signing_keys_from_toml() {
+        let toml = format!(
+            "{}\n\n[signing_keys]\n\"welcome-v1\" = {{ secret_env = \"WELCOME_HMAC_SECRET\" }}\n\"audit-v1\" = {{ secret_env = \"AUDIT_HMAC_SECRET\" }}",
+            full_toml()
+        );
+        let cfg = build_config(&toml);
+        assert_eq!(cfg.signing_keys.len(), 2);
+        assert_eq!(
+            cfg.signing_keys["welcome-v1"].secret_env,
+            "WELCOME_HMAC_SECRET"
+        );
+        assert_eq!(cfg.signing_keys["audit-v1"].secret_env, "AUDIT_HMAC_SECRET");
+    }
+
+    // ── Validate: new sections ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_http_client_zero_connect_timeout() {
+        let mut cfg = build_config(full_toml());
+        cfg.http_client.connect_timeout_secs = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("connect_timeout_secs")));
+    }
+
+    #[test]
+    fn test_validate_http_client_empty_user_agent() {
+        let mut cfg = build_config(full_toml());
+        cfg.http_client.user_agent = String::new();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("user_agent")));
+    }
+
+    #[test]
+    fn test_validate_retention_disabled_skips_checks() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = false;
+        cfg.retention.processed_retention_days = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_zero_days() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = true;
+        cfg.retention.processed_retention_days = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("processed_retention_days")));
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_dead_letter_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = true;
+        cfg.retention.dead_letter_retention_days = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("dead_letter_retention_days"))
+        );
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_cleanup_interval_too_short() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = true;
+        cfg.retention.cleanup_interval_secs = 59;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("cleanup_interval_secs")));
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_cleanup_interval_at_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = true;
+        cfg.retention.cleanup_interval_secs = 60;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_batch_limit_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = true;
+        cfg.retention.batch_limit = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("batch_limit")));
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_batch_limit_too_large() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = true;
+        cfg.retention.batch_limit = 10_001;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("batch_limit")));
+    }
+
+    #[test]
+    fn test_validate_retention_enabled_batch_limit_at_maximum() {
+        let mut cfg = build_config(full_toml());
+        cfg.retention.enabled = true;
+        cfg.retention.batch_limit = 10_000;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_passes_with_full_config() {
+        let toml = format!(
+            "{}\n\n[admin]\nbind = \"0.0.0.0:9090\"\nauth_token = \"tok\"\n\n[http_client]\nconnect_timeout_secs = 5\nuser_agent = \"test/1.0\"\nallow_insecure_tls = false\n\n[retention]\nenabled = true\nprocessed_retention_days = 7\ndead_letter_retention_days = 30\ncleanup_interval_secs = 3600\nbatch_limit = 1000",
+            full_toml()
+        );
+        let cfg = build_config(&toml);
+        assert!(cfg.validate().is_ok());
     }
 }
