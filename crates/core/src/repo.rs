@@ -12,36 +12,6 @@ use crate::schema::{
     ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, SweepReport,
 };
 
-/// Default values applied at dispatch time when a callback spec omits optional fields.
-///
-/// Retained as a public re-export of the relevant subset of [`DispatchConfig`] for
-/// callers who only care about the defaults (e.g. tests).
-#[derive(Debug, Clone)]
-pub struct DispatchDefaults {
-    pub max_attempts: u32,
-    pub backoff: Vec<Duration>,
-    pub timeout: Duration,
-    pub max_completion_cycles: u32,
-}
-
-impl Default for DispatchDefaults {
-    fn default() -> Self {
-        Self {
-            max_attempts: 6,
-            backoff: vec![
-                Duration::from_secs(30),
-                Duration::from_secs(120),
-                Duration::from_secs(600),
-                Duration::from_secs(3600),
-                Duration::from_secs(21600),
-                Duration::from_secs(86400),
-            ],
-            timeout: Duration::from_secs(30),
-            max_completion_cycles: 20,
-        }
-    }
-}
-
 #[async_trait]
 pub trait Repo: Send + Sync {
     // ── Scheduling ─────────────────────────────────────────────────────────
@@ -725,36 +695,28 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 /// at dispatch time as a defense-in-depth check: if the row was mutated after schedule
 /// (admin tool, replication anomaly, or schema drift) to contain a reserved header,
 /// private-IP target, or `http://` URL, the dispatcher refuses to honor it.
+///
+/// Uses [`crate::callbacks::validate_named_callback`] so only the target entry is
+/// fully parsed — O(N) scan per delivery rather than O(N²) re-materialisation of
+/// every sibling callback's headers/backoff.
 fn extract_callback_target(
     callbacks: &serde_json::Value,
     callback_name: &str,
     config: &DispatchConfig,
 ) -> Result<CallbackTarget> {
-    // Must be an array — return a dedicated error so the poison-pill guard logs it clearly.
-    if !callbacks.is_array() {
-        return Err(crate::error::Error::InvalidData(
-            "callbacks is not an array".to_string(),
-        ));
-    }
-
-    let parsed = crate::callbacks::parse_callbacks(callbacks, config);
-
-    // If the named callback appears in `invalid`, it failed structural revalidation.
-    if let Some((_, reason)) = parsed.invalid.iter().find(|(n, _)| n == callback_name) {
-        return Err(crate::error::Error::InvalidData(format!(
-            "callback '{callback_name}' failed structural revalidation at dispatch time: {reason}"
-        )));
-    }
-
-    parsed
-        .valid
-        .into_iter()
-        .find(|t| t.name == callback_name)
-        .ok_or_else(|| {
-            crate::error::Error::CallbackTargetMissing(format!(
+    match crate::callbacks::validate_named_callback(callbacks, callback_name, config) {
+        Ok(target) => Ok(target),
+        Err(crate::callbacks::NamedCallbackError::Invalid(reason)) => {
+            Err(crate::error::Error::InvalidData(format!(
+                "callback '{callback_name}' failed structural revalidation at dispatch time: {reason}"
+            )))
+        }
+        Err(crate::callbacks::NamedCallbackError::NotFound) => {
+            Err(crate::error::Error::CallbackTargetMissing(format!(
                 "callback '{callback_name}' not found in event callbacks array"
-            ))
-        })
+            )))
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -845,6 +807,29 @@ mod tests {
         let callbacks = json!({"name": "notify", "url": "https://example.com"});
         let err = extract_callback_target(&callbacks, "notify", &test_config()).unwrap_err();
         assert!(matches!(err, crate::error::Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn extract_callback_target_too_many_callbacks_surfaces_real_reason() {
+        // Regression for 2026-05-08 code review Finding 3: an operator who lowered
+        // `max_callbacks_per_event` below an already-scheduled event's fan-out would
+        // previously see a misleading "not found" error. Array-level rejections must
+        // now surface as InvalidData with the actual reason.
+        let config = DispatchConfig {
+            max_callbacks_per_event: 1,
+            allow_unsigned_callbacks: true,
+            ..Default::default()
+        };
+        let callbacks = json!([
+            {"name": "first",  "url": "https://a.example.com/"},
+            {"name": "second", "url": "https://b.example.com/"}
+        ]);
+        let err = extract_callback_target(&callbacks, "first", &config).unwrap_err();
+        let crate::error::Error::InvalidData(msg) = err else {
+            panic!("expected InvalidData, got {err:?}");
+        };
+        assert!(msg.contains("too many callbacks"), "got: {msg}");
+        assert!(msg.contains("revalidation"), "got: {msg}");
     }
 
     #[test]

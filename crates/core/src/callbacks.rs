@@ -55,6 +55,21 @@ pub struct ParsedCallbacks {
 
 // ── Public functions ──────────────────────────────────────────────────────────
 
+/// Outcome of [`validate_named_callback`] when the requested callback cannot
+/// be returned as a valid `CallbackTarget`.
+///
+/// The two arms let callers distinguish "the row's JSON is structurally bad or
+/// the single entry failed revalidation" from "the name you asked for isn't in
+/// the array", so the dispatcher can log each case with an accurate reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamedCallbackError {
+    /// The callbacks value itself (array-level) failed validation, or the named
+    /// entry failed per-callback structural validation.
+    Invalid(String),
+    /// No element named `callback_name` exists in the array.
+    NotFound,
+}
+
 /// Parse and structurally validate the `callbacks` JSONB array from an event row.
 ///
 /// **Does not** resolve `signing_key_id` against the keyring — that is deferred to
@@ -104,6 +119,48 @@ pub fn parse_callbacks(
     }
 
     ParsedCallbacks { valid, invalid }
+}
+
+/// Locate `callback_name` in `callbacks_json` and run full structural validation
+/// on that single entry.
+///
+/// Cheaper than [`parse_callbacks`] when the dispatcher only cares about one
+/// callback per delivery row: avoids materialising every sibling callback's
+/// `headers`/`backoff` just to discard them.
+///
+/// Still runs the cheap array-level checks (must be an array, size limit) so
+/// that operators who lower `max_callbacks_per_event` after events are already
+/// scheduled see a meaningful `last_error` rather than a misleading "not found".
+pub fn validate_named_callback(
+    callbacks_json: &serde_json::Value,
+    callback_name: &str,
+    config: &DispatchConfig,
+) -> Result<CallbackTarget, NamedCallbackError> {
+    let array = callbacks_json.as_array().ok_or_else(|| {
+        NamedCallbackError::Invalid(
+            "invalid_callback: top-level callbacks value is not a JSON array".to_string(),
+        )
+    })?;
+
+    if array.len() > config.max_callbacks_per_event as usize {
+        return Err(NamedCallbackError::Invalid(format!(
+            "invalid_callback: too many callbacks in event ({}); max is {}",
+            array.len(),
+            config.max_callbacks_per_event
+        )));
+    }
+
+    let found = array
+        .iter()
+        .enumerate()
+        .find(|(_, v)| v.get("name").and_then(|n| n.as_str()) == Some(callback_name));
+
+    let Some((idx, element)) = found else {
+        return Err(NamedCallbackError::NotFound);
+    };
+
+    parse_one_callback(element, idx, config)
+        .map_err(|(_, reason)| NamedCallbackError::Invalid(reason))
 }
 
 /// Produces the canonical `last_error` string for a schedule-time payload-size rejection.
@@ -1682,5 +1739,94 @@ mod tests {
             "got: {}",
             result.invalid[0].1
         );
+    }
+
+    // ── validate_named_callback ───────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_named_callback_happy_path() {
+        let arr = json!([
+            { "name": "alpha", "url": "https://alpha.example.com/", "signing_key_id": "k" },
+            { "name": "beta",  "url": "https://beta.example.com/",  "signing_key_id": "k" }
+        ]);
+        let target = validate_named_callback(&arr, "beta", &default_config()).unwrap();
+        assert_eq!(target.name, "beta");
+        assert_eq!(target.url, "https://beta.example.com/");
+    }
+
+    #[test]
+    fn test_validate_named_callback_returns_not_found() {
+        let arr = json!([
+            { "name": "alpha", "url": "https://alpha.example.com/", "signing_key_id": "k" }
+        ]);
+        let err = validate_named_callback(&arr, "missing", &default_config()).unwrap_err();
+        assert_eq!(err, NamedCallbackError::NotFound);
+    }
+
+    #[test]
+    fn test_validate_named_callback_rejects_non_array_root() {
+        let not_an_array = json!({ "name": "alpha", "url": "https://a.example.com/" });
+        let err = validate_named_callback(&not_an_array, "alpha", &default_config()).unwrap_err();
+        match err {
+            NamedCallbackError::Invalid(msg) => {
+                assert!(msg.contains("not a JSON array"), "got: {msg}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_named_callback_rejects_too_many_callbacks() {
+        // Operator lowered max_callbacks_per_event after rows were already scheduled.
+        // The array now exceeds the limit; the helper must surface the real reason,
+        // not "not found" (Finding 3 in 2026-05-08 review).
+        let config = DispatchConfig {
+            max_callbacks_per_event: 2,
+            allow_unsigned_callbacks: true,
+            ..Default::default()
+        };
+        let arr = json!([
+            { "name": "a1", "url": "https://a.example.com/" },
+            { "name": "a2", "url": "https://b.example.com/" },
+            { "name": "a3", "url": "https://c.example.com/" }
+        ]);
+        let err = validate_named_callback(&arr, "a1", &config).unwrap_err();
+        match err {
+            NamedCallbackError::Invalid(msg) => {
+                assert!(msg.contains("too many callbacks"), "got: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_named_callback_invalid_target_entry() {
+        // The named callback itself is structurally invalid (reserved header):
+        // must be reported as Invalid, not NotFound.
+        let arr = json!([{
+            "name": "notify",
+            "url": "https://example.com/hook",
+            "signing_key_id": "k",
+            "headers": { "Authorization": "Bearer secret" }
+        }]);
+        let err = validate_named_callback(&arr, "notify", &default_config()).unwrap_err();
+        match err {
+            NamedCallbackError::Invalid(msg) => {
+                assert!(msg.contains("Authorization"), "got: {msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_named_callback_skips_sibling_parse_cost() {
+        // Sanity: a sibling callback is structurally invalid, but the helper must
+        // not fail on it when the requested target itself is valid.
+        let arr = json!([
+            { "name": "good",    "url": "https://good.example.com/",  "signing_key_id": "k" },
+            { "name": "broken",  "url": "not-a-url",                  "signing_key_id": "k" }
+        ]);
+        let target = validate_named_callback(&arr, "good", &default_config()).unwrap();
+        assert_eq!(target.name, "good");
     }
 }

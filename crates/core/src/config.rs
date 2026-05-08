@@ -143,7 +143,13 @@ pub struct DispatchSettings {
     pub max_completion_cycles: u32,
     pub payload_size_limit_bytes: i64,
     pub notify_channel: String,
+    /// If true, allows callback URLs with the `http://` scheme. Off by default;
+    /// only enable in dev/integration-test environments.
+    #[serde(default)]
     pub allow_insecure_urls: bool,
+    /// If true, allows callbacks without a `signing_key_id`. Off by default;
+    /// only enable in dev/integration-test environments.
+    #[serde(default)]
     pub allow_unsigned_callbacks: bool,
     /// If true, allows callback URLs that target private/loopback IP addresses.
     /// Off by default; only enable in dev/integration-test environments.
@@ -587,6 +593,9 @@ auth_token = "test-token"
 
     #[test]
     fn test_log_format_pretty() {
+        // Also exercises the fact that every allow-flag and max_callbacks_per_event
+        // has a serde default, so upgrading from an older config without these keys
+        // must not error at deserialization.
         let cfg = build_config(
             r#"
 [database]
@@ -604,8 +613,6 @@ external_timeout_sweep_interval_secs = 60
 max_completion_cycles = 20
 payload_size_limit_bytes = 1048576
 notify_channel = "outbox_events_new"
-allow_insecure_urls = false
-allow_unsigned_callbacks = false
 
 [log]
 format = "pretty"
@@ -613,6 +620,14 @@ filter = "debug"
 "#,
         );
         assert_eq!(cfg.log.format, LogFormat::Pretty);
+        // Secure-default behaviour: all allow-flags default to `false`.
+        assert!(!cfg.dispatch.allow_insecure_urls);
+        assert!(!cfg.dispatch.allow_unsigned_callbacks);
+        assert!(!cfg.dispatch.allow_private_ip_targets);
+        assert_eq!(
+            cfg.dispatch.max_callbacks_per_event,
+            DEFAULT_MAX_CALLBACKS_PER_EVENT
+        );
     }
 
     #[test]
@@ -813,6 +828,8 @@ filter = "info"
     #[test]
     fn test_database_config_acquire_timeout_secs_default() {
         // Configs without the field should use the serde default (10).
+        // Also omits every allow-flag and max_callbacks_per_event to confirm they
+        // all use their serde defaults — symmetric behaviour for all security flags.
         let toml_without_timeout = r#"
 [database]
 url = "postgres://user:pass@localhost/db"
@@ -829,8 +846,6 @@ external_timeout_sweep_interval_secs = 60
 max_completion_cycles = 20
 payload_size_limit_bytes = 1048576
 notify_channel = "outbox_events_new"
-allow_insecure_urls = false
-allow_unsigned_callbacks = false
 
 [log]
 format = "json"
@@ -838,6 +853,13 @@ filter = "info"
 "#;
         let cfg = build_config(toml_without_timeout);
         assert_eq!(cfg.database.acquire_timeout_secs, 10);
+        assert!(!cfg.dispatch.allow_insecure_urls);
+        assert!(!cfg.dispatch.allow_unsigned_callbacks);
+        assert!(!cfg.dispatch.allow_private_ip_targets);
+        assert_eq!(
+            cfg.dispatch.max_callbacks_per_event,
+            DEFAULT_MAX_CALLBACKS_PER_EVENT
+        );
     }
 
     #[test]
