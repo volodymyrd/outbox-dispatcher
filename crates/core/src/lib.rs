@@ -20,6 +20,7 @@ pub use config::{
 pub use error::{Error, Result, ValidationErrors};
 pub use keyring::KeyRing;
 pub use repo::{PgRepo, Repo};
+pub use scheduler::{ListenerStatus, run_scheduler, schedule_new_deliveries};
 pub use schema::{
     CallbackError, CallbackTarget, CompletionMode, DeadLetterRow, DeliveryRow, DueDelivery,
     EventForDelivery, EventWithDeliveries, ExternalPendingRow, PageParams, RawEvent,
