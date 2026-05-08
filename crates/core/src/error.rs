@@ -17,3 +17,11 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Aggregated validation errors returned by [`AppConfig::validate`] and [`KeyRing::load`].
+///
+/// Collects all problems instead of stopping at the first, so operators see every issue
+/// in a single startup failure.
+#[derive(Debug, Error)]
+#[error("{} validation error(s): {}", self.0.len(), self.0.join("; "))]
+pub struct ValidationErrors(pub Vec<String>);

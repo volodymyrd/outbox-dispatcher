@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use outbox_dispatcher_core::config::{AppConfig, DatabaseConfig, LogConfig, LogFormat};
+use outbox_dispatcher_core::{AppConfig, DatabaseConfig, KeyRing, LogConfig, LogFormat};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};
@@ -50,10 +50,18 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to load app config for env '{app_env}'"))?;
 
     if let Err(errors) = config.validate() {
-        for e in &errors {
+        for e in &errors.0 {
             eprintln!("config error: {e}");
         }
-        anyhow::bail!("invalid configuration ({} error(s))", errors.len());
+        anyhow::bail!("invalid configuration ({} error(s))", errors.0.len());
+    }
+
+    // Fail fast if any configured signing key cannot be resolved from its env var.
+    if let Err(errors) = KeyRing::load(&config.signing_keys) {
+        for e in &errors.0 {
+            eprintln!("signing key error: {e}");
+        }
+        anyhow::bail!("invalid signing keys ({} error(s))", errors.0.len());
     }
 
     init_tracing(&config.log).context("initialising tracing subscriber")?;
@@ -65,6 +73,12 @@ async fn main() -> Result<()> {
     if config.dispatch.allow_unsigned_callbacks {
         warn!(
             "allow_unsigned_callbacks is enabled — callbacks without a signing_key_id are accepted"
+        );
+    }
+    if config.http_client.allow_insecure_tls {
+        warn!(
+            "http_client.allow_insecure_tls is enabled — TLS certificate verification is \
+             DISABLED; this is for development only and must NOT be used in production"
         );
     }
 

@@ -46,6 +46,7 @@ cargo sort --workspace
 | `crates/core/src/schema.rs`           | All public data types (`RawEvent`, `CallbackTarget`, `DueDelivery`, …) |
 | `crates/core/src/error.rs`            | `Error` enum + `Result<T>` alias for the core crate                    |
 | `crates/core/src/retry.rs`            | `compute_next_available_at` (backoff + jitter)                         |
+| `crates/core/src/callbacks.rs`        | `parse_callbacks`, structural validation, SSRF denylist (Phase 2)      |
 | `crates/core/src/dispatch.rs`         | Dispatch loop (Phase 4 stub)                                           |
 | `crates/core/src/scheduler.rs`        | LISTEN/NOTIFY scheduler (Phase 3 stub)                                 |
 | `crates/core/src/timeout_sweep.rs`    | External-completion timeout sweeper (Phase 5 stub)                     |

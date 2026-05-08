@@ -39,10 +39,11 @@ pub struct RawEvent {
 }
 
 /// Determines how the dispatcher decides if a delivery is finished.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CompletionMode {
     /// Delivery is done as soon as the receiver returns HTTP 2xx.
+    #[default]
     Managed,
     /// Delivery stays "pending" after HTTP 2xx until the receiver explicitly completes it.
     External,
