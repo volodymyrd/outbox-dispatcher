@@ -211,14 +211,14 @@ mod tests {
     }
 
     #[test]
-    fn load_empty_signing_keys_succeeds() {
+    fn test_load_empty_signing_keys_succeeds() {
         let kr =
             KeyRing::load_internal(&HashMap::new(), |_| Err("is not set".to_string())).unwrap();
         assert!(kr.get("any").is_none());
     }
 
     #[test]
-    fn load_valid_key_resolves() {
+    fn test_load_valid_key_resolves() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("my-key".to_string(), make_key_cfg("MY_SECRET_ENV"));
 
@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn load_missing_env_var_returns_error() {
+    fn test_load_missing_env_var_returns_error() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("MISSING_ENV"));
 
@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn load_invalid_base64_returns_error() {
+    fn test_load_invalid_base64_returns_error() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("BAD_B64_ENV"));
 
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn load_too_short_secret_returns_error() {
+    fn test_load_too_short_secret_returns_error() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("SHORT_ENV"));
 
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn load_too_large_secret_returns_error() {
+    fn test_load_too_large_secret_returns_error() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("LARGE_ENV"));
 
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn load_collects_multiple_errors() {
+    fn test_load_collects_multiple_errors() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k1".to_string(), make_key_cfg("MISSING_ENV"));
         signing_keys.insert("k2".to_string(), make_key_cfg("SHORT_ENV"));
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn get_unknown_key_returns_none() {
+    fn test_get_unknown_key_returns_none() {
         let kr =
             KeyRing::load_internal(&HashMap::new(), |_| Err("is not set".to_string())).unwrap();
         assert!(kr.get("no-such-key").is_none());
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn key_with_whitespace_in_env_is_trimmed() {
+    fn test_key_with_whitespace_in_env_is_trimmed() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("WHITESPACE_ENV"));
 
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn key_with_internal_whitespace_is_accepted() {
+    fn test_key_with_internal_whitespace_is_accepted() {
         // Simulates a K8s secret that was base64-encoded with line breaks (every 76 chars).
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("WRAPPED_ENV"));
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn url_safe_base64_is_accepted() {
+    fn test_url_safe_base64_is_accepted() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("URL_SAFE_ENV"));
 
@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn load_public_api_missing_env_var_returns_error() {
+    fn test_load_public_api_missing_env_var_returns_error() {
         // Tests the public `load` function using a sentinel var name guaranteed not to exist.
         let mut signing_keys = HashMap::new();
         signing_keys.insert(
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_no_pad_base64_is_accepted() {
+    fn test_standard_no_pad_base64_is_accepted() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("STD_NO_PAD_ENV"));
 
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn url_safe_no_pad_base64_is_accepted() {
+    fn test_url_safe_no_pad_base64_is_accepted() {
         // K8s often emits unpadded URL-safe base64; verify we accept it without the trailing '='.
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("URL_SAFE_NO_PAD_ENV"));
@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_redacts_secret_bytes() {
+    fn test_debug_output_redacts_secret_bytes() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("my-key".to_string(), make_key_cfg("REDACT_ENV"));
 
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_secret_env_returns_error() {
+    fn test_duplicate_secret_env_returns_error() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k1".to_string(), make_key_cfg("SHARED_ENV"));
         signing_keys.insert("k2".to_string(), make_key_cfg("SHARED_ENV"));
@@ -441,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn load_errors_are_in_deterministic_key_order() {
+    fn test_load_errors_are_in_deterministic_key_order() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("zzz".to_string(), make_key_cfg("MISSING_ZZZ"));
         signing_keys.insert("aaa".to_string(), make_key_cfg("MISSING_AAA"));
@@ -467,7 +467,7 @@ mod tests {
     // ── Fix #3: empty secret_env produces clear error ─────────────────────────
 
     #[test]
-    fn empty_secret_env_returns_clear_error() {
+    fn test_empty_secret_env_returns_clear_error() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg(""));
 
@@ -482,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_only_secret_env_returns_clear_error() {
+    fn test_whitespace_only_secret_env_returns_clear_error() {
         let mut signing_keys = HashMap::new();
         signing_keys.insert("k".to_string(), make_key_cfg("   "));
 

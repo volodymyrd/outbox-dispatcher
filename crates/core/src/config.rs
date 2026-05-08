@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::error::ValidationErrors;
-use crate::scheduler::{
+use crate::callbacks::{
     MAX_BACKOFF_ELEMENT_SECS, MAX_COMPLETION_CYCLES_LIMIT, MAX_HANDLER_TIMEOUT_SECS,
     MAX_PER_CALLBACK_ATTEMPTS,
 };
+use crate::error::ValidationErrors;
 
 /// Dispatch-loop settings (domain type; no serde — converted from [`DispatchSettings`]).
 #[derive(Debug, Clone)]
@@ -331,6 +331,14 @@ pub struct AppConfig {
     pub retention: RetentionConfig,
 }
 
+// ── Validation bounds (centralised so conditions and error messages stay in sync) ──
+
+const MIN_PAYLOAD_SIZE_BYTES: i64 = 1_024;
+const MAX_PAYLOAD_SIZE_BYTES: i64 = 100 * 1_024 * 1_024;
+const MIN_SWEEP_INTERVAL_SECS: u64 = 10;
+const MIN_RETENTION_CLEANUP_SECS: u64 = 60;
+const MAX_RETENTION_BATCH: u64 = 10_000;
+
 impl AppConfig {
     /// Load config by layering (later sources override earlier ones):
     /// 1. `{dir}/app_config.toml` — base defaults, required
@@ -420,9 +428,11 @@ impl AppConfig {
         }
         if self.dispatch.backoff_secs.is_empty() {
             errors.push("dispatch.backoff_secs must contain at least one value".to_string());
-        } else if self.dispatch.backoff_secs.contains(&0) {
+        }
+        if self.dispatch.backoff_secs.contains(&0) {
             errors.push("dispatch.backoff_secs entries must all be > 0".to_string());
-        } else if self
+        }
+        if self
             .dispatch
             .backoff_secs
             .iter()
@@ -432,16 +442,20 @@ impl AppConfig {
                 "dispatch.backoff_secs entries must all be <= {MAX_BACKOFF_ELEMENT_SECS}"
             ));
         }
-        if self.dispatch.external_timeout_sweep_interval_secs < 10 {
-            errors.push("dispatch.external_timeout_sweep_interval_secs must be >= 10".to_string());
+        if self.dispatch.external_timeout_sweep_interval_secs < MIN_SWEEP_INTERVAL_SECS {
+            errors.push(format!(
+                "dispatch.external_timeout_sweep_interval_secs must be >= {MIN_SWEEP_INTERVAL_SECS}"
+            ));
         }
-        if self.dispatch.payload_size_limit_bytes < 1024 {
-            errors.push("dispatch.payload_size_limit_bytes must be >= 1024 (1 KB)".to_string());
+        if self.dispatch.payload_size_limit_bytes < MIN_PAYLOAD_SIZE_BYTES {
+            errors.push(format!(
+                "dispatch.payload_size_limit_bytes must be >= {MIN_PAYLOAD_SIZE_BYTES} (1 KB)"
+            ));
         }
-        if self.dispatch.payload_size_limit_bytes > 104_857_600 {
-            errors.push(
-                "dispatch.payload_size_limit_bytes must be <= 104857600 (100 MB)".to_string(),
-            );
+        if self.dispatch.payload_size_limit_bytes > MAX_PAYLOAD_SIZE_BYTES {
+            errors.push(format!(
+                "dispatch.payload_size_limit_bytes must be <= {MAX_PAYLOAD_SIZE_BYTES} (100 MB)"
+            ));
         }
         if self.dispatch.notify_channel.trim().is_empty() {
             errors.push("dispatch.notify_channel must not be empty".to_string());
@@ -461,7 +475,8 @@ impl AppConfig {
         }
         if self.admin.bind.parse::<std::net::SocketAddr>().is_err() {
             errors.push(format!(
-                "admin.bind '{}' is not a valid socket address (expected host:port, e.g. 0.0.0.0:9090)",
+                "admin.bind '{}' is not a valid socket address \
+                 (expected IP:port, e.g. 0.0.0.0:9090 or [::]:9090)",
                 self.admin.bind
             ));
         }
@@ -489,11 +504,15 @@ impl AppConfig {
             if self.retention.dead_letter_retention_days == 0 {
                 errors.push("retention.dead_letter_retention_days must be >= 1".to_string());
             }
-            if self.retention.cleanup_interval_secs < 60 {
-                errors.push("retention.cleanup_interval_secs must be >= 60 (1 minute)".to_string());
+            if self.retention.cleanup_interval_secs < MIN_RETENTION_CLEANUP_SECS {
+                errors.push(format!(
+                    "retention.cleanup_interval_secs must be >= {MIN_RETENTION_CLEANUP_SECS} (1 minute)"
+                ));
             }
-            if self.retention.batch_limit == 0 || self.retention.batch_limit > 10_000 {
-                errors.push("retention.batch_limit must be between 1 and 10000".to_string());
+            if self.retention.batch_limit == 0 || self.retention.batch_limit > MAX_RETENTION_BATCH {
+                errors.push(format!(
+                    "retention.batch_limit must be between 1 and {MAX_RETENTION_BATCH}"
+                ));
             }
         }
 
@@ -1188,6 +1207,17 @@ filter = "info"
     }
 
     #[test]
+    fn test_validate_backoff_secs_multiple_violations_all_reported() {
+        // Independent `if` blocks (not `else if`) ensure both zero-entry and
+        // exceeds-max violations are reported in a single validate() call.
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.backoff_secs = vec![0, MAX_BACKOFF_ELEMENT_SECS + 1];
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("must all be > 0")));
+        assert!(errs.0.iter().any(|e| e.contains("must all be <=")));
+    }
+
+    #[test]
     fn test_validate_notify_channel_empty() {
         let mut cfg = build_config(full_toml());
         cfg.dispatch.notify_channel = String::new();
@@ -1399,7 +1429,7 @@ filter = "info"
     #[test]
     fn test_load_reads_base_config_from_disk() {
         use std::io::Write;
-        let _guard = LOAD_MUTEX.lock().unwrap();
+        let _guard = LOAD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut f = std::fs::File::create(dir.path().join("app_config.toml")).unwrap();
@@ -1418,7 +1448,7 @@ filter = "info"
     #[test]
     fn test_load_env_layer_overrides_base() {
         use std::io::Write;
-        let _guard = LOAD_MUTEX.lock().unwrap();
+        let _guard = LOAD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut base = std::fs::File::create(dir.path().join("app_config.toml")).unwrap();
@@ -1441,7 +1471,7 @@ filter = "info"
     #[test]
     fn test_load_database_url_env_var_overrides_file() {
         use std::io::Write;
-        let _guard = LOAD_MUTEX.lock().unwrap();
+        let _guard = LOAD_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut f = std::fs::File::create(dir.path().join("app_config.toml")).unwrap();
