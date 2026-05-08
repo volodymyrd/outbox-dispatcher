@@ -1,19 +1,21 @@
-use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::config::DispatchConfig;
 use crate::error::Result;
 use crate::schema::{
-    CallbackTarget, CompletionMode, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
+    CallbackTarget, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
     ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, SweepReport,
 };
 
-/// Defaults applied when a callback spec omits optional fields.
+/// Default values applied at dispatch time when a callback spec omits optional fields.
+///
+/// Retained as a public re-export of the relevant subset of [`DispatchConfig`] for
+/// callers who only care about the defaults (e.g. tests).
 #[derive(Debug, Clone)]
 pub struct DispatchDefaults {
     pub max_attempts: u32,
@@ -141,62 +143,12 @@ pub trait Repo: Send + Sync {
 
 pub struct PgRepo {
     pool: PgPool,
-    defaults: DispatchDefaults,
+    config: DispatchConfig,
 }
 
 impl PgRepo {
-    pub fn new(pool: PgPool, defaults: DispatchDefaults) -> Self {
-        Self { pool, defaults }
-    }
-}
-
-/// JSONB callback spec as written by the publisher.
-#[derive(Debug, Deserialize)]
-struct RawCallbackSpec {
-    name: String,
-    url: String,
-    #[serde(default)]
-    mode: CompletionMode,
-    signing_key_id: Option<String>,
-    #[serde(default)]
-    headers: HashMap<String, String>,
-    max_attempts: Option<u32>,
-    backoff_seconds: Option<Vec<u64>>,
-    timeout_seconds: Option<u64>,
-    external_completion_timeout_seconds: Option<u64>,
-    max_completion_cycles: Option<u32>,
-}
-
-impl RawCallbackSpec {
-    fn into_target(self, defaults: &DispatchDefaults) -> CallbackTarget {
-        let timeout = self
-            .timeout_seconds
-            .map(Duration::from_secs)
-            .unwrap_or(defaults.timeout);
-        let max_attempts = self.max_attempts.unwrap_or(defaults.max_attempts);
-        let backoff = self
-            .backoff_seconds
-            .map(|v| v.into_iter().map(Duration::from_secs).collect())
-            .unwrap_or_else(|| defaults.backoff.clone());
-        let max_completion_cycles = self
-            .max_completion_cycles
-            .unwrap_or(defaults.max_completion_cycles);
-        let external_completion_timeout = self
-            .external_completion_timeout_seconds
-            .map(Duration::from_secs);
-
-        CallbackTarget {
-            name: self.name,
-            url: self.url,
-            mode: self.mode,
-            signing_key_id: self.signing_key_id,
-            headers: self.headers,
-            max_attempts,
-            backoff,
-            timeout,
-            external_completion_timeout,
-            max_completion_cycles,
-        }
+    pub fn new(pool: PgPool, config: DispatchConfig) -> Self {
+        Self { pool, config }
     }
 }
 
@@ -339,7 +291,7 @@ impl Repo for PgRepo {
 
         let mut due = Vec::with_capacity(rows.len());
         for row in rows {
-            match extract_callback_target(&row.callbacks, &row.callback_name, &self.defaults) {
+            match extract_callback_target(&row.callbacks, &row.callback_name, &self.config) {
                 Ok(target) => due.push(DueDelivery {
                     delivery_id: row.delivery_id,
                     event_id: row.event_id,
@@ -768,26 +720,41 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 }
 
 /// Finds a callback by name in the event's callbacks JSONB array and parses it.
+///
+/// Re-runs the full structural validation from [`crate::callbacks::parse_callbacks`]
+/// at dispatch time as a defense-in-depth check: if the row was mutated after schedule
+/// (admin tool, replication anomaly, or schema drift) to contain a reserved header,
+/// private-IP target, or `http://` URL, the dispatcher refuses to honor it.
 fn extract_callback_target(
     callbacks: &serde_json::Value,
     callback_name: &str,
-    defaults: &DispatchDefaults,
+    config: &DispatchConfig,
 ) -> Result<CallbackTarget> {
-    let arr = callbacks
-        .as_array()
-        .ok_or_else(|| crate::error::Error::InvalidData("callbacks is not an array".to_string()))?;
+    // Must be an array — return a dedicated error so the poison-pill guard logs it clearly.
+    if !callbacks.is_array() {
+        return Err(crate::error::Error::InvalidData(
+            "callbacks is not an array".to_string(),
+        ));
+    }
 
-    let spec_value = arr
-        .iter()
-        .find(|v| v.get("name").and_then(|n| n.as_str()) == Some(callback_name))
+    let parsed = crate::callbacks::parse_callbacks(callbacks, config);
+
+    // If the named callback appears in `invalid`, it failed structural revalidation.
+    if let Some((_, reason)) = parsed.invalid.iter().find(|(n, _)| n == callback_name) {
+        return Err(crate::error::Error::InvalidData(format!(
+            "callback '{callback_name}' failed structural revalidation at dispatch time: {reason}"
+        )));
+    }
+
+    parsed
+        .valid
+        .into_iter()
+        .find(|t| t.name == callback_name)
         .ok_or_else(|| {
             crate::error::Error::CallbackTargetMissing(format!(
                 "callback '{callback_name}' not found in event callbacks array"
             ))
-        })?;
-
-    let spec: RawCallbackSpec = serde_json::from_value(spec_value.clone())?;
-    Ok(spec.into_target(defaults))
+        })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -797,8 +764,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn defaults() -> DispatchDefaults {
-        DispatchDefaults::default()
+    fn test_config() -> DispatchConfig {
+        // Allow unsigned callbacks so the minimal specs in these tests pass
+        // schedule-time validation (they omit signing_key_id).
+        DispatchConfig {
+            allow_unsigned_callbacks: true,
+            ..Default::default()
+        }
     }
 
     // ── truncate_at_char_boundary ─────────────────────────────────────────────
@@ -861,17 +833,17 @@ mod tests {
         let callbacks = json!([
             {"name": "notify", "url": "https://example.com/hook"}
         ]);
-        let target = extract_callback_target(&callbacks, "notify", &defaults()).unwrap();
+        let target = extract_callback_target(&callbacks, "notify", &test_config()).unwrap();
         assert_eq!(target.name, "notify");
         assert_eq!(target.url, "https://example.com/hook");
         assert_eq!(target.mode, crate::schema::CompletionMode::Managed);
-        assert_eq!(target.max_attempts, defaults().max_attempts);
+        assert_eq!(target.max_attempts, test_config().max_attempts);
     }
 
     #[test]
     fn extract_callback_target_not_an_array() {
         let callbacks = json!({"name": "notify", "url": "https://example.com"});
-        let err = extract_callback_target(&callbacks, "notify", &defaults()).unwrap_err();
+        let err = extract_callback_target(&callbacks, "notify", &test_config()).unwrap_err();
         assert!(matches!(err, crate::error::Error::InvalidData(_)));
     }
 
@@ -880,16 +852,17 @@ mod tests {
         let callbacks = json!([
             {"name": "other", "url": "https://example.com/other"}
         ]);
-        let err = extract_callback_target(&callbacks, "notify", &defaults()).unwrap_err();
+        let err = extract_callback_target(&callbacks, "notify", &test_config()).unwrap_err();
         assert!(matches!(err, crate::error::Error::CallbackTargetMissing(_)));
     }
 
     #[test]
     fn extract_callback_target_malformed_spec() {
-        // missing required "url" field
+        // Missing required "url" field — parse_callbacks flags this in its `invalid` list,
+        // so dispatch-time revalidation returns `InvalidData`.
         let callbacks = json!([{"name": "notify"}]);
-        let err = extract_callback_target(&callbacks, "notify", &defaults()).unwrap_err();
-        assert!(matches!(err, crate::error::Error::Serialization(_)));
+        let err = extract_callback_target(&callbacks, "notify", &test_config()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidData(_)));
     }
 
     #[test]
@@ -901,9 +874,10 @@ mod tests {
             "max_attempts": 3,
             "backoff_seconds": [10, 20],
             "timeout_seconds": 5,
+            "external_completion_timeout_seconds": 3600,
             "max_completion_cycles": 7
         }]);
-        let target = extract_callback_target(&callbacks, "notify", &defaults()).unwrap();
+        let target = extract_callback_target(&callbacks, "notify", &test_config()).unwrap();
         assert_eq!(target.mode, crate::schema::CompletionMode::External);
         assert_eq!(target.max_attempts, 3);
         assert_eq!(
@@ -921,7 +895,7 @@ mod tests {
             "url": "https://example.com/hook",
             "signing_key_id": "key-abc"
         }]);
-        let target = extract_callback_target(&callbacks, "notify", &defaults()).unwrap();
+        let target = extract_callback_target(&callbacks, "notify", &test_config()).unwrap();
         assert_eq!(target.signing_key_id.as_deref(), Some("key-abc"));
     }
 
@@ -931,7 +905,87 @@ mod tests {
             {"name": "alpha", "url": "https://alpha.example.com"},
             {"name": "beta",  "url": "https://beta.example.com"}
         ]);
-        let target = extract_callback_target(&callbacks, "beta", &defaults()).unwrap();
+        let target = extract_callback_target(&callbacks, "beta", &test_config()).unwrap();
         assert_eq!(target.url, "https://beta.example.com");
+    }
+
+    // ── Dispatch-time revalidation: security regression tests ────────────────
+    //
+    // These lock in the defense-in-depth guarantee that mutating the callbacks JSON
+    // between schedule and dispatch cannot resurrect a structurally invalid spec.
+
+    #[test]
+    fn extract_callback_target_rejects_mutated_reserved_header() {
+        // An attacker-controlled (or admin-mutated) row carrying an Authorization header
+        // must be refused at dispatch time even though it was "approved" at schedule time.
+        let callbacks = json!([{
+            "name": "notify",
+            "url": "https://example.com/hook",
+            "headers": { "Authorization": "Bearer secret" }
+        }]);
+        let err = extract_callback_target(&callbacks, "notify", &test_config()).unwrap_err();
+        let crate::error::Error::InvalidData(msg) = err else {
+            panic!("expected InvalidData, got {err:?}");
+        };
+        assert!(msg.contains("revalidation"), "got: {msg}");
+        assert!(msg.contains("Authorization"), "got: {msg}");
+    }
+
+    #[test]
+    fn extract_callback_target_rejects_mutated_http_url() {
+        // Flipping https:// to http:// after schedule time must be caught.
+        let callbacks = json!([{
+            "name": "notify",
+            "url": "http://example.com/hook"
+        }]);
+        let err = extract_callback_target(&callbacks, "notify", &test_config()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn extract_callback_target_rejects_mutated_private_host() {
+        let callbacks = json!([{
+            "name": "notify",
+            "url": "https://metadata.google.internal/hook"
+        }]);
+        let err = extract_callback_target(&callbacks, "notify", &test_config()).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidData(_)));
+    }
+
+    // ── Parser contract: schedule and dispatch agree on valid callbacks ──────
+
+    #[test]
+    fn dispatch_parser_matches_schedule_parser_for_valid_callbacks() {
+        // A callback that passes parse_callbacks must produce a structurally equivalent
+        // target via extract_callback_target. Locks the contract between the two parsers.
+        let cb = json!({
+            "name": "abc",
+            "url": "https://example.com/",
+            "signing_key_id": "k",
+            "headers": { "X-Service": "svc" },
+            "max_attempts": 3,
+        });
+        let arr = json!([cb]);
+        let cfg = DispatchConfig::default();
+        let mut parsed = crate::callbacks::parse_callbacks(&arr, &cfg);
+        assert_eq!(parsed.valid.len(), 1);
+        let from_schedule = parsed.valid.remove(0);
+        let from_dispatch = extract_callback_target(&arr, "abc", &cfg).unwrap();
+        assert_eq!(from_schedule.name, from_dispatch.name);
+        assert_eq!(from_schedule.url, from_dispatch.url);
+        assert_eq!(from_schedule.headers, from_dispatch.headers);
+        assert_eq!(from_schedule.max_attempts, from_dispatch.max_attempts);
+        assert_eq!(from_schedule.mode, from_dispatch.mode);
+        assert_eq!(from_schedule.signing_key_id, from_dispatch.signing_key_id);
+        assert_eq!(from_schedule.backoff, from_dispatch.backoff);
+        assert_eq!(from_schedule.timeout, from_dispatch.timeout);
+        assert_eq!(
+            from_schedule.external_completion_timeout,
+            from_dispatch.external_completion_timeout
+        );
+        assert_eq!(
+            from_schedule.max_completion_cycles,
+            from_dispatch.max_completion_cycles
+        );
     }
 }

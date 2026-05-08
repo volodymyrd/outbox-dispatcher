@@ -154,98 +154,80 @@ fn parse_one_callback(
         ));
     }
 
-    let url = match obj.get("url") {
-        None => {
-            return Err((
-                name.clone(),
-                "invalid_callback: missing required field 'url'".to_string(),
-            ));
+    // Validate every other field inside a closure so errors can be tagged with
+    // `name` in a single place instead of cloning it nine times.
+    let body = || -> Result<CallbackTarget, String> {
+        let url = obj
+            .get("url")
+            .ok_or_else(|| "invalid_callback: missing required field 'url'".to_string())?
+            .as_str()
+            .ok_or_else(|| "invalid_callback: 'url' must be a string".to_string())?
+            .to_string();
+
+        validate_url(
+            &url,
+            config.allow_insecure_urls,
+            config.allow_private_ip_targets,
+        )?;
+
+        let mode = parse_mode(obj.get("mode").and_then(|v| v.as_str()))?;
+
+        let signing_key_id = obj
+            .get("signing_key_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if !config.allow_unsigned_callbacks && signing_key_id.is_none() {
+            return Err("invalid_callback: missing required field 'signing_key_id' \
+                 (set allow_unsigned_callbacks=true to omit)"
+                .to_string());
         }
-        Some(v) => v.as_str().ok_or_else(|| {
-            (
-                name.clone(),
-                "invalid_callback: 'url' must be a string".to_string(),
-            )
-        })?,
-    }
-    .to_string();
 
-    validate_url(
-        &url,
-        config.allow_insecure_urls,
-        config.allow_private_ip_targets,
-    )
-    .map_err(|r| (name.clone(), r))?;
+        let headers = parse_headers(obj.get("headers"))?;
+        let max_attempts = parse_max_attempts(obj.get("max_attempts"), config.max_attempts)?;
+        let backoff = parse_backoff(obj.get("backoff_seconds"), &config.backoff)?;
+        let timeout = parse_timeout(obj.get("timeout_seconds"), config.handler_timeout)?;
+        let external_completion_timeout =
+            parse_external_timeout(obj.get("external_completion_timeout_seconds"))?;
+        let max_completion_cycles = parse_max_completion_cycles(
+            obj.get("max_completion_cycles"),
+            config.max_completion_cycles,
+        )?;
 
-    let mode =
-        parse_mode(obj.get("mode").and_then(|v| v.as_str())).map_err(|r| (name.clone(), r))?;
+        // External mode requires a timeout so the sweeper knows when to redeliver.
+        if mode == CompletionMode::External && external_completion_timeout.is_none() {
+            return Err("invalid_callback: mode='external' requires \
+                 'external_completion_timeout_seconds'"
+                .to_string());
+        }
 
-    let signing_key_id = obj
-        .get("signing_key_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    if !config.allow_unsigned_callbacks && signing_key_id.is_none() {
-        return Err((
-            name,
-            "invalid_callback: missing required field 'signing_key_id' \
-             (set allow_unsigned_callbacks=true to omit)"
-                .to_string(),
-        ));
-    }
+        Ok(CallbackTarget {
+            name: name.clone(),
+            url,
+            mode,
+            signing_key_id,
+            headers,
+            max_attempts,
+            backoff,
+            timeout,
+            external_completion_timeout,
+            max_completion_cycles,
+        })
+    };
 
-    let headers = parse_headers(obj.get("headers")).map_err(|r| (name.clone(), r))?;
-
-    let max_attempts = parse_max_attempts(obj.get("max_attempts"), config.max_attempts)
-        .map_err(|r| (name.clone(), r))?;
-
-    let backoff = parse_backoff(obj.get("backoff_seconds"), &config.backoff)
-        .map_err(|r| (name.clone(), r))?;
-
-    let timeout = parse_timeout(obj.get("timeout_seconds"), config.handler_timeout)
-        .map_err(|r| (name.clone(), r))?;
-
-    let external_completion_timeout =
-        parse_external_timeout(obj.get("external_completion_timeout_seconds"))
-            .map_err(|r| (name.clone(), r))?;
-
-    let max_completion_cycles = parse_max_completion_cycles(
-        obj.get("max_completion_cycles"),
-        config.max_completion_cycles,
-    )
-    .map_err(|r| (name.clone(), r))?;
-
-    // External mode requires a timeout so the sweeper knows when to redeliver.
-    if mode == CompletionMode::External && external_completion_timeout.is_none() {
-        return Err((
-            name,
-            "invalid_callback: mode='external' requires \
-             'external_completion_timeout_seconds'"
-                .to_string(),
-        ));
-    }
-
-    Ok(CallbackTarget {
-        name,
-        url,
-        mode,
-        signing_key_id,
-        headers,
-        max_attempts,
-        backoff,
-        timeout,
-        external_completion_timeout,
-        max_completion_cycles,
-    })
+    body().map_err(|reason| (name, reason))
 }
 
 fn is_valid_callback_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    b.len() >= 3
-        && b.len() <= 64
-        && b[0].is_ascii_lowercase()
-        && b[1..]
-            .iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+    // Regex: ^[a-z][a-z0-9_]{2,63}$
+    if !(3..=64).contains(&name.len()) {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn validate_url(
