@@ -76,6 +76,114 @@ For each issue found:
 
 End with a summary table of findings by severity.
 
+## Report File
+
+After completing the review, **always** write a report file, even if there are no findings.
+
+### Gather context first
+
+Before writing, run:
+```bash
+git branch --show-current
+date -u +"%Y-%m-%dT%H:%M:%SZ"
+```
+
+### File path
+
+Create the `code-review/` directory at the workspace root if it does not exist, then write:
+
+```
+code-review/YYYY-MM-DD_<branch>_<target-slug>.md
+```
+
+- `YYYY-MM-DD` — today's UTC date
+- `<branch>` — current git branch name with `/` replaced by `-`
+- `<target-slug>` — the reviewed file or scope: base filename without extension, or `workspace` when reviewing the full workspace
+
+Example: `code-review/2025-05-08_phase2_callbacks.md`
+
+### Report structure
+
+Use **exactly** this template:
+
+```markdown
+# Code Review — <target>
+
+**Date:** <ISO-8601 UTC datetime>
+**Branch:** <branch>
+**Reviewed by:** Claude (review command)
+**Scope:** <file path(s) or "full workspace">
+
+---
+
+## Findings
+
+<!-- One section per finding. Omit section entirely if no findings. -->
+
+### Finding <N> — <short title>
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `path/to/file.rs:42` |
+| **Severity** | Critical / High / Medium / Low |
+| **Category** | Security / Correctness / Concurrency / Performance / Idiom / Migration / Testing / Config |
+
+**Problem**
+
+<One or two sentences describing what is wrong and why it matters.>
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// file.rs lines 38-48
+<exact existing code excerpt — enough for an LLM to locate and understand the problem>
+```
+
+**Recommended fix**
+
+```rust
+<complete corrected replacement — not a diff, the full new form of the changed lines>
+```
+
+**Why this fix**
+
+<One sentence explaining the Rust/project reasoning behind the recommendation.>
+
+---
+
+<!-- repeat for each finding -->
+
+## Summary
+
+| # | Title | File:Line | Severity | Category | Status | Notes |
+|---|-------|-----------|----------|----------|--------|-------|
+| 1 | <short title> | `path/file.rs:42` | Critical | Correctness | TODO | |
+| 2 | <short title> | `path/file.rs:88` | High | Idiom | TODO | |
+
+> **Instructions for the implementing LLM:**
+> - Change `TODO` to `DONE` once a finding is fully addressed.
+> - If a finding is intentionally skipped or cannot be applied, change `TODO` to `SKIPPED` and add a short reason in the **Notes** column.
+> - Do not delete rows — the table is the authoritative implementation log.
+```
+
+### When there are no findings
+
+Still write the file. Use an empty `## Findings` section with a note:
+
+```markdown
+## Findings
+
+No issues found.
+```
+
+And a summary table with a single row:
+
+```markdown
+| # | Title | File:Line | Severity | Category | Status | Notes |
+|---|-------|-----------|----------|----------|--------|-------|
+| — | No findings | — | — | — | DONE | All checklist items passed |
+```
+
 ## Mandatory Post-Change Steps
 
 After applying **every** fix, run these commands in order and resolve all issues before finishing:
