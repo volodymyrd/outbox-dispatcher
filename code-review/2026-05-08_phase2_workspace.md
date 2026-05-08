@@ -162,9 +162,9 @@ Leverages `serde` for type-safe deserialization and reduces boilerplate.
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 1 | Poison Pill in `fetch_due_deliveries` | `crates/core/src/repo.rs:260` | High | Correctness | TODO | |
-| 2 | Inefficient loop in `ensure_deliveries` | `crates/core/src/repo.rs:206` | Low | Performance | TODO | |
-| 3 | `CompletionMode` manual string matching | `crates/core/src/repo.rs:136` | Low | Idiom | TODO | |
+| 1 | Poison Pill in `fetch_due_deliveries` | `crates/core/src/repo.rs:260` | High | Correctness | DONE | Per-row parse errors now dead-letter the offending delivery in-place and continue the batch. |
+| 2 | Inefficient loop in `ensure_deliveries` | `crates/core/src/repo.rs:206` | Low | Performance | DONE | Replaced per-callback loop + transaction with a single `UNNEST`-driven INSERT. |
+| 3 | `CompletionMode` manual string matching | `crates/core/src/repo.rs:136` | Low | Idiom | DONE | `CompletionMode` now derives `Default`; `RawCallbackSpec.mode` deserializes directly. |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

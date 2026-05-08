@@ -61,6 +61,10 @@ pub trait Repo: Send + Sync {
     // ── Dispatch ───────────────────────────────────────────────────────────
 
     /// Returns due deliveries (available_at ≤ now, not locked, not dispatched).
+    ///
+    /// Rows whose callback spec cannot be parsed are dead-lettered in-place and
+    /// excluded from the returned batch so a single corrupt row cannot stall the
+    /// queue ("poison pill" guard).
     async fn fetch_due_deliveries(&self, batch_size: i64) -> Result<Vec<DueDelivery>>;
 
     /// Atomically sets `locked_until` and increments `attempts`; returns false if
@@ -151,8 +155,8 @@ impl PgRepo {
 struct RawCallbackSpec {
     name: String,
     url: String,
-    #[serde(default = "default_mode_str")]
-    mode: String,
+    #[serde(default)]
+    mode: CompletionMode,
     signing_key_id: Option<String>,
     #[serde(default)]
     headers: HashMap<String, String>,
@@ -163,17 +167,8 @@ struct RawCallbackSpec {
     max_completion_cycles: Option<u32>,
 }
 
-fn default_mode_str() -> String {
-    "managed".to_string()
-}
-
 impl RawCallbackSpec {
     fn into_target(self, defaults: &DispatchDefaults) -> CallbackTarget {
-        let mode = if self.mode == "external" {
-            CompletionMode::External
-        } else {
-            CompletionMode::Managed
-        };
         let timeout = self
             .timeout_seconds
             .map(Duration::from_secs)
@@ -193,7 +188,7 @@ impl RawCallbackSpec {
         CallbackTarget {
             name: self.name,
             url: self.url,
-            mode,
+            mode: self.mode,
             signing_key_id: self.signing_key_id,
             headers: self.headers,
             max_attempts,
@@ -262,26 +257,26 @@ impl Repo for PgRepo {
         if callbacks.is_empty() {
             return Ok(());
         }
-        // Transaction ensures all-or-nothing insertion across the callback list.
-        // For the typical single-callback case this adds one BEGIN/COMMIT round-trip;
-        // acceptable given the small callback fan-out and correctness benefit.
-        let mut tx = self.pool.begin().await?;
-        for cb in callbacks {
-            sqlx::query!(
-                r#"
-                INSERT INTO outbox_deliveries
-                    (event_id, callback_name, completion_mode, available_at)
-                VALUES ($1, $2, $3, now())
-                ON CONFLICT (event_id, callback_name) DO NOTHING
-                "#,
-                event_id,
-                cb.name,
-                cb.mode.as_str(),
-            )
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
+        // Single batched INSERT via UNNEST: one round-trip regardless of fan-out.
+        let names: Vec<String> = callbacks.iter().map(|cb| cb.name.clone()).collect();
+        let modes: Vec<String> = callbacks
+            .iter()
+            .map(|cb| cb.mode.as_str().to_string())
+            .collect();
+        sqlx::query!(
+            r#"
+            INSERT INTO outbox_deliveries
+                (event_id, callback_name, completion_mode, available_at)
+            SELECT $1, name, mode, now()
+            FROM UNNEST($2::text[], $3::text[]) AS t(name, mode)
+            ON CONFLICT (event_id, callback_name) DO NOTHING
+            "#,
+            event_id,
+            &names as &[String],
+            &modes as &[String],
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -344,23 +339,57 @@ impl Repo for PgRepo {
 
         let mut due = Vec::with_capacity(rows.len());
         for row in rows {
-            let target =
-                extract_callback_target(&row.callbacks, &row.callback_name, &self.defaults)?;
-            due.push(DueDelivery {
-                delivery_id: row.delivery_id,
-                event_id: row.event_id,
-                attempts: row.attempts,
-                target,
-                kind: row.kind,
-                aggregate_type: row.aggregate_type,
-                aggregate_id: row.aggregate_id,
-                payload: row.payload,
-                metadata: row.metadata,
-                actor_id: row.actor_id,
-                correlation_id: row.correlation_id,
-                causation_id: row.causation_id,
-                created_at: row.created_at,
-            });
+            match extract_callback_target(&row.callbacks, &row.callback_name, &self.defaults) {
+                Ok(target) => due.push(DueDelivery {
+                    delivery_id: row.delivery_id,
+                    event_id: row.event_id,
+                    attempts: row.attempts,
+                    target,
+                    kind: row.kind,
+                    aggregate_type: row.aggregate_type,
+                    aggregate_id: row.aggregate_id,
+                    payload: row.payload,
+                    metadata: row.metadata,
+                    actor_id: row.actor_id,
+                    correlation_id: row.correlation_id,
+                    causation_id: row.causation_id,
+                    created_at: row.created_at,
+                }),
+                Err(err) => {
+                    // Poison-pill guard: a structurally invalid callback spec would otherwise
+                    // halt the entire queue (this row keeps its `available_at` at the head).
+                    // Dead-letter it so the rest of the batch can proceed.
+                    tracing::error!(
+                        delivery_id = row.delivery_id,
+                        event_id = %row.event_id,
+                        callback_name = %row.callback_name,
+                        error = %err,
+                        "dead-lettering delivery with invalid callback spec",
+                    );
+                    let reason_owned = format!("invalid callback spec: {err}");
+                    let reason = truncate_at_char_boundary(&reason_owned, 4096);
+                    if let Err(db_err) = sqlx::query!(
+                        r#"
+                        UPDATE outbox_deliveries
+                        SET dead_letter  = TRUE,
+                            last_error   = $2,
+                            locked_until = NULL
+                        WHERE id = $1
+                        "#,
+                        row.delivery_id,
+                        reason,
+                    )
+                    .execute(&self.pool)
+                    .await
+                    {
+                        tracing::error!(
+                            delivery_id = row.delivery_id,
+                            error = %db_err,
+                            "failed to dead-letter poison-pill delivery",
+                        );
+                    }
+                }
+            }
         }
         Ok(due)
     }
