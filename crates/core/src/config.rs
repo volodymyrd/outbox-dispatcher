@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::callbacks::{
-    MAX_BACKOFF_ELEMENT_SECS, MAX_COMPLETION_CYCLES_LIMIT, MAX_HANDLER_TIMEOUT_SECS,
-    MAX_PER_CALLBACK_ATTEMPTS,
+    MAX_BACKOFF_ELEMENT_SECS, MAX_CALLBACKS_PER_EVENT_LIMIT, MAX_COMPLETION_CYCLES_LIMIT,
+    MAX_HANDLER_TIMEOUT_SECS, MAX_PER_CALLBACK_ATTEMPTS,
 };
 use crate::error::ValidationErrors;
 
@@ -14,6 +14,8 @@ pub struct DispatchConfig {
     pub poll_interval: Duration,
     /// Maximum number of deliveries to fetch and dispatch concurrently per cycle.
     pub batch_size: i64,
+    /// Maximum number of new events to fetch and schedule per scheduling cycle.
+    pub schedule_batch_size: i64,
     /// Default maximum retry attempts for a callback before dead-lettering.
     pub max_attempts: u32,
     /// Default backoff schedule for retries.
@@ -45,6 +47,7 @@ impl Default for DispatchConfig {
         Self {
             poll_interval: Duration::from_secs(5),
             batch_size: 50,
+            schedule_batch_size: DEFAULT_SCHEDULE_BATCH_SIZE as i64,
             max_attempts: 6,
             backoff: vec![
                 Duration::from_secs(30),
@@ -122,9 +125,14 @@ pub struct LogConfig {
 }
 
 const DEFAULT_MAX_CALLBACKS_PER_EVENT: u32 = 32;
+const DEFAULT_SCHEDULE_BATCH_SIZE: u32 = 500;
 
 fn default_max_callbacks_per_event() -> u32 {
     DEFAULT_MAX_CALLBACKS_PER_EVENT
+}
+
+fn default_schedule_batch_size() -> u32 {
+    DEFAULT_SCHEDULE_BATCH_SIZE
 }
 
 // ── Dispatch settings (TOML-friendly) ────────────────────────────────────────
@@ -135,6 +143,9 @@ fn default_max_callbacks_per_event() -> u32 {
 pub struct DispatchSettings {
     pub poll_interval_secs: u64,
     pub batch_size: i64,
+    /// Maximum number of new events to fetch per scheduling cycle.
+    #[serde(default = "default_schedule_batch_size")]
+    pub schedule_batch_size: u32,
     pub max_attempts: u32,
     pub backoff_secs: Vec<u64>,
     pub handler_timeout_secs: u64,
@@ -165,6 +176,7 @@ impl From<DispatchSettings> for DispatchConfig {
         Self {
             poll_interval: Duration::from_secs(s.poll_interval_secs),
             batch_size: s.batch_size,
+            schedule_batch_size: s.schedule_batch_size as i64,
             max_attempts: s.max_attempts,
             backoff: s
                 .backoff_secs
@@ -404,6 +416,9 @@ impl AppConfig {
         if self.dispatch.batch_size <= 0 {
             errors.push("dispatch.batch_size must be > 0".to_string());
         }
+        if self.dispatch.schedule_batch_size == 0 {
+            errors.push("dispatch.schedule_batch_size must be > 0".to_string());
+        }
         if self.dispatch.max_attempts == 0 {
             errors.push("dispatch.max_attempts must be > 0".to_string());
         }
@@ -468,6 +483,11 @@ impl AppConfig {
         }
         if self.dispatch.max_callbacks_per_event == 0 {
             errors.push("dispatch.max_callbacks_per_event must be > 0".to_string());
+        }
+        if self.dispatch.max_callbacks_per_event > MAX_CALLBACKS_PER_EVENT_LIMIT {
+            errors.push(format!(
+                "dispatch.max_callbacks_per_event must be <= {MAX_CALLBACKS_PER_EVENT_LIMIT}"
+            ));
         }
         if self.log.filter.trim().is_empty() {
             errors.push("log.filter must not be empty".to_string());
@@ -555,6 +575,7 @@ acquire_timeout_secs = 10
 [dispatch]
 poll_interval_secs = 5
 batch_size = 50
+schedule_batch_size = 500
 max_attempts = 6
 backoff_secs = [30, 120, 600, 3600, 21600, 86400]
 handler_timeout_secs = 30
@@ -642,6 +663,7 @@ filter = "debug"
         let d = &cfg.dispatch;
         assert_eq!(d.poll_interval_secs, 5);
         assert_eq!(d.batch_size, 50);
+        assert_eq!(d.schedule_batch_size, 500);
         assert_eq!(d.max_attempts, 6);
         assert_eq!(d.backoff_secs, vec![30, 120, 600, 3600, 21600, 86400]);
         assert_eq!(d.handler_timeout_secs, 30);
@@ -662,6 +684,7 @@ filter = "debug"
         let dc = DispatchConfig::from(cfg.dispatch);
         assert_eq!(dc.poll_interval, Duration::from_secs(5));
         assert_eq!(dc.batch_size, 50);
+        assert_eq!(dc.schedule_batch_size, 500);
         assert_eq!(dc.max_attempts, 6);
         assert_eq!(
             dc.backoff,
@@ -876,6 +899,14 @@ filter = "info"
         cfg.dispatch.batch_size = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.0.iter().any(|e| e.contains("batch_size")));
+    }
+
+    #[test]
+    fn test_validate_zero_schedule_batch_size() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.schedule_batch_size = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("schedule_batch_size")));
     }
 
     #[test]
@@ -1296,6 +1327,21 @@ filter = "info"
         cfg.dispatch.max_callbacks_per_event = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.0.iter().any(|e| e.contains("max_callbacks_per_event")));
+    }
+
+    #[test]
+    fn test_validate_max_callbacks_per_event_above_limit() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_callbacks_per_event = MAX_CALLBACKS_PER_EVENT_LIMIT + 1;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("max_callbacks_per_event")));
+    }
+
+    #[test]
+    fn test_validate_max_callbacks_per_event_at_limit() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.max_callbacks_per_event = MAX_CALLBACKS_PER_EVENT_LIMIT;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

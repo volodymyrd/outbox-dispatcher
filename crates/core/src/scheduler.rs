@@ -137,9 +137,9 @@ pub async fn schedule_new_deliveries(
     config: &DispatchConfig,
     cursor: i64,
 ) -> Result<i64> {
-    const FETCH_LIMIT: i64 = 500;
-
-    let new_events = repo.fetch_new_events(cursor, FETCH_LIMIT).await?;
+    let new_events = repo
+        .fetch_new_events(cursor, config.schedule_batch_size)
+        .await?;
     if new_events.is_empty() {
         return Ok(cursor);
     }
@@ -187,19 +187,7 @@ pub async fn schedule_new_deliveries(
         // `parse_callbacks` returns a split of valid and invalid entries.
         // Invalid entries are dead-lettered immediately; valid entries are expanded
         // into delivery rows via `ensure_deliveries` (idempotent via UNIQUE constraint).
-        let parsed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            parse_callbacks(&event.callbacks, config)
-        })) {
-            Ok(p) => p,
-            Err(_) => {
-                // Defensive: parse_callbacks should never panic, but guard anyway.
-                error!(
-                    event_id = %event.event_id,
-                    "unexpected panic while parsing callbacks — skipping event (poison pill)"
-                );
-                continue;
-            }
-        };
+        let parsed = parse_callbacks(&event.callbacks, config);
 
         // Poison-pill guard: if the entire callbacks value is unparseable at the
         // array level (not an array, completely corrupt), `parse_callbacks` returns

@@ -62,12 +62,17 @@ async fn main() -> Result<()> {
     }
 
     // Fail fast if any configured signing key cannot be resolved from its env var.
-    if let Err(errors) = KeyRing::load(&config.signing_keys) {
-        for e in &errors.0 {
-            eprintln!("signing key error: {e}");
+    // Bind the keyring so the allocation is held for the process lifetime and Phase 4
+    // dispatch wiring can pass it directly without a second decode pass.
+    let _keyring = match KeyRing::load(&config.signing_keys) {
+        Ok(kr) => kr,
+        Err(errors) => {
+            for e in &errors.0 {
+                eprintln!("signing key error: {e}");
+            }
+            anyhow::bail!("invalid signing keys ({} error(s))", errors.0.len());
         }
-        anyhow::bail!("invalid signing keys ({} error(s))", errors.0.len());
-    }
+    };
 
     init_tracing(&config.log).context("initialising tracing subscriber")?;
     info!(env = %app_env, "outbox-dispatcher starting");

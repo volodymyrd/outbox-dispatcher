@@ -142,6 +142,9 @@ impl KeyRing {
                             ));
                         }
                         Ok(bytes) => {
+                            // Wrap immediately so the allocation is zeroed on every exit path,
+                            // including the length-validation rejection branches below.
+                            let bytes = Zeroizing::new(bytes);
                             if bytes.len() < MIN_SECRET_BYTES {
                                 errors.push(format!(
                                     "signing_keys[{id}]: secret from '{}' is {} bytes after \
@@ -157,7 +160,7 @@ impl KeyRing {
                                     bytes.len()
                                 ));
                             } else {
-                                keys.insert(id.clone(), Zeroizing::new(bytes));
+                                keys.insert(id.clone(), bytes);
                             }
                         }
                     }

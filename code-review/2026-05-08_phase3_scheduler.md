@@ -214,11 +214,11 @@ Avoids redundant work and prepares for Phase 4 where the `KeyRing` will be requi
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 1 | Redundant `catch_unwind` | `crates/core/src/scheduler.rs:163` | Medium | Idiom | TODO | |
-| 2 | Unstable `let_chains` | `crates/core/src/scheduler.rs:180` | Medium | Idiom | TODO | |
-| 3 | Hardcoded `FETCH_LIMIT` | `crates/core/src/scheduler.rs:141` | Low | Config | TODO | |
-| 4 | `max_callbacks_per_event` upper bound | `crates/core/src/config.rs:469` | Medium | Config | TODO | |
-| 5 | `KeyRing::load` result discarded | `crates/bin/src/main.rs:64` | Low | Idiom | TODO | |
+| 1 | Redundant `catch_unwind` | `crates/core/src/scheduler.rs:163` | Medium | Idiom | DONE | |
+| 2 | Unstable `let_chains` | `crates/core/src/scheduler.rs:180` | Medium | Idiom | SKIPPED | `let_chains` is stable in Rust edition 2024 (this project); Rust 1.91 + edition = "2024"; clippy prefers the collapsed form |
+| 3 | Hardcoded `FETCH_LIMIT` | `crates/core/src/scheduler.rs:141` | Low | Config | DONE | Added `schedule_batch_size` to `DispatchConfig`/`DispatchSettings` with default 500 |
+| 4 | `max_callbacks_per_event` upper bound | `crates/core/src/config.rs:469` | Medium | Config | DONE | |
+| 5 | `KeyRing::load` result discarded | `crates/bin/src/main.rs:64` | Low | Idiom | DONE | |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

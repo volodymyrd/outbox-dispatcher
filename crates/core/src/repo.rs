@@ -474,14 +474,21 @@ impl Repo for PgRepo {
     }
 
     async fn recover_cursor(&self) -> Result<i64> {
+        // Find the most recently inserted delivery row (O(1) via the BIGSERIAL PK),
+        // then join once to resolve its event's sequential id.
+        // This avoids scanning outbox_events in reverse when there is a large gap of
+        // events without delivery rows (e.g. after a downtime or publisher burst).
         let cursor = sqlx::query_scalar!(
             r#"
             SELECT COALESCE(
                 (SELECT e.id
-                 FROM outbox_deliveries d
-                 JOIN outbox_events e ON e.event_id = d.event_id
-                 ORDER BY e.id DESC
-                 LIMIT 1),
+                 FROM outbox_events e
+                 WHERE e.event_id = (
+                     SELECT d.event_id
+                     FROM outbox_deliveries d
+                     ORDER BY d.id DESC
+                     LIMIT 1
+                 )),
                 0
             ) AS "cursor!"
             "#,
