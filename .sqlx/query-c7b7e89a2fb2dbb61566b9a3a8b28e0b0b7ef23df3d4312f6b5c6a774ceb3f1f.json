@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO outbox_deliveries\n                (event_id, callback_name, completion_mode, dead_letter, last_error, available_at)\n            SELECT $1, name, 'managed', TRUE, reason, now()\n            FROM UNNEST($2::text[], $3::text[]) AS t(name, reason)\n            ON CONFLICT (event_id, callback_name) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c7b7e89a2fb2dbb61566b9a3a8b28e0b0b7ef23df3d4312f6b5c6a774ceb3f1f"
+}

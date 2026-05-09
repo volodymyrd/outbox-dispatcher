@@ -30,6 +30,14 @@ pub trait Repo: Send + Sync {
         reason: &str,
     ) -> Result<()>;
 
+    /// Inserts dead-lettered delivery rows for multiple invalid callbacks in a single
+    /// round-trip. Each entry is `(callback_name, reason)`. No-ops if `entries` is empty.
+    async fn create_invalid_deliveries(
+        &self,
+        event_id: Uuid,
+        entries: &[(String, String)],
+    ) -> Result<()>;
+
     // ── Dispatch ───────────────────────────────────────────────────────────
 
     /// Returns due deliveries (available_at ≤ now, not locked, not dispatched).
@@ -219,6 +227,36 @@ impl Repo for PgRepo {
             event_id,
             callback_name,
             reason,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn create_invalid_deliveries(
+        &self,
+        event_id: Uuid,
+        entries: &[(String, String)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+        let reasons: Vec<String> = entries
+            .iter()
+            .map(|(_, r)| truncate_at_char_boundary(r, 4096).to_string())
+            .collect();
+        sqlx::query!(
+            r#"
+            INSERT INTO outbox_deliveries
+                (event_id, callback_name, completion_mode, dead_letter, last_error, available_at)
+            SELECT $1, name, 'managed', TRUE, reason, now()
+            FROM UNNEST($2::text[], $3::text[]) AS t(name, reason)
+            ON CONFLICT (event_id, callback_name) DO NOTHING
+            "#,
+            event_id,
+            &names as &[String],
+            &reasons as &[String],
         )
         .execute(&self.pool)
         .await?;
@@ -474,14 +512,21 @@ impl Repo for PgRepo {
     }
 
     async fn recover_cursor(&self) -> Result<i64> {
+        // Find the most recently inserted delivery row (O(1) via the BIGSERIAL PK),
+        // then join once to resolve its event's sequential id.
+        // This avoids scanning outbox_events in reverse when there is a large gap of
+        // events without delivery rows (e.g. after a downtime or publisher burst).
         let cursor = sqlx::query_scalar!(
             r#"
             SELECT COALESCE(
                 (SELECT e.id
-                 FROM outbox_deliveries d
-                 JOIN outbox_events e ON e.event_id = d.event_id
-                 ORDER BY e.id DESC
-                 LIMIT 1),
+                 FROM outbox_events e
+                 WHERE e.event_id = (
+                     SELECT d.event_id
+                     FROM outbox_deliveries d
+                     ORDER BY d.id DESC
+                     LIMIT 1
+                 )),
                 0
             ) AS "cursor!"
             "#,

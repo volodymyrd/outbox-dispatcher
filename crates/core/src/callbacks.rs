@@ -38,6 +38,8 @@ pub const MAX_HANDLER_TIMEOUT_SECS: u64 = 300;
 pub const MAX_COMPLETION_CYCLES_LIMIT: u64 = 1_000;
 /// Hard ceiling on each element of per-callback `backoff_seconds`; also enforced by [`AppConfig::validate`].
 pub const MAX_BACKOFF_ELEMENT_SECS: u64 = 7 * 86_400;
+/// Hard ceiling on `dispatch.max_callbacks_per_event`; also enforced by [`AppConfig::validate`].
+pub const MAX_CALLBACKS_PER_EVENT_LIMIT: u32 = 1_000;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 

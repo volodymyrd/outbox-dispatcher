@@ -9,6 +9,7 @@ acquire_timeout_secs = 10
 [dispatch]
 poll_interval_secs = 5
 batch_size = 50
+schedule_batch_size = 500
 max_attempts = 6
 backoff_secs = [30, 120, 600, 3600, 21600, 86400]
 handler_timeout_secs = 30

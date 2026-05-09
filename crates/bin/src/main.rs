@@ -1,10 +1,15 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use outbox_dispatcher_core::{AppConfig, DatabaseConfig, KeyRing, LogConfig, LogFormat};
+use outbox_dispatcher_core::{
+    AppConfig, DatabaseConfig, DispatchConfig, KeyRing, LogConfig, LogFormat, PgRepo, run_scheduler,
+};
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgListener, PgPoolOptions};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 /// Migrations embedded at compile time from the workspace-root `migrations/` directory.
@@ -57,12 +62,17 @@ async fn main() -> Result<()> {
     }
 
     // Fail fast if any configured signing key cannot be resolved from its env var.
-    if let Err(errors) = KeyRing::load(&config.signing_keys) {
-        for e in &errors.0 {
-            eprintln!("signing key error: {e}");
+    // Bind the keyring so the allocation is held for the process lifetime and Phase 4
+    // dispatch wiring can pass it directly without a second decode pass.
+    let _keyring = match KeyRing::load(&config.signing_keys) {
+        Ok(kr) => kr,
+        Err(errors) => {
+            for e in &errors.0 {
+                eprintln!("signing key error: {e}");
+            }
+            anyhow::bail!("invalid signing keys ({} error(s))", errors.0.len());
         }
-        anyhow::bail!("invalid signing keys ({} error(s))", errors.0.len());
-    }
+    };
 
     init_tracing(&config.log).context("initialising tracing subscriber")?;
     info!(env = %app_env, "outbox-dispatcher starting");
@@ -106,8 +116,33 @@ async fn main() -> Result<()> {
 
             validate_schema(&pool).await?;
 
-            info!("outbox-dispatcher started (dispatch loop not yet implemented — Phase 3+)");
-            // TODO(Phase 3): start scheduler, dispatch loop, admin API.
+            let dispatch_config = DispatchConfig::from(config.dispatch.clone());
+            let repo = Arc::new(PgRepo::new(pool.clone(), dispatch_config.clone()));
+
+            // Create a dedicated connection for LISTEN/NOTIFY (the pool cannot be used
+            // for LISTEN because each .execute() call may use a different connection).
+            let listener = PgListener::connect_with(&pool)
+                .await
+                .context("creating PgListener for LISTEN/NOTIFY")?;
+
+            let listener_status = Arc::new(AtomicBool::new(false));
+
+            // Graceful-shutdown token — wired to SIGTERM/SIGINT.
+            let shutdown = CancellationToken::new();
+            let shutdown_clone = shutdown.clone();
+            tokio::spawn(async move {
+                if let Ok(()) = tokio::signal::ctrl_c().await {
+                    info!("received SIGINT/SIGTERM, requesting shutdown");
+                    shutdown_clone.cancel();
+                }
+            });
+
+            info!("starting scheduler");
+            run_scheduler(repo, dispatch_config, listener, listener_status, shutdown)
+                .await
+                .context("scheduler exited with error")?;
+
+            info!("outbox-dispatcher stopped cleanly");
         }
     }
 
