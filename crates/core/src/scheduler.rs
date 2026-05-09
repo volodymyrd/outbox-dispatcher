@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use sqlx::postgres::PgListener;
 use tokio::time::{Instant, sleep_until};
@@ -70,6 +71,10 @@ pub async fn run_scheduler(
     let poll_interval = config.poll_interval;
     let mut next_poll = Instant::now() + poll_interval;
 
+    // Tracks consecutive scheduling failures so we can apply a capped backoff and
+    // avoid log-spamming at full speed during a sustained DB outage.
+    let mut consecutive_errors: u32 = 0;
+
     loop {
         tokio::select! {
             biased;
@@ -103,21 +108,41 @@ pub async fn run_scheduler(
 
             // Poll-timer fallback: fires at most every poll_interval.
             _ = sleep_until(next_poll) => {
-                next_poll = Instant::now() + poll_interval;
                 debug!("scheduler poll-timer fired");
             }
+        }
+
+        // Drain any further notifications that arrived since the select fired so we run
+        // one scheduling pass per *batch* of signals rather than one pass per signal.
+        // This prevents a burst of 1000 NOTIFYs from triggering 1000 redundant cycles.
+        while let Ok(Some(_)) = listener.try_recv().await {
+            // intentionally discarded — we just want to flush the buffer
         }
 
         // Run a scheduling cycle regardless of which wake source fired.
         match schedule_new_deliveries(repo.as_ref(), &config, cursor).await {
             Ok(new_cursor) => {
                 cursor = new_cursor;
+                consecutive_errors = 0;
             }
             Err(e) => {
-                // Log and continue — a transient DB error should not crash the loop.
-                error!(error = %e, "error during schedule_new_deliveries; will retry on next wake");
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                error!(
+                    error = %e,
+                    consecutive_errors,
+                    "error during schedule_new_deliveries; will retry on next wake"
+                );
+                // Cap at poll_interval so we never delay longer than a regular poll.
+                let backoff = poll_interval.min(Duration::from_millis(
+                    100u64.saturating_mul(1u64 << consecutive_errors.min(6)),
+                ));
+                tokio::time::sleep(backoff).await;
             }
         }
+
+        // Reset the poll timer after every cycle so the next timer fire is a full
+        // poll_interval away from the last completed cycle.
+        next_poll = Instant::now() + poll_interval;
     }
 }
 
@@ -147,9 +172,6 @@ pub async fn schedule_new_deliveries(
     let mut new_cursor = cursor;
 
     for event in &new_events {
-        // Always advance the cursor so a poison pill does not stall the loop.
-        new_cursor = event.id;
-
         // ── Payload-size guard ────────────────────────────────────────────────
         // Events that exceed the limit are dead-lettered immediately for every
         // callback in the list. This is a documented carve-out from the normal
@@ -163,23 +185,14 @@ pub async fn schedule_new_deliveries(
                 limit_bytes = config.payload_size_limit_bytes,
                 "payload too large — dead-lettering all callbacks"
             );
-
-            // Extract callback names from the JSONB array for dead-lettering.
-            // We don't fully parse here; a name or synthetic fallback is enough.
             let names = extract_callback_names(&event.callbacks);
-            for name in names {
-                if let Err(e) = repo
-                    .create_invalid_delivery(event.event_id, &name, &reason)
-                    .await
-                {
-                    error!(
-                        event_id = %event.event_id,
-                        callback_name = %name,
-                        error = %e,
-                        "failed to dead-letter oversized-payload callback"
-                    );
-                }
-            }
+            let entries: Vec<(String, String)> =
+                names.into_iter().map(|n| (n, reason.clone())).collect();
+            // Propagate: a transient DB error here would otherwise lose the dead-letter
+            // record for an oversized payload and skip the event from the cursor.
+            repo.create_invalid_deliveries(event.event_id, &entries)
+                .await?;
+            new_cursor = event.id;
             continue;
         }
 
@@ -189,43 +202,61 @@ pub async fn schedule_new_deliveries(
         // into delivery rows via `ensure_deliveries` (idempotent via UNIQUE constraint).
         let parsed = parse_callbacks(&event.callbacks, config);
 
-        // Poison-pill guard: if the entire callbacks value is unparseable at the
-        // array level (not an array, completely corrupt), `parse_callbacks` returns
-        // only `invalid` entries with the synthetic "<root>" label. Log and skip.
+        // Array-level rejection guard: `parse_callbacks` returns only `<root>` invalid
+        // entries when the JSONB cannot be handled at the array level.
+        //
+        // Two distinct cases:
+        //   (a) Truly corrupt / non-array JSONB — no callback names to materialise.
+        //       Log and skip (poison pill); safe because the DB CHECK constraint makes
+        //       this unreachable in practice.
+        //   (b) Valid array that fails an array-level check (e.g. too many callbacks).
+        //       Dead-letter every named entry so the rejection is visible to operators
+        //       via the admin dead-letter list.
         if parsed.valid.is_empty() && parsed.invalid.iter().all(|(n, _)| n == "<root>") {
-            error!(
-                event_id = %event.event_id,
-                callbacks_json = %event.callbacks,
-                "callbacks JSONB is structurally corrupt — skipping event (poison pill)"
-            );
+            if event.callbacks.is_array() {
+                // Array exists but failed an array-level check (e.g. too many callbacks).
+                // Dead-letter every entry so the rejection is visible in the dead-letter list.
+                let reason = parsed
+                    .invalid
+                    .first()
+                    .map(|(_, r)| r.clone())
+                    .unwrap_or_else(|| {
+                        "invalid_callback: unspecified array-level rejection".to_string()
+                    });
+                let entries: Vec<(String, String)> = extract_callback_names(&event.callbacks)
+                    .into_iter()
+                    .map(|n| (n, reason.clone()))
+                    .collect();
+                repo.create_invalid_deliveries(event.event_id, &entries)
+                    .await?;
+            } else {
+                // Truly unparseable JSONB — currently unreachable due to DB CHECK constraint.
+                error!(
+                    event_id = %event.event_id,
+                    callbacks_json = %event.callbacks,
+                    "callbacks JSONB is structurally corrupt — skipping event (poison pill)"
+                );
+            }
+            new_cursor = event.id;
             continue;
         }
 
-        // Schedule valid callbacks.
-        if !parsed.valid.is_empty()
-            && let Err(e) = repo.ensure_deliveries(event.event_id, &parsed.valid).await
-        {
-            error!(
-                event_id = %event.event_id,
-                error = %e,
-                "failed to ensure deliveries for event"
-            );
+        // Schedule valid callbacks. Propagate DB errors so the cursor stays at the last
+        // fully-processed event and the wake loop retries this event on the next cycle.
+        if !parsed.valid.is_empty() {
+            repo.ensure_deliveries(event.event_id, &parsed.valid)
+                .await?;
         }
 
-        // Dead-letter structurally invalid callbacks.
-        for (name, reason) in &parsed.invalid {
-            if let Err(e) = repo
-                .create_invalid_delivery(event.event_id, name, reason)
-                .await
-            {
-                error!(
-                    event_id = %event.event_id,
-                    callback_name = %name,
-                    error = %e,
-                    "failed to dead-letter invalid callback"
-                );
-            }
+        // Dead-letter structurally invalid callbacks. Same rule: propagate DB errors.
+        if !parsed.invalid.is_empty() {
+            repo.create_invalid_deliveries(event.event_id, &parsed.invalid)
+                .await?;
         }
+
+        // Cursor advance is the commit point for "this event has been fully scheduled".
+        // Only advance after all DB writes for this event have succeeded.
+        new_cursor = event.id;
     }
 
     Ok(new_cursor)
@@ -235,19 +266,20 @@ pub async fn schedule_new_deliveries(
 
 /// Extract callback names from a JSONB array without full validation.
 ///
-/// Used only in the payload-size rejection path where we need names to dead-letter
-/// each callback without running full structural validation (which would be redundant
-/// since we're rejecting everything unconditionally).
+/// Used in the payload-size rejection path and array-level rejection path where we
+/// need names to dead-letter each callback without running full structural validation.
 ///
-/// Falls back to a synthetic name when an element lacks a valid string `"name"` field.
+/// The DB CHECK constraint guarantees `callbacks` is a non-empty array; the
+/// `debug_assert!` below catches regressions in tests.
 fn extract_callback_names(callbacks: &serde_json::Value) -> Vec<String> {
-    let Some(arr) = callbacks.as_array() else {
-        return vec!["<unknown>".to_string()];
-    };
-    if arr.is_empty() {
-        return vec!["<unknown>".to_string()];
-    }
-    arr.iter()
+    debug_assert!(
+        callbacks.as_array().is_some_and(|a| !a.is_empty()),
+        "callbacks JSONB must be a non-empty array (DB CHECK constraint)"
+    );
+    callbacks
+        .as_array()
+        .into_iter()
+        .flatten()
         .enumerate()
         .map(|(i, v)| {
             v.get("name")
@@ -288,19 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_names_from_non_array_returns_unknown() {
-        let callbacks = json!({"name": "not_array"});
-        let names = extract_callback_names(&callbacks);
-        assert_eq!(names, vec!["<unknown>"]);
-    }
-
-    #[test]
-    fn extract_names_from_empty_array_returns_unknown() {
-        let names = extract_callback_names(&json!([]));
-        assert_eq!(names, vec!["<unknown>"]);
-    }
-
-    #[test]
     fn extract_names_non_string_name_field_falls_back() {
         let callbacks = json!([{"name": 42, "url": "https://a.example.com/"}]);
         let names = extract_callback_names(&callbacks);
@@ -324,12 +343,16 @@ mod tests {
     use uuid::Uuid;
 
     /// A minimal mock Repo that records calls to `ensure_deliveries` and
-    /// `create_invalid_delivery`, and returns pre-loaded events from a queue.
+    /// `create_invalid_deliveries`, and returns pre-loaded events from a queue.
     struct MockRepo {
         events: Mutex<VecDeque<RawEvent>>,
         ensured: Mutex<Vec<(Uuid, Vec<String>)>>,
-        invalids: Mutex<Vec<(Uuid, String, String)>>,
+        invalids: Mutex<Vec<(Uuid, Vec<(String, String)>)>>,
         cursor: Mutex<i64>,
+        /// If set, `ensure_deliveries` returns this error once then clears it.
+        ensure_error: Mutex<Option<crate::error::Error>>,
+        /// If set, `create_invalid_deliveries` returns this error once then clears it.
+        invalid_error: Mutex<Option<crate::error::Error>>,
     }
 
     impl MockRepo {
@@ -339,15 +362,46 @@ mod tests {
                 ensured: Mutex::new(vec![]),
                 invalids: Mutex::new(vec![]),
                 cursor: Mutex::new(initial_cursor),
+                ensure_error: Mutex::new(None),
+                invalid_error: Mutex::new(None),
             }
+        }
+
+        fn with_ensure_error(self, e: crate::error::Error) -> Self {
+            *self.ensure_error.lock().unwrap() = Some(e);
+            self
+        }
+
+        fn with_invalid_error(self, e: crate::error::Error) -> Self {
+            *self.invalid_error.lock().unwrap() = Some(e);
+            self
+        }
+
+        fn simulated_db_error() -> crate::error::Error {
+            crate::error::Error::InvalidData("simulated DB failure".into())
         }
 
         fn ensured_deliveries(&self) -> Vec<(Uuid, Vec<String>)> {
             self.ensured.lock().unwrap().clone()
         }
 
-        fn invalid_deliveries(&self) -> Vec<(Uuid, String, String)> {
+        fn invalid_deliveries(&self) -> Vec<(Uuid, Vec<(String, String)>)> {
             self.invalids.lock().unwrap().clone()
+        }
+
+        /// Flatten all (callback_name, reason) pairs recorded across all calls.
+        fn flat_invalids(&self) -> Vec<(Uuid, String, String)> {
+            self.invalids
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(eid, entries)| {
+                    entries
+                        .iter()
+                        .map(|(n, r)| (*eid, n.clone(), r.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
         }
     }
 
@@ -374,6 +428,9 @@ mod tests {
             event_id: Uuid,
             callbacks: &[CallbackTarget],
         ) -> crate::error::Result<()> {
+            if let Some(e) = self.ensure_error.lock().unwrap().take() {
+                return Err(e);
+            }
             let names = callbacks.iter().map(|c| c.name.clone()).collect();
             self.ensured.lock().unwrap().push((event_id, names));
             Ok(())
@@ -387,9 +444,25 @@ mod tests {
         ) -> crate::error::Result<()> {
             self.invalids.lock().unwrap().push((
                 event_id,
-                callback_name.to_string(),
-                reason.to_string(),
+                vec![(callback_name.to_string(), reason.to_string())],
             ));
+            Ok(())
+        }
+
+        async fn create_invalid_deliveries(
+            &self,
+            event_id: Uuid,
+            entries: &[(String, String)],
+        ) -> crate::error::Result<()> {
+            if let Some(e) = self.invalid_error.lock().unwrap().take() {
+                return Err(e);
+            }
+            if !entries.is_empty() {
+                self.invalids
+                    .lock()
+                    .unwrap()
+                    .push((event_id, entries.to_vec()));
+            }
             Ok(())
         }
 
@@ -592,7 +665,7 @@ mod tests {
         assert!(repo.ensured_deliveries().is_empty());
 
         // Both callbacks dead-lettered with the source_payload_too_large prefix.
-        let invalids = repo.invalid_deliveries();
+        let invalids = repo.flat_invalids();
         assert_eq!(invalids.len(), 2, "expected 2 dead-lettered callbacks");
         for (eid, _name, reason) in &invalids {
             assert_eq!(*eid, event_id);
@@ -634,7 +707,7 @@ mod tests {
 
         assert_eq!(new_cursor, 1);
         assert!(repo.ensured_deliveries().is_empty());
-        let invalids = repo.invalid_deliveries();
+        let invalids = repo.flat_invalids();
         assert_eq!(invalids.len(), 1);
         assert_eq!(invalids[0].0, event_id);
         assert_eq!(invalids[0].1, "bad");
@@ -672,7 +745,7 @@ mod tests {
         let ensured = repo.ensured_deliveries();
         assert_eq!(ensured.len(), 1);
         assert_eq!(ensured[0].1, vec!["good"]);
-        let invalids = repo.invalid_deliveries();
+        let invalids = repo.flat_invalids();
         assert_eq!(invalids.len(), 1);
         assert!(invalids[0].2.starts_with("invalid_callback:"));
     }
@@ -720,5 +793,124 @@ mod tests {
         let ensured = repo.ensured_deliveries();
         assert_eq!(ensured.len(), 1);
         assert_eq!(ensured[0].1, vec!["def"]);
+    }
+
+    // ── Finding 6: cursor does NOT advance past DB write failures ─────────────
+
+    #[tokio::test]
+    async fn db_error_on_ensure_deliveries_stops_cursor_advance() {
+        // Two events: id=1 (will fail DB write), id=2 (should never be reached).
+        let events = vec![
+            make_event(
+                1,
+                json!([{"name": "notify", "url": "https://a.example.com/"}]),
+                10,
+            ),
+            make_event(
+                2,
+                json!([{"name": "notify", "url": "https://b.example.com/"}]),
+                10,
+            ),
+        ];
+        let repo = MockRepo::new(events, 0).with_ensure_error(MockRepo::simulated_db_error());
+
+        let result = schedule_new_deliveries(&repo, &config(), 0).await;
+
+        // Must propagate the error.
+        assert!(result.is_err());
+        // The cursor must NOT have advanced (stays at 0).
+        // Nothing was recorded since ensure_deliveries failed before we could push.
+        assert!(repo.ensured_deliveries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn db_error_on_create_invalid_deliveries_stops_cursor_advance() {
+        let cfg = DispatchConfig::default(); // allow_unsigned_callbacks = false
+        let event = make_event(
+            1,
+            json!([{"name": "bad", "url": "https://a.example.com/"}]),
+            10,
+        );
+        let repo = MockRepo::new(vec![event], 0).with_invalid_error(MockRepo::simulated_db_error());
+
+        let result = schedule_new_deliveries(&repo, &cfg, 0).await;
+
+        // Must propagate the error.
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn db_error_on_oversized_payload_stops_cursor_advance() {
+        let event = make_event(
+            1,
+            json!([{"name": "a", "url": "https://a.example.com/"}]),
+            2_000_000,
+        );
+        let repo = MockRepo::new(vec![event], 0).with_invalid_error(MockRepo::simulated_db_error());
+
+        let result = schedule_new_deliveries(&repo, &config(), 0).await;
+
+        assert!(result.is_err());
+    }
+
+    // ── Finding 7: batch dead-lettering uses create_invalid_deliveries ────────
+
+    #[tokio::test]
+    async fn oversized_payload_uses_single_batch_call() {
+        let event = make_event(
+            1,
+            json!([
+                {"name": "a", "url": "https://a.example.com/"},
+                {"name": "b", "url": "https://b.example.com/"},
+                {"name": "c", "url": "https://c.example.com/"}
+            ]),
+            2_000_000,
+        );
+        let repo = MockRepo::new(vec![event], 0);
+        schedule_new_deliveries(&repo, &config(), 0).await.unwrap();
+
+        // All 3 callbacks should arrive in a single create_invalid_deliveries call.
+        let invalids = repo.invalid_deliveries();
+        assert_eq!(invalids.len(), 1, "expected exactly one batched call");
+        assert_eq!(invalids[0].1.len(), 3);
+    }
+
+    // ── Finding 8: too-many-callbacks dead-letters each entry ─────────────────
+
+    #[tokio::test]
+    async fn too_many_callbacks_dead_letters_all_entries() {
+        let cfg = DispatchConfig {
+            max_callbacks_per_event: 1,
+            allow_unsigned_callbacks: true,
+            allow_private_ip_targets: true,
+            ..Default::default()
+        };
+        let event = make_event(
+            1,
+            json!([
+                {"name": "first",  "url": "https://a.example.com/"},
+                {"name": "second", "url": "https://b.example.com/"}
+            ]),
+            10,
+        );
+        let event_id = event.event_id;
+        let repo = MockRepo::new(vec![event], 0);
+        let new_cursor = schedule_new_deliveries(&repo, &cfg, 0).await.unwrap();
+
+        assert_eq!(new_cursor, 1);
+        assert!(repo.ensured_deliveries().is_empty());
+
+        let invalids = repo.flat_invalids();
+        assert_eq!(invalids.len(), 2, "expected 2 dead-lettered callbacks");
+        for (eid, _, reason) in &invalids {
+            assert_eq!(*eid, event_id);
+            assert!(
+                reason.contains("too many callbacks"),
+                "expected too-many-callbacks reason, got: {reason}"
+            );
+        }
+        let mut names: Vec<_> = invalids.iter().map(|(_, n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["first", "second"]);
     }
 }

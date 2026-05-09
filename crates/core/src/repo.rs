@@ -30,6 +30,14 @@ pub trait Repo: Send + Sync {
         reason: &str,
     ) -> Result<()>;
 
+    /// Inserts dead-lettered delivery rows for multiple invalid callbacks in a single
+    /// round-trip. Each entry is `(callback_name, reason)`. No-ops if `entries` is empty.
+    async fn create_invalid_deliveries(
+        &self,
+        event_id: Uuid,
+        entries: &[(String, String)],
+    ) -> Result<()>;
+
     // ── Dispatch ───────────────────────────────────────────────────────────
 
     /// Returns due deliveries (available_at ≤ now, not locked, not dispatched).
@@ -219,6 +227,36 @@ impl Repo for PgRepo {
             event_id,
             callback_name,
             reason,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn create_invalid_deliveries(
+        &self,
+        event_id: Uuid,
+        entries: &[(String, String)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+        let reasons: Vec<String> = entries
+            .iter()
+            .map(|(_, r)| truncate_at_char_boundary(r, 4096).to_string())
+            .collect();
+        sqlx::query!(
+            r#"
+            INSERT INTO outbox_deliveries
+                (event_id, callback_name, completion_mode, dead_letter, last_error, available_at)
+            SELECT $1, name, 'managed', TRUE, reason, now()
+            FROM UNNEST($2::text[], $3::text[]) AS t(name, reason)
+            ON CONFLICT (event_id, callback_name) DO NOTHING
+            "#,
+            event_id,
+            &names as &[String],
+            &reasons as &[String],
         )
         .execute(&self.pool)
         .await?;

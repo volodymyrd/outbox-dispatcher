@@ -788,12 +788,12 @@ Removing dead branches makes the function's contract match the schema's invarian
 | 3 | Hardcoded `FETCH_LIMIT` | `crates/core/src/scheduler.rs:141` | Low | Config | DONE | Added `schedule_batch_size` to `DispatchConfig`/`DispatchSettings` with default 500 |
 | 4 | `max_callbacks_per_event` upper bound | `crates/core/src/config.rs:469` | Medium | Config | DONE | |
 | 5 | `KeyRing::load` result discarded | `crates/bin/src/main.rs:64` | Low | Idiom | DONE | |
-| 6 | Cursor advances past events whose DB writes fail (data loss) | `crates/core/src/scheduler.rs:147-228` | High | Correctness | TODO | |
-| 7 | N+1 inserts when dead-lettering invalid/oversized callbacks | `crates/core/src/scheduler.rs:170-228` | Medium | Performance | TODO | |
-| 8 | Array-level rejections (too-many-callbacks) skip event silently | `crates/core/src/scheduler.rs:194-202` | Medium | Correctness | TODO | |
-| 9 | Wake loop runs a full cycle per NOTIFY; no notification draining or `next_poll` reset | `crates/core/src/scheduler.rs:73-122` | Low | Performance | TODO | |
-| 10 | Wake-loop error branch has no backoff or rate-limit on sustained DB failure | `crates/core/src/scheduler.rs:111-121` | Low | Observability | TODO | |
-| 11 | `extract_callback_names` carries unreachable fallbacks for non-array / empty inputs | `crates/core/src/scheduler.rs:243-259` | Low | Idiom | TODO | |
+| 6 | Cursor advances past events whose DB writes fail (data loss) | `crates/core/src/scheduler.rs:147-228` | High | Correctness | DONE | Cursor only advances after all DB writes for an event succeed; DB errors propagate so the wake loop retries |
+| 7 | N+1 inserts when dead-lettering invalid/oversized callbacks | `crates/core/src/scheduler.rs:170-228` | Medium | Performance | DONE | Added `create_invalid_deliveries` (UNNEST batch) to `Repo` + `PgRepo`; both dead-letter paths now use one round-trip per event |
+| 8 | Array-level rejections (too-many-callbacks) skip event silently | `crates/core/src/scheduler.rs:194-202` | Medium | Correctness | DONE | Array-level rejections now dead-letter each named entry via `create_invalid_deliveries`; truly corrupt non-array JSONB is still silently skipped |
+| 9 | Wake loop runs a full cycle per NOTIFY; no notification draining or `next_poll` reset | `crates/core/src/scheduler.rs:73-122` | Low | Performance | DONE | Added `try_recv` drain after select; `next_poll` reset after every cycle |
+| 10 | Wake-loop error branch has no backoff or rate-limit on sustained DB failure | `crates/core/src/scheduler.rs:111-121` | Low | Observability | DONE | Added `consecutive_errors` counter + capped exponential backoff (100 ms × 2^n, capped at poll_interval) |
+| 11 | `extract_callback_names` carries unreachable fallbacks for non-array / empty inputs | `crates/core/src/scheduler.rs:243-259` | Low | Idiom | DONE | Replaced `<unknown>` fallback branches with `debug_assert!` + `into_iter().flatten()` |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
