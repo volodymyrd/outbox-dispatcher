@@ -17,12 +17,15 @@ pub use config::{
     AdminConfig, AppConfig, DatabaseConfig, DispatchConfig, HttpClientConfig, LogConfig, LogFormat,
     RetentionConfig, SigningKeyConfig,
 };
+pub use dispatch::{Callback, dispatch_due};
 pub use error::{Error, Result, ValidationErrors};
 pub use keyring::KeyRing;
 pub use repo::{PgRepo, Repo};
+pub use retry::compute_next_available_at;
 pub use scheduler::{ListenerStatus, run_scheduler, schedule_new_deliveries};
 pub use schema::{
     CallbackError, CallbackTarget, CompletionMode, DeadLetterRow, DeliveryRow, DueDelivery,
     EventForDelivery, EventWithDeliveries, ExternalPendingRow, PageParams, RawEvent,
     RawEventSerializable, SweepReport,
 };
+pub use timeout_sweep::sweep_hung_external;

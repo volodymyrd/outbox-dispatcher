@@ -10,6 +10,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+httpdate = { workspace = true }
 outbox-dispatcher-core = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -20,3 +21,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }

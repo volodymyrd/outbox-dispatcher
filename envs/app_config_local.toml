@@ -5,6 +5,7 @@
 max_connections = 5
 
 [dispatch]
+dispatch_concurrency = 5
 allow_insecure_urls = true
 allow_unsigned_callbacks = true
 

@@ -14,6 +14,10 @@ pub struct DispatchConfig {
     pub poll_interval: Duration,
     /// Maximum number of deliveries to fetch and dispatch concurrently per cycle.
     pub batch_size: i64,
+    /// Maximum number of concurrent in-flight HTTP calls per dispatch cycle.
+    /// Decouples HTTP parallelism from fetch granularity to avoid exhausting
+    /// the database connection pool when callbacks are slow.
+    pub dispatch_concurrency: usize,
     /// Maximum number of new events to fetch and schedule per scheduling cycle.
     pub schedule_batch_size: i64,
     /// Default maximum retry attempts for a callback before dead-lettering.
@@ -47,6 +51,7 @@ impl Default for DispatchConfig {
         Self {
             poll_interval: Duration::from_secs(5),
             batch_size: 50,
+            dispatch_concurrency: DEFAULT_DISPATCH_CONCURRENCY,
             schedule_batch_size: DEFAULT_SCHEDULE_BATCH_SIZE as i64,
             max_attempts: 6,
             backoff: vec![
@@ -126,6 +131,7 @@ pub struct LogConfig {
 
 const DEFAULT_MAX_CALLBACKS_PER_EVENT: u32 = 32;
 const DEFAULT_SCHEDULE_BATCH_SIZE: u32 = 500;
+const DEFAULT_DISPATCH_CONCURRENCY: usize = 16;
 
 fn default_max_callbacks_per_event() -> u32 {
     DEFAULT_MAX_CALLBACKS_PER_EVENT
@@ -133,6 +139,10 @@ fn default_max_callbacks_per_event() -> u32 {
 
 fn default_schedule_batch_size() -> u32 {
     DEFAULT_SCHEDULE_BATCH_SIZE
+}
+
+fn default_dispatch_concurrency() -> usize {
+    DEFAULT_DISPATCH_CONCURRENCY
 }
 
 // ── Dispatch settings (TOML-friendly) ────────────────────────────────────────
@@ -143,6 +153,10 @@ fn default_schedule_batch_size() -> u32 {
 pub struct DispatchSettings {
     pub poll_interval_secs: u64,
     pub batch_size: i64,
+    /// Maximum number of concurrent in-flight HTTP calls per dispatch cycle.
+    /// Defaults to 16; decouples HTTP parallelism from fetch granularity.
+    #[serde(default = "default_dispatch_concurrency")]
+    pub dispatch_concurrency: usize,
     /// Maximum number of new events to fetch per scheduling cycle.
     #[serde(default = "default_schedule_batch_size")]
     pub schedule_batch_size: u32,
@@ -176,6 +190,7 @@ impl From<DispatchSettings> for DispatchConfig {
         Self {
             poll_interval: Duration::from_secs(s.poll_interval_secs),
             batch_size: s.batch_size,
+            dispatch_concurrency: s.dispatch_concurrency,
             schedule_batch_size: s.schedule_batch_size as i64,
             max_attempts: s.max_attempts,
             backoff: s
@@ -489,6 +504,19 @@ impl AppConfig {
                 "dispatch.max_callbacks_per_event must be <= {MAX_CALLBACKS_PER_EVENT_LIMIT}"
             ));
         }
+        if self.dispatch.dispatch_concurrency == 0 {
+            errors.push("dispatch.dispatch_concurrency must be > 0".to_string());
+        }
+        if self.database.max_connections > 0
+            && self.dispatch.dispatch_concurrency as u32 > self.database.max_connections
+        {
+            errors.push(format!(
+                "dispatch.dispatch_concurrency ({}) must be <= database.max_connections ({}); \
+                 a slow callback can otherwise hold the last connection while concurrent \
+                 dispatchers stall on lock_delivery",
+                self.dispatch.dispatch_concurrency, self.database.max_connections
+            ));
+        }
         if self.log.filter.trim().is_empty() {
             errors.push("log.filter must not be empty".to_string());
         }
@@ -575,6 +603,7 @@ acquire_timeout_secs = 10
 [dispatch]
 poll_interval_secs = 5
 batch_size = 50
+dispatch_concurrency = 10
 schedule_batch_size = 500
 max_attempts = 6
 backoff_secs = [30, 120, 600, 3600, 21600, 86400]
@@ -1350,6 +1379,35 @@ filter = "info"
         cfg.dispatch.lock_buffer_secs = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.0.iter().any(|e| e.contains("lock_buffer_secs")));
+    }
+
+    #[test]
+    fn test_validate_dispatch_concurrency_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.dispatch_concurrency = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("dispatch_concurrency must be > 0"))
+        );
+    }
+
+    #[test]
+    fn test_validate_dispatch_concurrency_exceeds_max_connections() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.max_connections = 5;
+        cfg.dispatch.dispatch_concurrency = 6;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("dispatch_concurrency")));
+    }
+
+    #[test]
+    fn test_validate_dispatch_concurrency_at_max_connections() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.max_connections = 10;
+        cfg.dispatch.dispatch_concurrency = 10;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

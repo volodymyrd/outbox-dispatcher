@@ -184,6 +184,16 @@ impl KeyRing {
     pub fn contains(&self, id: &str) -> bool {
         self.keys.contains_key(id)
     }
+
+    /// Build a keyring with a single pre-decoded key.
+    ///
+    /// Bypasses environment variable lookup and base64 decoding.
+    /// Intended for use in integration tests and test helpers.
+    pub fn with_key(key_id: &str, secret: &[u8]) -> Self {
+        let mut keys = HashMap::new();
+        keys.insert(key_id.to_string(), Zeroizing::new(secret.to_vec()));
+        Self { keys }
+    }
 }
 
 #[cfg(test)]
