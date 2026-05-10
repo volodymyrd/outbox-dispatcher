@@ -46,7 +46,14 @@ enum MigrationsAction {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e:?}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     // Parse CLI first so `--help` and `--version` work without a valid config.
     let cli = Cli::parse();
 
@@ -59,7 +66,8 @@ async fn main() -> Result<()> {
         for e in &errors.0 {
             eprintln!("config error: {e}");
         }
-        anyhow::bail!("invalid configuration ({} error(s))", errors.0.len());
+        eprintln!("invalid configuration ({} error(s))", errors.0.len());
+        std::process::exit(1);
     }
 
     // Fail fast if any configured signing key cannot be resolved from its env var.
@@ -69,7 +77,8 @@ async fn main() -> Result<()> {
             for e in &errors.0 {
                 eprintln!("signing key error: {e}");
             }
-            anyhow::bail!("invalid signing keys ({} error(s))", errors.0.len());
+            eprintln!("invalid signing keys ({} error(s))", errors.0.len());
+            std::process::exit(1);
         }
     };
 
