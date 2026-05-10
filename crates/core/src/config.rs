@@ -14,6 +14,10 @@ pub struct DispatchConfig {
     pub poll_interval: Duration,
     /// Maximum number of deliveries to fetch and dispatch concurrently per cycle.
     pub batch_size: i64,
+    /// Maximum number of concurrent in-flight HTTP calls per dispatch cycle.
+    /// Decouples HTTP parallelism from fetch granularity to avoid exhausting
+    /// the database connection pool when callbacks are slow.
+    pub dispatch_concurrency: usize,
     /// Maximum number of new events to fetch and schedule per scheduling cycle.
     pub schedule_batch_size: i64,
     /// Default maximum retry attempts for a callback before dead-lettering.
@@ -47,6 +51,7 @@ impl Default for DispatchConfig {
         Self {
             poll_interval: Duration::from_secs(5),
             batch_size: 50,
+            dispatch_concurrency: DEFAULT_DISPATCH_CONCURRENCY,
             schedule_batch_size: DEFAULT_SCHEDULE_BATCH_SIZE as i64,
             max_attempts: 6,
             backoff: vec![
@@ -126,6 +131,7 @@ pub struct LogConfig {
 
 const DEFAULT_MAX_CALLBACKS_PER_EVENT: u32 = 32;
 const DEFAULT_SCHEDULE_BATCH_SIZE: u32 = 500;
+const DEFAULT_DISPATCH_CONCURRENCY: usize = 16;
 
 fn default_max_callbacks_per_event() -> u32 {
     DEFAULT_MAX_CALLBACKS_PER_EVENT
@@ -133,6 +139,10 @@ fn default_max_callbacks_per_event() -> u32 {
 
 fn default_schedule_batch_size() -> u32 {
     DEFAULT_SCHEDULE_BATCH_SIZE
+}
+
+fn default_dispatch_concurrency() -> usize {
+    DEFAULT_DISPATCH_CONCURRENCY
 }
 
 // ── Dispatch settings (TOML-friendly) ────────────────────────────────────────
@@ -143,6 +153,10 @@ fn default_schedule_batch_size() -> u32 {
 pub struct DispatchSettings {
     pub poll_interval_secs: u64,
     pub batch_size: i64,
+    /// Maximum number of concurrent in-flight HTTP calls per dispatch cycle.
+    /// Defaults to 16; decouples HTTP parallelism from fetch granularity.
+    #[serde(default = "default_dispatch_concurrency")]
+    pub dispatch_concurrency: usize,
     /// Maximum number of new events to fetch per scheduling cycle.
     #[serde(default = "default_schedule_batch_size")]
     pub schedule_batch_size: u32,
@@ -176,6 +190,7 @@ impl From<DispatchSettings> for DispatchConfig {
         Self {
             poll_interval: Duration::from_secs(s.poll_interval_secs),
             batch_size: s.batch_size,
+            dispatch_concurrency: s.dispatch_concurrency,
             schedule_batch_size: s.schedule_batch_size as i64,
             max_attempts: s.max_attempts,
             backoff: s

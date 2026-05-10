@@ -31,18 +31,12 @@ pub async fn sweep_hung_external(repo: &dyn Repo, config: &DispatchConfig) -> Re
             "external timeout sweep reset deliveries for redelivery"
         );
     }
-
     if report.exhausted > 0 {
         warn!(
             exhausted = report.exhausted,
             "external timeout sweep dead-lettered rows after max_completion_cycles"
         );
     }
-
-    if report.reset == 0 && report.exhausted == 0 {
-        return Ok(());
-    }
-
     Ok(())
 }
 

@@ -623,15 +623,15 @@ Comments that misdescribe behaviour rot fastest and confuse future maintainers r
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 1 | `HttpCallback::new` returns `anyhow` from a library crate | `crates/http-callback/src/client.rs:54` | High | Idiom | TODO | |
-| 2 | Dead-code `keyring_with` test helper trips `-D warnings` | `crates/http-callback/src/client.rs:262-280` | Medium | Testing | TODO | |
-| 3 | Redundant `Arc::clone` in `HttpCallback::new` | `crates/http-callback/src/client.rs:69` | Low | Idiom | TODO | |
-| 4 | No HTTP-level test of `Callback::deliver` | `crates/http-callback/src/client.rs:282-314` | High | Testing | TODO | |
-| 5 | `extract_retry_after` ignores HTTP-date form | `crates/http-callback/src/client.rs:201-209` | Low | Correctness | TODO | |
-| 6 | Dead `if … Ok(())` branch in `sweep_hung_external` | `crates/core/src/timeout_sweep.rs:42-46` | Low | Idiom | TODO | |
-| 7 | `dispatch_due` has no concurrency cap; can starve pg pool | `crates/core/src/dispatch.rs:61-67` | Medium | Concurrency | TODO | |
-| 8 | Non-dead transient failures logged silently | `crates/core/src/dispatch.rs:155-185` | Low | Idiom | TODO | |
-| 9 | Scheduler `consecutive_errors` comment is now misleading | `crates/core/src/scheduler.rs:83-85` | Low | Idiom | TODO | |
+| 1 | `HttpCallback::new` returns `anyhow` from a library crate | `crates/http-callback/src/client.rs:54` | High | Idiom | DONE | |
+| 2 | Dead-code `keyring_with` test helper trips `-D warnings` | `crates/http-callback/src/client.rs:262-280` | Medium | Testing | DONE | |
+| 3 | Redundant `Arc::clone` in `HttpCallback::new` | `crates/http-callback/src/client.rs:69` | Low | Idiom | DONE | |
+| 4 | No HTTP-level test of `Callback::deliver` | `crates/http-callback/src/client.rs:282-314` | High | Testing | DONE | |
+| 5 | `extract_retry_after` ignores HTTP-date form | `crates/http-callback/src/client.rs:201-209` | Low | Correctness | DONE | |
+| 6 | Dead `if … Ok(())` branch in `sweep_hung_external` | `crates/core/src/timeout_sweep.rs:42-46` | Low | Idiom | DONE | |
+| 7 | `dispatch_due` has no concurrency cap; can starve pg pool | `crates/core/src/dispatch.rs:61-67` | Medium | Concurrency | DONE | |
+| 8 | Non-dead transient failures logged silently | `crates/core/src/dispatch.rs:155-185` | Low | Idiom | DONE | |
+| 9 | Scheduler `consecutive_errors` comment is now misleading | `crates/core/src/scheduler.rs:83-85` | Low | Idiom | DONE | |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

@@ -80,8 +80,10 @@ pub async fn run_scheduler(
     let mut next_poll = Instant::now() + poll_interval;
     let mut last_sweep = Instant::now();
 
-    // Tracks consecutive scheduling/dispatch failures so we can apply a capped backoff
+    // Tracks consecutive **scheduling** failures so we can apply a capped backoff
     // and avoid log-spamming at full speed during a sustained DB outage.
+    // Dispatch / sweep errors are logged but do not contribute to the backoff because
+    // dispatch_one already swallows per-row failures and the sweeper is rate-limited.
     let mut consecutive_errors: u32 = 0;
 
     loop {

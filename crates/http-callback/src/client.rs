@@ -38,6 +38,7 @@ use outbox_dispatcher_core::{
 use reqwest::{Client, ClientBuilder};
 use tracing::{debug, warn};
 
+use crate::error::HttpCallbackError;
 use crate::signing::sign;
 
 /// HTTP webhook client that implements the `Callback` trait.
@@ -51,7 +52,7 @@ pub struct HttpCallback {
 
 impl HttpCallback {
     /// Build an `HttpCallback` from the HTTP client config and the loaded keyring.
-    pub fn new(cfg: &HttpClientConfig, keyring: Arc<KeyRing>) -> anyhow::Result<Self> {
+    pub fn new(cfg: &HttpClientConfig, keyring: Arc<KeyRing>) -> Result<Self, HttpCallbackError> {
         let mut builder = ClientBuilder::new()
             .user_agent(&cfg.user_agent)
             .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
@@ -61,13 +62,8 @@ impl HttpCallback {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
-        let client = builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("failed to build reqwest client: {e}"))?;
-        Ok(Self {
-            client,
-            keyring: keyring.clone(),
-        })
+        let client = builder.build()?;
+        Ok(Self { client, keyring })
     }
 }
 
@@ -196,16 +192,20 @@ fn build_body(event: &EventForDelivery) -> serde_json::Value {
 
 /// Parse a `Retry-After` header value into a `Duration`.
 ///
-/// Supports both integer seconds (most common) and the HTTP date form.
+/// Supports both integer seconds (most common) and the HTTP-date form
+/// (RFC 7231 §7.1.3, e.g. `Wed, 21 Oct 2026 07:28:00 GMT`).
+/// Negative deltas (date already in the past) collapse to zero.
 /// Returns `None` if the header is absent or unparseable.
 fn extract_retry_after(response: &reqwest::Response) -> Option<Duration> {
     let value = response.headers().get("Retry-After")?.to_str().ok()?;
-    // Try integer seconds first.
-    if let Ok(secs) = value.trim().parse::<u64>() {
+    let trimmed = value.trim();
+    // Try integer seconds first (most common form).
+    if let Ok(secs) = trimmed.parse::<u64>() {
         return Some(Duration::from_secs(secs));
     }
-    // HTTP date parsing is not implemented here; return None for date form.
-    None
+    // RFC 7231 §7.1.3 HTTP-date form. Negative deltas collapse to zero.
+    let target = httpdate::parse_http_date(trimmed).ok()?;
+    target.duration_since(SystemTime::now()).ok()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ fn extract_retry_after(response: &reqwest::Response) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use outbox_dispatcher_core::{CompletionMode, KeyRing, SigningKeyConfig};
+    use outbox_dispatcher_core::{CompletionMode, KeyRing};
     use serde_json::json;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -259,26 +259,6 @@ mod tests {
         Arc::new(KeyRing::load(&HashMap::new()).unwrap())
     }
 
-    fn keyring_with(key_id: &str, secret_env: &str, secret_val: &str) -> Arc<KeyRing> {
-        // Set env var, build keyring, unset env var.
-        let env_key = secret_env.to_string();
-        unsafe {
-            std::env::set_var(&env_key, secret_val);
-        }
-        let mut keys = HashMap::new();
-        keys.insert(
-            key_id.to_string(),
-            SigningKeyConfig {
-                secret_env: secret_env.to_string(),
-            },
-        );
-        let kr = KeyRing::load(&keys).unwrap();
-        unsafe {
-            std::env::remove_var(&env_key);
-        }
-        Arc::new(kr)
-    }
-
     #[test]
     fn build_body_includes_required_fields() {
         let (event, _) = make_event(42, None);
@@ -311,5 +291,207 @@ mod tests {
             parsed.map(Duration::from_secs),
             Some(Duration::from_secs(120))
         );
+    }
+
+    // ── Helper for wiremock tests: build a KeyRing with one key loaded from env ──
+
+    fn keyring_with(key_id: &str, secret_env: &str, secret_val: &str) -> Arc<KeyRing> {
+        use outbox_dispatcher_core::SigningKeyConfig;
+        let env_key = secret_env.to_string();
+        // SAFETY: test-only, single-threaded setup before the async runtime starts.
+        unsafe {
+            std::env::set_var(&env_key, secret_val);
+        }
+        let mut keys = HashMap::new();
+        keys.insert(
+            key_id.to_string(),
+            SigningKeyConfig {
+                secret_env: secret_env.to_string(),
+            },
+        );
+        let kr = KeyRing::load(&keys).unwrap();
+        unsafe {
+            std::env::remove_var(&env_key);
+        }
+        Arc::new(kr)
+    }
+
+    // ── HTTP-level tests using wiremock ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn deliver_2xx_returns_ok() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let cfg = outbox_dispatcher_core::HttpClientConfig::default();
+        let cb = HttpCallback::new(&cfg, empty_keyring()).unwrap();
+        let (event, mut target) = make_event(1, None);
+        target.url = format!("{}/hook", server.uri());
+
+        cb.deliver(&target, &event)
+            .await
+            .expect("expected Ok on 2xx");
+    }
+
+    #[tokio::test]
+    async fn deliver_sends_required_headers() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header_exists("X-Outbox-Event-Id"))
+            .and(header_exists("X-Outbox-Delivery-Id"))
+            .and(header_exists("X-Outbox-Callback-Name"))
+            .and(header_exists("X-Outbox-Kind"))
+            .and(header_exists("X-Outbox-Mode"))
+            .and(header_exists("X-Outbox-Attempt"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = outbox_dispatcher_core::HttpClientConfig::default();
+        let cb = HttpCallback::new(&cfg, empty_keyring()).unwrap();
+        let (event, mut target) = make_event(2, None);
+        target.url = format!("{}/hook", server.uri());
+
+        cb.deliver(&target, &event).await.expect("expected Ok");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_sends_hmac_signature_header_when_key_present() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header_exists("X-Outbox-Signing-Key-Id"))
+            .and(header_exists("X-Outbox-Signature"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // 32-byte base64 secret (exactly 32 raw bytes = 44 base64 chars with padding)
+        let kr = keyring_with(
+            "k1",
+            "TEST_HMAC_SECRET_DELIVER",
+            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUI=",
+        );
+        let cfg = outbox_dispatcher_core::HttpClientConfig::default();
+        let cb = HttpCallback::new(&cfg, kr).unwrap();
+        let (event, mut target) = make_event(3, Some("k1"));
+        target.url = format!("{}/hook", server.uri());
+
+        cb.deliver(&target, &event).await.expect("expected Ok");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_non_2xx_returns_transient_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let cfg = outbox_dispatcher_core::HttpClientConfig::default();
+        let cb = HttpCallback::new(&cfg, empty_keyring()).unwrap();
+        let (event, mut target) = make_event(4, None);
+        target.url = format!("{}/hook", server.uri());
+
+        let err = cb.deliver(&target, &event).await.unwrap_err();
+        assert!(
+            matches!(err, CallbackError::Transient { .. }),
+            "503 must produce Transient"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_returns_transient_with_retry_after_on_429() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(429).append_header("Retry-After", "60"))
+            .mount(&server)
+            .await;
+
+        let cfg = outbox_dispatcher_core::HttpClientConfig::default();
+        let cb = HttpCallback::new(&cfg, empty_keyring()).unwrap();
+        let (event, mut target) = make_event(5, None);
+        target.url = format!("{}/hook", server.uri());
+
+        let err = cb.deliver(&target, &event).await.unwrap_err();
+        match err {
+            CallbackError::Transient { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(60)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_returns_transient_on_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Respond with a redirect — reqwest is configured with Policy::none() so it
+        // treats this as a non-2xx and returns a Transient error (§6.3).
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .append_header("Location", "https://other.example.com/hook"),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = outbox_dispatcher_core::HttpClientConfig::default();
+        let cb = HttpCallback::new(&cfg, empty_keyring()).unwrap();
+        let (event, mut target) = make_event(6, None);
+        target.url = format!("{}/hook", server.uri());
+
+        let err = cb.deliver(&target, &event).await.unwrap_err();
+        assert!(
+            matches!(err, CallbackError::Transient { .. }),
+            "redirect must produce Transient (§6.3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_unknown_signing_key_returns_transient_without_http_call() {
+        // An unknown key_id should fail before any network call is made.
+        let cfg = outbox_dispatcher_core::HttpClientConfig::default();
+        let cb = HttpCallback::new(&cfg, empty_keyring()).unwrap();
+        let (event, mut target) = make_event(7, Some("nonexistent-key"));
+        target.url = "http://127.0.0.1:1".to_string(); // unreachable port
+
+        let err = cb.deliver(&target, &event).await.unwrap_err();
+        match err {
+            CallbackError::Transient { reason, .. } => {
+                assert!(
+                    reason.contains("nonexistent-key"),
+                    "reason should mention the key id"
+                );
+            }
+        }
     }
 }

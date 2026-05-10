@@ -11,12 +11,15 @@
 //! 4. **Write back the result** — success (managed or external mode) or transient
 //!    failure (bump attempts, apply backoff, dead-letter when exhausted).
 //!
-//! All calls in a batch are driven concurrently via `futures::future::join_all`.
+//! Concurrency is bounded by `DispatchConfig::dispatch_concurrency` via
+//! `buffer_unordered`, decoupling HTTP parallelism from fetch granularity and
+//! protecting the database connection pool from exhaustion under slow callbacks.
 //! There is no permanent-failure branch — `CallbackError` only has `Transient`,
 //! and dead-lettering is purely a function of `attempts ≥ max_attempts`.
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::StreamExt;
 use tracing::{debug, error, warn};
 
 use crate::config::DispatchConfig;
@@ -58,12 +61,13 @@ pub async fn dispatch_due(
 
     debug!(count = due.len(), "dispatching due deliveries");
 
-    let futures: Vec<_> = due
-        .into_iter()
-        .map(|d| dispatch_one(repo, callback, config, d))
-        .collect();
+    let mut tasks = futures::stream::iter(
+        due.into_iter()
+            .map(|d| dispatch_one(repo, callback, config, d)),
+    )
+    .buffer_unordered(config.dispatch_concurrency.max(1));
 
-    futures::future::join_all(futures).await;
+    while tasks.next().await.is_some() {}
     Ok(())
 }
 
@@ -169,6 +173,13 @@ async fn dispatch_one(
                     max_attempts = due.target.max_attempts,
                     reason = %reason,
                     "delivery exhausted retries — dead-lettering"
+                );
+            } else {
+                debug!(
+                    delivery_id = due.delivery_id,
+                    attempts = next_attempt,
+                    reason = %reason,
+                    "delivery transient failure; will retry"
                 );
             }
 

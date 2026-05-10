@@ -24,6 +24,7 @@ config = { version = "0.15", features = ["toml"] }
 futures = "0.3"
 hex = "0.4"
 hmac = "0.13"
+httpdate = "1"
 outbox-dispatcher-admin-api = { path = "crates/admin-api" }
 outbox-dispatcher-core = { path = "crates/core" }
 outbox-dispatcher-http-callback = { path = "crates/http-callback" }
@@ -45,4 +46,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
+wiremock = "0.6"
 zeroize = "1"
