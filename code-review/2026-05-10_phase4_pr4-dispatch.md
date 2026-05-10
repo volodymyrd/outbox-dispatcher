@@ -619,19 +619,562 @@ Comments that misdescribe behaviour rot fastest and confuse future maintainers r
 
 ---
 
+## Second-Pass Findings (post-rework on commit 580b7f7)
+
+All nine findings above were verified addressed by reading the current code. The
+second pass uncovered the following additional issues, scoped to changes
+introduced in PR #4.
+
+---
+
+### Finding 10 — `dispatch_concurrency` is not validated in `AppConfig::validate`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/config.rs:412-558` (validate block) / `crates/core/src/dispatch.rs:68` |
+| **Severity** | Medium |
+| **Category** | Config |
+
+**Problem**
+
+The Finding 7 fix added a `dispatch_concurrency: usize` field to `DispatchSettings` /
+`DispatchConfig` and applied `config.dispatch_concurrency.max(1)` in `dispatch_due`
+to defend against zero. The recommended fix explicitly asked for *both* a `.max(1)` guard
+*and* an `AppConfig::validate()` rule, but only the runtime guard landed. As a result:
+
+1. An operator who sets `dispatch_concurrency = 0` in TOML gets silent coercion to 1
+   at runtime rather than a startup-time error — directly contradicting the project's
+   "fail fast at startup" convention used for every other dispatch field (look at
+   `batch_size`, `schedule_batch_size`, `max_attempts`, etc., all of which reject 0).
+2. There is also no upper-bound / relational check (`dispatch_concurrency <= batch_size`,
+   `dispatch_concurrency <= database.max_connections`), which is the *exact* failure mode
+   Finding 7 was about. A misconfigured `dispatch_concurrency` larger than
+   `database.max_connections` re-introduces the pool-starvation cascade that Finding 7
+   set out to prevent.
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/core/src/dispatch.rs lines 63-71
+let mut tasks = futures::stream::iter(
+    due.into_iter()
+        .map(|d| dispatch_one(repo, callback, config, d)),
+)
+.buffer_unordered(config.dispatch_concurrency.max(1));
+
+while tasks.next().await.is_some() {}
+Ok(())
+```
+
+```rust
+// crates/core/src/config.rs validate() — currently no check for dispatch_concurrency
+// (search the validate() body and you will find no occurrence of "dispatch_concurrency").
+```
+
+**Recommended fix**
+
+Add to `AppConfig::validate`:
+
+```rust
+if self.dispatch.dispatch_concurrency == 0 {
+    errors.push("dispatch.dispatch_concurrency must be > 0".to_string());
+}
+if (self.dispatch.dispatch_concurrency as u32) > self.database.max_connections {
+    errors.push(format!(
+        "dispatch.dispatch_concurrency ({}) must be <= database.max_connections ({}); \
+         a slow callback can otherwise hold the last connection while concurrent \
+         dispatchers stall on lock_delivery",
+        self.dispatch.dispatch_concurrency, self.database.max_connections
+    ));
+}
+```
+
+Drop the `.max(1)` at `dispatch.rs:68` once the validate check is in place — defensive
+coercion at runtime hides config bugs operators should see at startup.
+
+**Why this fix**
+
+Finding 7 was a *concurrency / pool-starvation* finding, not a *missing field*
+finding. The field alone, without a relational check against `max_connections`,
+does not fix the failure mode it was raised against.
+
+---
+
+### Finding 11 — `dispatch_concurrency` is missing from `envs/app_config.toml`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `envs/app_config.toml` (the `[dispatch]` section) |
+| **Severity** | Low |
+| **Category** | Config |
+
+**Problem**
+
+`envs/app_config.toml` is the canonical "every tunable knob lives here" file
+(`poll_interval_secs`, `batch_size`, `schedule_batch_size`, `max_attempts`,
+`backoff_secs`, `handler_timeout_secs`, `lock_buffer_secs`,
+`external_timeout_sweep_interval_secs`, `max_completion_cycles`,
+`payload_size_limit_bytes`, `notify_channel`, …, all explicitly listed). The new
+`dispatch_concurrency` field is the *only* dispatch field missing from this file,
+even though it now has a serde `#[serde(default = "default_dispatch_concurrency")]`
+covering its absence.
+
+The functional impact is zero (default = 16). The operator-experience impact is
+real: someone tuning throughput from this file would not know the knob exists.
+
+**Context** (surrounding code as it exists today)
+
+```toml
+# envs/app_config.toml — current [dispatch] section
+[dispatch]
+poll_interval_secs = 5
+batch_size = 50
+schedule_batch_size = 500
+max_attempts = 6
+# ... no dispatch_concurrency line
+```
+
+**Recommended fix**
+
+Add a line in the `[dispatch]` block of `envs/app_config.toml`:
+
+```toml
+[dispatch]
+poll_interval_secs = 5
+batch_size = 50
+# Maximum concurrent in-flight HTTP calls per dispatch cycle. Should be
+# <= database.max_connections to avoid pool starvation under slow callbacks.
+dispatch_concurrency = 16
+schedule_batch_size = 500
+# ...
+```
+
+**Why this fix**
+
+Documents the new tunable so operators can find it; matches the precedent set by
+every other dispatch field. Pure documentation change — no code impact.
+
+---
+
+### Finding 12 — `HttpCallback` reqwest client has no full-request timeout
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/http-callback/src/client.rs:55-67` |
+| **Severity** | Low |
+| **Category** | Correctness |
+
+**Problem**
+
+The reqwest `ClientBuilder` is configured only with `.connect_timeout(...)`. There is
+no `.timeout(...)` (full request) or `.read_timeout(...)` on the client itself.
+A receiver that completes the TCP handshake quickly but then drips response bytes
+extremely slowly (or stalls mid-body) is bounded *only* by the outer
+`tokio::time::timeout(due.target.timeout, …)` in `dispatch.rs:133`.
+
+That outer timeout works — it drops the future, which causes reqwest to cancel
+the in-flight request — but two minor concerns remain:
+
+1. **Defense-in-depth**: a callback bug that swallows or extends the outer
+   timeout (e.g. a future wrapper that ignores cancellation) leaves no timeout
+   inside reqwest. Today there is no such bug, but the layered defence is
+   essentially free.
+2. **Connection lifetime under cancellation**: when reqwest's body-stream future
+   is dropped, the underlying TCP connection is closed (it cannot be returned
+   to the pool mid-body). Setting `.timeout(due.target.timeout + lock_buffer)`
+   on the request via `.timeout(...)` on the request builder would let reqwest
+   itself observe the boundary and abort cleanly.
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/http-callback/src/client.rs lines 55-67
+pub fn new(cfg: &HttpClientConfig, keyring: Arc<KeyRing>) -> Result<Self, HttpCallbackError> {
+    let mut builder = ClientBuilder::new()
+        .user_agent(&cfg.user_agent)
+        .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none()); // §6.3: redirects are failures
+
+    if cfg.allow_insecure_tls {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    let client = builder.build()?;
+    Ok(Self { client, keyring })
+}
+```
+
+**Recommended fix**
+
+Apply `.timeout(...)` on the per-request builder in `deliver`, using
+`due.target.timeout`. This is preferable to setting it on the client because
+each `CallbackTarget` has its own timeout:
+
+```rust
+// crates/http-callback/src/client.rs deliver() — request-build section
+let mut req = self
+    .client
+    .post(&target.url)
+    .timeout(target.timeout)  // <— new: full-request timeout matches per-callback config
+    .header("Content-Type", "application/json")
+    // ... rest unchanged
+```
+
+**Why this fix**
+
+Layered timeouts are the standard pattern: connect, full request, and outer
+tokio timeout. Today only connect + outer tokio are present; the middle layer
+is essentially free defence and removes the need to rely on Tokio's cancellation
+propagating cleanly into reqwest.
+
+---
+
+### Finding 13 — `extract_retry_after` doc claims "negative deltas collapse to zero" but code returns `None`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/http-callback/src/client.rs:193-209` |
+| **Severity** | Low |
+| **Category** | Idiom |
+
+**Problem**
+
+The doc-comment on `extract_retry_after` (after the Finding 5 fix) says:
+
+> Negative deltas (date already in the past) collapse to zero.
+
+But the implementation is `target.duration_since(SystemTime::now()).ok()`, which
+returns `Err` when `target < now` and is then `.ok()` → `None`. Behaviour-wise
+this is fine (in `compute_next_available_at`, `Some(Duration::ZERO)` and `None`
+both end up using the schedule base since `after.max(base) == base`), but the
+doc and code disagree.
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/http-callback/src/client.rs lines 193-209
+/// Parse a `Retry-After` header value into a `Duration`.
+///
+/// Supports both integer seconds (most common) and the HTTP-date form
+/// (RFC 7231 §7.1.3, e.g. `Wed, 21 Oct 2026 07:28:00 GMT`).
+/// Negative deltas (date already in the past) collapse to zero.
+/// Returns `None` if the header is absent or unparseable.
+fn extract_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response.headers().get("Retry-After")?.to_str().ok()?;
+    let trimmed = value.trim();
+    // Try integer seconds first (most common form).
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // RFC 7231 §7.1.3 HTTP-date form. Negative deltas collapse to zero.
+    let target = httpdate::parse_http_date(trimmed).ok()?;
+    target.duration_since(SystemTime::now()).ok()
+}
+```
+
+**Recommended fix**
+
+Either match the doc by clamping to zero:
+
+```rust
+let target = httpdate::parse_http_date(trimmed).ok()?;
+Some(
+    target
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO),
+)
+```
+
+…or correct the doc-comment to match the current behaviour:
+
+```rust
+/// Past HTTP-date values are returned as `None` (treated as "no floor"), which
+/// is behaviourally equivalent to a zero floor under `compute_next_available_at`.
+```
+
+The first option is preferable because it makes the function self-consistent: a
+parseable `Retry-After` header always yields `Some(_)`; only an *unparseable*
+or *absent* header yields `None`. Tests would then be easier to write
+(`assert_eq!(extract_retry_after(...), Some(Duration::ZERO))` for a past date).
+
+**Why this fix**
+
+Doc-comments that misdescribe behaviour are the cheapest comment failure mode to
+fix and the most expensive one to leave in: future maintainers reasoning about
+Retry-After semantics will trust the comment.
+
+---
+
+### Finding 14 — `extract_retry_after` HTTP-date branch has no unit test
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/http-callback/src/client.rs:281-294` (test module) |
+| **Severity** | Low |
+| **Category** | Testing |
+
+**Problem**
+
+The Finding 5 fix added `httpdate::parse_http_date` for RFC 7231 §7.1.3 dates.
+The unit test `extract_retry_after_parses_integer_seconds` only exercises the
+integer-seconds path; there is no test that:
+
+- A valid future HTTP-date returns a `Some(Duration)`.
+- A past HTTP-date returns `None` (or `Some(ZERO)` depending on the resolution of Finding 13).
+- A malformed string returns `None`.
+
+The HTTP-level test `deliver_returns_transient_with_retry_after_on_429` uses
+`"Retry-After: 60"` — also the integer path. So the new `httpdate` dependency
+has zero code coverage.
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/http-callback/src/client.rs lines 281-294 (test for the integer path only)
+#[test]
+fn extract_retry_after_parses_integer_seconds() {
+    let secs_str = "120";
+    let parsed: Option<u64> = secs_str.trim().parse().ok();
+    assert_eq!(parsed, Some(120u64));
+    assert_eq!(
+        parsed.map(Duration::from_secs),
+        Some(Duration::from_secs(120))
+    );
+}
+```
+
+Note: this test does not actually invoke `extract_retry_after` — it
+re-implements the parse inline. The function as written can only be exercised
+via the public `deliver` path (it takes a `&reqwest::Response`), so a more useful
+test factors the parsing into a helper accepting `&str`.
+
+**Recommended fix**
+
+Refactor `extract_retry_after` to delegate to a thin `parse_retry_after(&str) -> Option<Duration>`
+helper that does not depend on `reqwest::Response`, then test the helper directly:
+
+```rust
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let target = httpdate::parse_http_date(trimmed).ok()?;
+    target.duration_since(SystemTime::now()).ok()
+}
+
+fn extract_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    parse_retry_after(response.headers().get("Retry-After")?.to_str().ok()?)
+}
+
+#[test]
+fn parse_retry_after_integer_seconds() {
+    assert_eq!(parse_retry_after("60"), Some(Duration::from_secs(60)));
+}
+
+#[test]
+fn parse_retry_after_future_http_date_returns_some() {
+    // Build an HTTP-date ~10 minutes in the future
+    let future = SystemTime::now() + Duration::from_secs(600);
+    let header = httpdate::fmt_http_date(future);
+    let d = parse_retry_after(&header).expect("future date must parse");
+    assert!(d > Duration::from_secs(500) && d < Duration::from_secs(700));
+}
+
+#[test]
+fn parse_retry_after_garbage_returns_none() {
+    assert_eq!(parse_retry_after("not-a-date"), None);
+}
+```
+
+**Why this fix**
+
+CLAUDE.md sets a >90 % per-module coverage target. The HTTP-date branch is
+new code with no test; `httpdate` is a new dependency with zero exercise.
+
+---
+
+### Finding 15 — `keyring_with` test helper leaks env-var state via `unsafe { set_var }`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/http-callback/src/client.rs:298-317` |
+| **Severity** | Low |
+| **Category** | Testing |
+
+**Problem**
+
+`keyring_with` uses `unsafe { std::env::set_var(...) }` and
+`unsafe { std::env::remove_var(...) }` to bridge a string secret into
+`KeyRing::load` (which only reads from env). The pattern is correct *for a
+single-threaded setup*, but `cargo test` runs tests in parallel by default. If
+a future test calls `keyring_with` concurrently with another test that reads
+the same env var (or with another call that uses the same `secret_env` name),
+the second `set_var` will race the first `remove_var`. Today only one test
+(`deliver_sends_hmac_signature_header_when_key_present`) uses the helper with
+the unique name `TEST_HMAC_SECRET_DELIVER`, so the race is latent — but it is
+a foot-gun for the next person to add a wiremock test.
+
+The `SAFETY` comment claims "test-only, single-threaded setup before the async
+runtime starts" — but `#[tokio::test]` *does* start an async runtime, and
+multiple `#[tokio::test]` functions in the same binary do run concurrently
+across threads.
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/http-callback/src/client.rs lines 298-317
+fn keyring_with(key_id: &str, secret_env: &str, secret_val: &str) -> Arc<KeyRing> {
+    use outbox_dispatcher_core::SigningKeyConfig;
+    let env_key = secret_env.to_string();
+    // SAFETY: test-only, single-threaded setup before the async runtime starts.
+    unsafe {
+        std::env::set_var(&env_key, secret_val);
+    }
+    let mut keys = HashMap::new();
+    keys.insert(
+        key_id.to_string(),
+        SigningKeyConfig {
+            secret_env: secret_env.to_string(),
+        },
+    );
+    let kr = KeyRing::load(&keys).unwrap();
+    unsafe {
+        std::env::remove_var(&env_key);
+    }
+    Arc::new(kr)
+}
+```
+
+**Recommended fix**
+
+Two options, in order of preference:
+
+1. **Build the `KeyRing` directly in tests** without going through env. Expose
+   a `KeyRing::from_secrets(&HashMap<String, Vec<u8>>)` or
+   `KeyRing::with_key(&str, &[u8])` constructor for tests (behind
+   `#[cfg(test)]` or as a public test helper crate), so the helper becomes:
+
+   ```rust
+   fn keyring_with(key_id: &str, secret: &[u8]) -> Arc<KeyRing> {
+       Arc::new(KeyRing::with_key(key_id, secret))
+   }
+   ```
+
+2. **Serialise env access** with a `static MUTEX: Mutex<()>` held across
+   `set_var` … `KeyRing::load` … `remove_var`, and fix the `SAFETY` comment to
+   describe the actual invariant (no parallel callers, not "before the async
+   runtime starts").
+
+Option 1 is strictly safer and matches the convention used in `config.rs` where
+`LOAD_MUTEX` already serialises tests that touch `APP_CONFIG_DIR`.
+
+**Why this fix**
+
+Rust 2024 made `std::env::set_var` `unsafe` precisely because it is a
+process-global mutation that races every other thread's `getenv`. The `SAFETY`
+comment claims an invariant that does not hold for `#[tokio::test]` binaries;
+that mismatch *will* bite the next person to copy this helper.
+
+---
+
+### Finding 16 — Pre-existing `clippy::type_complexity` in `scheduler.rs` blocks `--all-targets` lint
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/scheduler.rs:378` |
+| **Severity** | Low |
+| **Category** | Idiom |
+
+**Problem**
+
+`cargo clippy --workspace --all-targets -- -D warnings` fails with:
+
+```
+error: very complex type used. Consider factoring parts into `type` definitions
+   --> crates/core/src/scheduler.rs:378:19
+    |
+378 |         invalids: Mutex<Vec<(Uuid, Vec<(String, String)>)>>,
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+```
+
+This is in the Phase 3 mock-repo test code and not strictly a PR #4 issue —
+`cargo clippy --workspace -- -D warnings` (without `--all-targets`) passes. But
+the project's stated mandatory check (`cargo clippy --workspace -- -D warnings`)
+omits `--all-targets`, so test-only clippy regressions are invisible. CI in
+Phase 8 will almost certainly run `--all-targets`.
+
+PR #4 is the right place to catch this because PR #4 added the `[dev-dependencies]`
+wiremock paths and adjusted the same module; future PRs that *also* run
+`--all-targets` will inherit the failure and blame the wrong PR.
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/core/src/scheduler.rs lines 375-385 (the offending struct)
+struct MockRepo {
+    events: Mutex<VecDeque<RawEvent>>,
+    ensured: Mutex<Vec<(Uuid, Vec<String>)>>,
+    invalids: Mutex<Vec<(Uuid, Vec<(String, String)>)>>,
+    cursor: Mutex<i64>,
+    /// If set, `ensure_deliveries` returns this error once then clears it.
+    ensure_error: Mutex<Option<crate::error::Error>>,
+    /// If set, `create_invalid_deliveries` returns this error once then clears it.
+    invalid_error: Mutex<Option<crate::error::Error>>,
+}
+```
+
+**Recommended fix**
+
+Introduce two type aliases at the top of the test module:
+
+```rust
+// crates/core/src/scheduler.rs — test module
+type EnsuredCalls = Mutex<Vec<(Uuid, Vec<String>)>>;
+type InvalidCalls = Mutex<Vec<(Uuid, Vec<(String, String)>)>>;
+
+struct MockRepo {
+    events: Mutex<VecDeque<RawEvent>>,
+    ensured: EnsuredCalls,
+    invalids: InvalidCalls,
+    cursor: Mutex<i64>,
+    ensure_error: Mutex<Option<crate::error::Error>>,
+    invalid_error: Mutex<Option<crate::error::Error>>,
+}
+```
+
+Also update CLAUDE.md's "Mandatory After Every Code Change" block to use
+`cargo clippy --workspace --all-targets -- -D warnings` so test-only regressions
+are caught locally before CI.
+
+**Why this fix**
+
+The fix is mechanical and clears a real CI-blocker the moment Phase 8 starts
+running `--all-targets`. The CLAUDE.md change prevents the same gap from
+re-opening on future PRs.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 1 | `HttpCallback::new` returns `anyhow` from a library crate | `crates/http-callback/src/client.rs:54` | High | Idiom | DONE | |
-| 2 | Dead-code `keyring_with` test helper trips `-D warnings` | `crates/http-callback/src/client.rs:262-280` | Medium | Testing | DONE | |
-| 3 | Redundant `Arc::clone` in `HttpCallback::new` | `crates/http-callback/src/client.rs:69` | Low | Idiom | DONE | |
-| 4 | No HTTP-level test of `Callback::deliver` | `crates/http-callback/src/client.rs:282-314` | High | Testing | DONE | |
-| 5 | `extract_retry_after` ignores HTTP-date form | `crates/http-callback/src/client.rs:201-209` | Low | Correctness | DONE | |
-| 6 | Dead `if … Ok(())` branch in `sweep_hung_external` | `crates/core/src/timeout_sweep.rs:42-46` | Low | Idiom | DONE | |
-| 7 | `dispatch_due` has no concurrency cap; can starve pg pool | `crates/core/src/dispatch.rs:61-67` | Medium | Concurrency | DONE | |
-| 8 | Non-dead transient failures logged silently | `crates/core/src/dispatch.rs:155-185` | Low | Idiom | DONE | |
-| 9 | Scheduler `consecutive_errors` comment is now misleading | `crates/core/src/scheduler.rs:83-85` | Low | Idiom | DONE | |
+| 1 | `HttpCallback::new` returns `anyhow` from a library crate | `crates/http-callback/src/client.rs:54` | High | Idiom | DONE | Verified — now returns `Result<Self, HttpCallbackError>` |
+| 2 | Dead-code `keyring_with` test helper trips `-D warnings` | `crates/http-callback/src/client.rs:262-280` | Medium | Testing | DONE | Verified — helper is now exercised by `deliver_sends_hmac_signature_header_when_key_present` |
+| 3 | Redundant `Arc::clone` in `HttpCallback::new` | `crates/http-callback/src/client.rs:69` | Low | Idiom | DONE | Verified — field-shorthand move in place |
+| 4 | No HTTP-level test of `Callback::deliver` | `crates/http-callback/src/client.rs:282-314` | High | Testing | DONE | Verified — 7 wiremock-backed tokio tests added |
+| 5 | `extract_retry_after` ignores HTTP-date form | `crates/http-callback/src/client.rs:201-209` | Low | Correctness | DONE | Verified — `httpdate::parse_http_date` integrated. See Finding 13/14 for follow-ups |
+| 6 | Dead `if … Ok(())` branch in `sweep_hung_external` | `crates/core/src/timeout_sweep.rs:42-46` | Low | Idiom | DONE | Verified — dead branch removed |
+| 7 | `dispatch_due` has no concurrency cap; can starve pg pool | `crates/core/src/dispatch.rs:61-67` | Medium | Concurrency | DONE | Verified — `buffer_unordered(dispatch_concurrency)` in place. See Finding 10 — validation rule still missing |
+| 8 | Non-dead transient failures logged silently | `crates/core/src/dispatch.rs:155-185` | Low | Idiom | DONE | Verified — `debug!` added in the non-dead branch |
+| 9 | Scheduler `consecutive_errors` comment is now misleading | `crates/core/src/scheduler.rs:83-85` | Low | Idiom | DONE | Verified — comment tightened |
+| 10 | `dispatch_concurrency` not validated in `AppConfig::validate` | `crates/core/src/config.rs:412-558` / `crates/core/src/dispatch.rs:68` | Medium | Config | TODO | Follow-up to Finding 7 — validation rule omitted |
+| 11 | `dispatch_concurrency` missing from `envs/app_config.toml` | `envs/app_config.toml` `[dispatch]` | Low | Config | TODO | |
+| 12 | `HttpCallback` reqwest client has no full-request timeout | `crates/http-callback/src/client.rs:55-67` | Low | Correctness | TODO | Defence-in-depth — outer `tokio::time::timeout` covers it today |
+| 13 | `extract_retry_after` doc-comment disagrees with code for past dates | `crates/http-callback/src/client.rs:193-209` | Low | Idiom | TODO | |
+| 14 | `extract_retry_after` HTTP-date branch has no unit test | `crates/http-callback/src/client.rs:281-294` | Low | Testing | TODO | |
+| 15 | `keyring_with` test helper leaks env-var state via `unsafe { set_var }` | `crates/http-callback/src/client.rs:298-317` | Low | Testing | TODO | `SAFETY` comment claims an invariant that doesn't hold for `#[tokio::test]` |
+| 16 | Pre-existing `clippy::type_complexity` blocks `--all-targets` lint | `crates/core/src/scheduler.rs:378` | Low | Idiom | TODO | Phase-3 leftover; surface before Phase 8 CI |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
