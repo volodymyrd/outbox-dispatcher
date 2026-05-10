@@ -504,6 +504,19 @@ impl AppConfig {
                 "dispatch.max_callbacks_per_event must be <= {MAX_CALLBACKS_PER_EVENT_LIMIT}"
             ));
         }
+        if self.dispatch.dispatch_concurrency == 0 {
+            errors.push("dispatch.dispatch_concurrency must be > 0".to_string());
+        }
+        if self.database.max_connections > 0
+            && self.dispatch.dispatch_concurrency as u32 > self.database.max_connections
+        {
+            errors.push(format!(
+                "dispatch.dispatch_concurrency ({}) must be <= database.max_connections ({}); \
+                 a slow callback can otherwise hold the last connection while concurrent \
+                 dispatchers stall on lock_delivery",
+                self.dispatch.dispatch_concurrency, self.database.max_connections
+            ));
+        }
         if self.log.filter.trim().is_empty() {
             errors.push("log.filter must not be empty".to_string());
         }
@@ -590,6 +603,7 @@ acquire_timeout_secs = 10
 [dispatch]
 poll_interval_secs = 5
 batch_size = 50
+dispatch_concurrency = 10
 schedule_batch_size = 500
 max_attempts = 6
 backoff_secs = [30, 120, 600, 3600, 21600, 86400]
@@ -968,11 +982,10 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.external_timeout_sweep_interval_secs = 9;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("external_timeout_sweep_interval_secs"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("external_timeout_sweep_interval_secs")));
     }
 
     #[test]
@@ -987,11 +1000,10 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 1023;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("payload_size_limit_bytes"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("payload_size_limit_bytes")));
     }
 
     #[test]
@@ -1161,11 +1173,10 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.processed_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("processed_retention_days"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("processed_retention_days")));
     }
 
     #[test]
@@ -1174,11 +1185,10 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.dead_letter_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("dead_letter_retention_days"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("dead_letter_retention_days")));
     }
 
     #[test]
@@ -1306,11 +1316,10 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 104_857_601;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("payload_size_limit_bytes"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("payload_size_limit_bytes")));
     }
 
     #[test]
@@ -1365,6 +1374,34 @@ filter = "info"
         cfg.dispatch.lock_buffer_secs = 0;
         let errs = cfg.validate().unwrap_err();
         assert!(errs.0.iter().any(|e| e.contains("lock_buffer_secs")));
+    }
+
+    #[test]
+    fn test_validate_dispatch_concurrency_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.dispatch.dispatch_concurrency = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("dispatch_concurrency must be > 0")));
+    }
+
+    #[test]
+    fn test_validate_dispatch_concurrency_exceeds_max_connections() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.max_connections = 5;
+        cfg.dispatch.dispatch_concurrency = 6;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("dispatch_concurrency")));
+    }
+
+    #[test]
+    fn test_validate_dispatch_concurrency_at_max_connections() {
+        let mut cfg = build_config(full_toml());
+        cfg.database.max_connections = 10;
+        cfg.dispatch.dispatch_concurrency = 10;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

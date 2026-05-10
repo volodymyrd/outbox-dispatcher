@@ -110,6 +110,7 @@ impl Callback for HttpCallback {
         let mut req = self
             .client
             .post(&target.url)
+            .timeout(target.timeout) // full-request timeout per §6.3 defence-in-depth
             .header("Content-Type", "application/json")
             .header("X-Outbox-Event-Id", event.event_id.to_string())
             .header("X-Outbox-Delivery-Id", event.delivery_id.to_string())
@@ -190,22 +191,32 @@ fn build_body(event: &EventForDelivery) -> serde_json::Value {
     })
 }
 
-/// Parse a `Retry-After` header value into a `Duration`.
+/// Parse a `Retry-After` header string value into a `Duration`.
 ///
 /// Supports both integer seconds (most common) and the HTTP-date form
 /// (RFC 7231 §7.1.3, e.g. `Wed, 21 Oct 2026 07:28:00 GMT`).
-/// Negative deltas (date already in the past) collapse to zero.
-/// Returns `None` if the header is absent or unparseable.
-fn extract_retry_after(response: &reqwest::Response) -> Option<Duration> {
-    let value = response.headers().get("Retry-After")?.to_str().ok()?;
+/// Past HTTP-date values (date already in the past) return `Some(Duration::ZERO)`.
+/// Returns `None` only if the value is unparseable.
+fn parse_retry_after(value: &str) -> Option<Duration> {
     let trimmed = value.trim();
     // Try integer seconds first (most common form).
     if let Ok(secs) = trimmed.parse::<u64>() {
         return Some(Duration::from_secs(secs));
     }
-    // RFC 7231 §7.1.3 HTTP-date form. Negative deltas collapse to zero.
+    // RFC 7231 §7.1.3 HTTP-date form. Past dates collapse to Duration::ZERO.
     let target = httpdate::parse_http_date(trimmed).ok()?;
-    target.duration_since(SystemTime::now()).ok()
+    Some(
+        target
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+/// Extract and parse a `Retry-After` header from a response.
+///
+/// Returns `None` if the header is absent or unparseable.
+fn extract_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    parse_retry_after(response.headers().get("Retry-After")?.to_str().ok()?)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -280,40 +291,40 @@ mod tests {
 
     #[test]
     fn extract_retry_after_parses_integer_seconds() {
-        // We test the helper via a mock response — build a response with the header.
-        // Since we can't easily construct a reqwest::Response in unit tests,
-        // we test the parsing logic by creating a minimal HTTP response via reqwest's
-        // test utilities.  Instead, we verify the parsing logic directly.
-        let secs_str = "120";
-        let parsed: Option<u64> = secs_str.trim().parse().ok();
-        assert_eq!(parsed, Some(120u64));
-        assert_eq!(
-            parsed.map(Duration::from_secs),
-            Some(Duration::from_secs(120))
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_retry_after("  60  "), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_retry_after_future_http_date_returns_some() {
+        let future = SystemTime::now() + Duration::from_secs(600);
+        let header = httpdate::fmt_http_date(future);
+        let d = parse_retry_after(&header).expect("future date must parse");
+        assert!(
+            d > Duration::from_secs(500) && d <= Duration::from_secs(700),
+            "expected ~600s delay, got {d:?}"
         );
     }
 
-    // ── Helper for wiremock tests: build a KeyRing with one key loaded from env ──
+    #[test]
+    fn parse_retry_after_past_http_date_returns_zero() {
+        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let header = httpdate::fmt_http_date(past);
+        let d = parse_retry_after(&header).expect("past date must parse to Some");
+        assert_eq!(d, Duration::ZERO);
+    }
 
-    fn keyring_with(key_id: &str, secret_env: &str, secret_val: &str) -> Arc<KeyRing> {
-        use outbox_dispatcher_core::SigningKeyConfig;
-        let env_key = secret_env.to_string();
-        // SAFETY: test-only, single-threaded setup before the async runtime starts.
-        unsafe {
-            std::env::set_var(&env_key, secret_val);
-        }
-        let mut keys = HashMap::new();
-        keys.insert(
-            key_id.to_string(),
-            SigningKeyConfig {
-                secret_env: secret_env.to_string(),
-            },
-        );
-        let kr = KeyRing::load(&keys).unwrap();
-        unsafe {
-            std::env::remove_var(&env_key);
-        }
-        Arc::new(kr)
+    #[test]
+    fn parse_retry_after_garbage_returns_none() {
+        assert_eq!(parse_retry_after("not-a-date"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    // ── Helper for wiremock tests: build a KeyRing with one key ──────────────
+
+    fn keyring_with(key_id: &str, secret: &[u8]) -> Arc<KeyRing> {
+        Arc::new(KeyRing::with_key(key_id, secret))
     }
 
     // ── HTTP-level tests using wiremock ───────────────────────────────────────
@@ -383,12 +394,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        // 32-byte base64 secret (exactly 32 raw bytes = 44 base64 chars with padding)
-        let kr = keyring_with(
-            "k1",
-            "TEST_HMAC_SECRET_DELIVER",
-            "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUI=",
-        );
+        // 32-byte secret (all 0x41 = 'A' bytes, matching the test pattern)
+        let kr = keyring_with("k1", &[0x41u8; 32]);
         let cfg = outbox_dispatcher_core::HttpClientConfig::default();
         let cb = HttpCallback::new(&cfg, kr).unwrap();
         let (event, mut target) = make_event(3, Some("k1"));

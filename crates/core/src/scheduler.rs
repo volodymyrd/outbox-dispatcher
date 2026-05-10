@@ -370,12 +370,15 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    type EnsuredCalls = Mutex<Vec<(Uuid, Vec<String>)>>;
+    type InvalidCalls = Mutex<Vec<(Uuid, Vec<(String, String)>)>>;
+
     /// A minimal mock Repo that records calls to `ensure_deliveries` and
     /// `create_invalid_deliveries`, and returns pre-loaded events from a queue.
     struct MockRepo {
         events: Mutex<VecDeque<RawEvent>>,
-        ensured: Mutex<Vec<(Uuid, Vec<String>)>>,
-        invalids: Mutex<Vec<(Uuid, Vec<(String, String)>)>>,
+        ensured: EnsuredCalls,
+        invalids: InvalidCalls,
         cursor: Mutex<i64>,
         /// If set, `ensure_deliveries` returns this error once then clears it.
         ensure_error: Mutex<Option<crate::error::Error>>,

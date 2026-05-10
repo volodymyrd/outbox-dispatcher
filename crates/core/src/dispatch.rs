@@ -65,7 +65,7 @@ pub async fn dispatch_due(
         due.into_iter()
             .map(|d| dispatch_one(repo, callback, config, d)),
     )
-    .buffer_unordered(config.dispatch_concurrency.max(1));
+    .buffer_unordered(config.dispatch_concurrency);
 
     while tasks.next().await.is_some() {}
     Ok(())

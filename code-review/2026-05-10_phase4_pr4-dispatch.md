@@ -1168,13 +1168,13 @@ re-opening on future PRs.
 | 7 | `dispatch_due` has no concurrency cap; can starve pg pool | `crates/core/src/dispatch.rs:61-67` | Medium | Concurrency | DONE | Verified — `buffer_unordered(dispatch_concurrency)` in place. See Finding 10 — validation rule still missing |
 | 8 | Non-dead transient failures logged silently | `crates/core/src/dispatch.rs:155-185` | Low | Idiom | DONE | Verified — `debug!` added in the non-dead branch |
 | 9 | Scheduler `consecutive_errors` comment is now misleading | `crates/core/src/scheduler.rs:83-85` | Low | Idiom | DONE | Verified — comment tightened |
-| 10 | `dispatch_concurrency` not validated in `AppConfig::validate` | `crates/core/src/config.rs:412-558` / `crates/core/src/dispatch.rs:68` | Medium | Config | TODO | Follow-up to Finding 7 — validation rule omitted |
-| 11 | `dispatch_concurrency` missing from `envs/app_config.toml` | `envs/app_config.toml` `[dispatch]` | Low | Config | TODO | |
-| 12 | `HttpCallback` reqwest client has no full-request timeout | `crates/http-callback/src/client.rs:55-67` | Low | Correctness | TODO | Defence-in-depth — outer `tokio::time::timeout` covers it today |
-| 13 | `extract_retry_after` doc-comment disagrees with code for past dates | `crates/http-callback/src/client.rs:193-209` | Low | Idiom | TODO | |
-| 14 | `extract_retry_after` HTTP-date branch has no unit test | `crates/http-callback/src/client.rs:281-294` | Low | Testing | TODO | |
-| 15 | `keyring_with` test helper leaks env-var state via `unsafe { set_var }` | `crates/http-callback/src/client.rs:298-317` | Low | Testing | TODO | `SAFETY` comment claims an invariant that doesn't hold for `#[tokio::test]` |
-| 16 | Pre-existing `clippy::type_complexity` blocks `--all-targets` lint | `crates/core/src/scheduler.rs:378` | Low | Idiom | TODO | Phase-3 leftover; surface before Phase 8 CI |
+| 10 | `dispatch_concurrency` not validated in `AppConfig::validate` | `crates/core/src/config.rs:412-558` / `crates/core/src/dispatch.rs:68` | Medium | Config | DONE | Added zero-check and `>= max_connections` relational check; dropped `.max(1)` guard |
+| 11 | `dispatch_concurrency` missing from `envs/app_config.toml` | `envs/app_config.toml` `[dispatch]` | Low | Config | DONE | Added with comment |
+| 12 | `HttpCallback` reqwest client has no full-request timeout | `crates/http-callback/src/client.rs:55-67` | Low | Correctness | DONE | Added `.timeout(target.timeout)` on per-request builder |
+| 13 | `extract_retry_after` doc-comment disagrees with code for past dates | `crates/http-callback/src/client.rs:193-209` | Low | Idiom | DONE | Clamps to `Duration::ZERO`; doc and code now agree |
+| 14 | `extract_retry_after` HTTP-date branch has no unit test | `crates/http-callback/src/client.rs:281-294` | Low | Testing | DONE | Factored `parse_retry_after(&str)` helper; added 4 unit tests incl. future/past/garbage |
+| 15 | `keyring_with` test helper leaks env-var state via `unsafe { set_var }` | `crates/http-callback/src/client.rs:298-317` | Low | Testing | DONE | Added `KeyRing::with_key` constructor; helper now uses raw bytes, no env mutation |
+| 16 | Pre-existing `clippy::type_complexity` blocks `--all-targets` lint | `crates/core/src/scheduler.rs:378` | Low | Idiom | DONE | Added `EnsuredCalls`/`InvalidCalls` type aliases; CLAUDE.md updated to `--all-targets` |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

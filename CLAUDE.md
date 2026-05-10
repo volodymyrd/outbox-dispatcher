@@ -28,7 +28,7 @@ Run in this order after **every** edit — fix all issues before moving on:
 ```bash
 cargo fmt --all
 cargo check --workspace
-cargo clippy --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
