@@ -982,10 +982,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.external_timeout_sweep_interval_secs = 9;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("external_timeout_sweep_interval_secs")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("external_timeout_sweep_interval_secs"))
+        );
     }
 
     #[test]
@@ -1000,10 +1001,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 1023;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("payload_size_limit_bytes")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("payload_size_limit_bytes"))
+        );
     }
 
     #[test]
@@ -1173,10 +1175,11 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.processed_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("processed_retention_days")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("processed_retention_days"))
+        );
     }
 
     #[test]
@@ -1185,10 +1188,11 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.dead_letter_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("dead_letter_retention_days")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("dead_letter_retention_days"))
+        );
     }
 
     #[test]
@@ -1316,10 +1320,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 104_857_601;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("payload_size_limit_bytes")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("payload_size_limit_bytes"))
+        );
     }
 
     #[test]
@@ -1381,10 +1386,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.dispatch_concurrency = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("dispatch_concurrency must be > 0")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("dispatch_concurrency must be > 0"))
+        );
     }
 
     #[test]

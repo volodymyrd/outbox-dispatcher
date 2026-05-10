@@ -1300,25 +1300,16 @@ a future repo refactor accidentally breaking the recovery semantics.
 
 ## PR Status
 
-**Status: NOT READY TO MERGE.**
+**Status: READY TO MERGE.**
 
-All sixteen prior findings (1–16) are correctly addressed in code. The
-**only** blocker is Finding 17: the PR currently fails the very first
-mandatory post-change check (`cargo fmt --all -- --check`). This is a 30-second
-fix — running `cargo fmt --all` and committing the result clears it.
-
-Once Finding 17 is fixed:
+All eighteen findings are correctly addressed in code.
 
 | Mandatory check | Status |
 |-----------------|--------|
-| `cargo fmt --all -- --check` | ❌ FAILS — 6 `assert!` blocks need rustfmt rewrite (Finding 17) |
+| `cargo fmt --all -- --check` | ✅ passes |
 | `cargo check --workspace` | ✅ passes |
 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ passes |
-| `cargo test --workspace` (lib tests) | ✅ passes (266 tests: 246 in core, 20 in http-callback) |
-
-After fixing Finding 17 the PR is ready to merge. Finding 18 (missing
-dispatch integration test) is a Low-severity gap that may be deferred to a
-follow-up PR or to Phase 5/8 without blocking this merge.
+| `cargo test --workspace` (lib + integration tests) | ✅ passes (275 tests: 246 in core, 9 integration in core, 20 in http-callback) |
 
 ---
 
@@ -1342,8 +1333,8 @@ follow-up PR or to Phase 5/8 without blocking this merge.
 | 14 | `extract_retry_after` HTTP-date branch has no unit test | `crates/http-callback/src/client.rs:281-294` | Low | Testing | DONE | Factored `parse_retry_after(&str)` helper; added 4 unit tests incl. future/past/garbage |
 | 15 | `keyring_with` test helper leaks env-var state via `unsafe { set_var }` | `crates/http-callback/src/client.rs:298-317` | Low | Testing | DONE | Added `KeyRing::with_key` constructor; helper now uses raw bytes, no env mutation |
 | 16 | Pre-existing `clippy::type_complexity` blocks `--all-targets` lint | `crates/core/src/scheduler.rs:378` | Low | Idiom | DONE | Added `EnsuredCalls`/`InvalidCalls` type aliases; CLAUDE.md updated to `--all-targets` |
-| 17 | `cargo fmt --all -- --check` regressed: 6 `assert!` blocks reformatted to non-rustfmt style | `crates/core/src/config.rs:982,1000,1173,1185,1316,1383` | Medium | Idiom | TODO | **MERGE BLOCKER** — run `cargo fmt --all` once and commit. Was correct on `main`, regressed in this PR. |
-| 18 | No integration test for dispatch lock+recovery flow (TDD §16 Phase 4 milestone) | `crates/core/tests/` | Low | Testing | TODO | May defer to follow-up. Add `dispatch_integration.rs` testcontainers test for `locked_until` expiry redelivery. |
+| 17 | `cargo fmt --all -- --check` regressed: 6 `assert!` blocks reformatted to non-rustfmt style | `crates/core/src/config.rs:982,1000,1173,1185,1316,1383` | Medium | Idiom | DONE | Ran `cargo fmt --all`; all 6 blocks rewritten to canonical rustfmt 2024 form |
+| 18 | No integration test for dispatch lock+recovery flow (TDD §16 Phase 4 milestone) | `crates/core/tests/` | Low | Testing | DONE | Added `crates/core/tests/dispatch_integration.rs` with 4 testcontainers tests covering lock visibility, attempts increment, concurrent-lock rejection, and post-dispatch non-reappearance |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
