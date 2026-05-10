@@ -1155,6 +1155,173 @@ re-opening on future PRs.
 
 ---
 
+## Third-Pass Findings (post-rework on commit 0c3adf0)
+
+Findings 1–16 above were re-verified against the current tree. The third pass
+(2026-05-10T19:53Z) confirms 1–16 are correctly addressed in code, but
+identifies the following new issues introduced by the rework itself.
+
+---
+
+### Finding 17 — `cargo fmt --all -- --check` regressed: 6 `assert!` blocks reformatted to non-rustfmt style
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/config.rs:982,1000,1173,1185,1316,1383` |
+| **Severity** | Medium |
+| **Category** | Idiom |
+
+**Problem**
+
+`cargo fmt --all -- --check` passes on `main` but fails on `phase4`. Six
+`assert!(errs.0.iter().any(|e| e.contains(...)))` test blocks were originally
+in the wrapped `assert!(\n    errs.0\n        .iter()\n        ...\n)` form
+(rustfmt 2024 default for multi-line arguments). They have been manually
+rewritten to the `assert!(errs\n    .0\n    .iter()\n    ...)` form, which
+rustfmt 2024 rejects. CLAUDE.md explicitly mandates `cargo fmt --all` after
+every code change as the first item in the post-change checklist; CI in
+Phase 8 will run this and fail.
+
+The rewrite is a behaviour-preserving regression in the same six tests in
+`config.rs` (verified via `git diff main...phase4 -- crates/core/src/config.rs`):
+
+- `test_validate_sweep_interval_below_minimum` (line 982)
+- `test_validate_payload_size_below_minimum` (line 1000)
+- `test_validate_retention_enabled_zero_days` (line 1173)
+- `test_validate_retention_enabled_dead_letter_zero` (line 1185)
+- `test_validate_payload_size_above_maximum` (line 1316)
+- `test_validate_dispatch_concurrency_zero` (line 1383)
+
+**Context** (sample of the regressed form, from `crates/core/src/config.rs:1380-1388`)
+
+```rust
+#[test]
+fn test_validate_dispatch_concurrency_zero() {
+    let mut cfg = build_config(full_toml());
+    cfg.dispatch.dispatch_concurrency = 0;
+    let errs = cfg.validate().unwrap_err();
+    assert!(errs
+        .0
+        .iter()
+        .any(|e| e.contains("dispatch_concurrency must be > 0")));
+}
+```
+
+**Recommended fix**
+
+Run `cargo fmt --all` once. The tool will rewrite all six blocks to the
+canonical form rustfmt 2024 emits:
+
+```rust
+#[test]
+fn test_validate_dispatch_concurrency_zero() {
+    let mut cfg = build_config(full_toml());
+    cfg.dispatch.dispatch_concurrency = 0;
+    let errs = cfg.validate().unwrap_err();
+    assert!(
+        errs.0
+            .iter()
+            .any(|e| e.contains("dispatch_concurrency must be > 0"))
+    );
+}
+```
+
+No code-behaviour change; this is a pure formatting fix.
+
+**Why this fix**
+
+`cargo fmt --all` is the first command in CLAUDE.md's mandatory post-change
+list specifically because letting fmt drift makes future PRs noisy and breaks
+CI. Always re-run `cargo fmt --all` before committing the rework.
+
+---
+
+### Finding 18 — No integration test for the dispatch lock+recovery flow (TDD §16 Phase 4 milestone)
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/tests/` (only `scheduler_integration.rs` exists) |
+| **Severity** | Low |
+| **Category** | Testing |
+
+**Problem**
+
+TDD §16 Phase 4 milestone explicitly lists "verify mid-dispatch crash leaves a
+row recovered via locked_until expiry". The current PR adds:
+
+- 7 wiremock-backed tokio tests for the HTTP side (good).
+- 8 mock-repo tokio tests for the dispatch state machine (good).
+- 3 mock-repo sweep tests in `timeout_sweep` (good).
+
+But **none** exercise the end-to-end "lock with short `locked_until` → expire
+→ re-fetch via `fetch_due_deliveries` → re-lock" cycle against a real Postgres
+container. The only integration test on disk is the Phase 3
+`scheduler_integration.rs`. Sweeper-related recovery covers external mode
+only — managed-mode recovery via `locked_until` expiry is the Phase 4
+mechanism and remains untested at the DB level.
+
+This is not a correctness blocker: `lock_delivery` does the right thing in the
+SQL (verified in `crates/core/src/repo.rs:357-376` — `WHERE … AND
+(locked_until IS NULL OR locked_until < now())`), and unit tests cover the
+in-memory flow. But the integration assertion that the SQL predicate behaves
+under wall-clock expiry is a milestone in the TDD that the PR description
+implicitly claims to deliver.
+
+**Recommended fix**
+
+Add `crates/core/tests/dispatch_integration.rs` with a single test using the
+existing testcontainers harness:
+
+```rust
+// crates/core/tests/dispatch_integration.rs (sketch)
+#[tokio::test]
+async fn locked_delivery_is_redelivered_after_locked_until_expiry() {
+    // 1. Spin up a Postgres container with the V1 schema applied.
+    // 2. Insert one event + one delivery row.
+    // 3. Call repo.lock_delivery(id, now() + 100ms) → returns true.
+    // 4. Verify repo.fetch_due_deliveries returns nothing now (lock active).
+    // 5. tokio::time::sleep(150ms).await
+    // 6. Verify repo.fetch_due_deliveries returns the row again.
+    // 7. Verify attempts == 1 (only the first lock_delivery bumped it).
+}
+```
+
+Alternatively, defer to Phase 5/8: this is a Low-severity gap, not a defect.
+If deferring, leave a tracking note on the PR description so the milestone is
+not silently dropped.
+
+**Why this fix**
+
+The TDD §16 Phase 4 milestone names this scenario explicitly; integration
+coverage of the `locked_until` expiry contract is the cheapest hedge against
+a future repo refactor accidentally breaking the recovery semantics.
+
+---
+
+## PR Status
+
+**Status: NOT READY TO MERGE.**
+
+All sixteen prior findings (1–16) are correctly addressed in code. The
+**only** blocker is Finding 17: the PR currently fails the very first
+mandatory post-change check (`cargo fmt --all -- --check`). This is a 30-second
+fix — running `cargo fmt --all` and committing the result clears it.
+
+Once Finding 17 is fixed:
+
+| Mandatory check | Status |
+|-----------------|--------|
+| `cargo fmt --all -- --check` | ❌ FAILS — 6 `assert!` blocks need rustfmt rewrite (Finding 17) |
+| `cargo check --workspace` | ✅ passes |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ passes |
+| `cargo test --workspace` (lib tests) | ✅ passes (266 tests: 246 in core, 20 in http-callback) |
+
+After fixing Finding 17 the PR is ready to merge. Finding 18 (missing
+dispatch integration test) is a Low-severity gap that may be deferred to a
+follow-up PR or to Phase 5/8 without blocking this merge.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
@@ -1175,6 +1342,8 @@ re-opening on future PRs.
 | 14 | `extract_retry_after` HTTP-date branch has no unit test | `crates/http-callback/src/client.rs:281-294` | Low | Testing | DONE | Factored `parse_retry_after(&str)` helper; added 4 unit tests incl. future/past/garbage |
 | 15 | `keyring_with` test helper leaks env-var state via `unsafe { set_var }` | `crates/http-callback/src/client.rs:298-317` | Low | Testing | DONE | Added `KeyRing::with_key` constructor; helper now uses raw bytes, no env mutation |
 | 16 | Pre-existing `clippy::type_complexity` blocks `--all-targets` lint | `crates/core/src/scheduler.rs:378` | Low | Idiom | DONE | Added `EnsuredCalls`/`InvalidCalls` type aliases; CLAUDE.md updated to `--all-targets` |
+| 17 | `cargo fmt --all -- --check` regressed: 6 `assert!` blocks reformatted to non-rustfmt style | `crates/core/src/config.rs:982,1000,1173,1185,1316,1383` | Medium | Idiom | TODO | **MERGE BLOCKER** — run `cargo fmt --all` once and commit. Was correct on `main`, regressed in this PR. |
+| 18 | No integration test for dispatch lock+recovery flow (TDD §16 Phase 4 milestone) | `crates/core/tests/` | Low | Testing | TODO | May defer to follow-up. Add `dispatch_integration.rs` testcontainers test for `locked_until` expiry redelivery. |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
