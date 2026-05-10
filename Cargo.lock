@@ -1788,6 +1788,7 @@ dependencies = [
  "base64",
  "chrono",
  "config",
+ "futures",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -1808,6 +1809,7 @@ dependencies = [
 name = "outbox-dispatcher-http-callback"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "hex",

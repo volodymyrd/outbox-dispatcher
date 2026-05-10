@@ -9,11 +9,15 @@
 //!    are immediately dead-lettered; events whose payload exceeds the configured limit are
 //!    dead-lettered in bulk. Poison-pill rows (corrupt JSONB that cannot be deserialized)
 //!    are logged, metered, and skipped so one bad row cannot stall the entire queue.
-//! 3. **Wake source** — a `PgListener` that listens on `outbox_events_new` wakes the loop
+//! 3. **Dispatch** — fetch due deliveries and invoke the `Callback` trait implementation
+//!    concurrently for each one, writing results back to the repository.
+//! 4. **External-completion sweep** — rate-limited sweep of hung external-mode rows:
+//!    reset for redelivery or dead-letter after cycle exhaustion (Phase 5).
+//! 5. **Wake source** — a `PgListener` that listens on `outbox_events_new` wakes the loop
 //!    with sub-second latency on every INSERT; a periodic poll-timer is the fallback if
 //!    the LISTEN connection is lost or too quiet.
-//! 4. **Graceful shutdown** — a `CancellationToken` lets the caller signal shutdown; the
-//!    loop drains any in-progress scheduling step and returns cleanly.
+//! 6. **Graceful shutdown** — a `CancellationToken` lets the caller signal shutdown; the
+//!    loop drains any in-progress scheduling/dispatch step and returns cleanly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,8 +30,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::callbacks::{parse_callbacks, payload_too_large_error};
 use crate::config::DispatchConfig;
+use crate::dispatch::{Callback, dispatch_due};
 use crate::error::Result;
 use crate::repo::Repo;
+use crate::timeout_sweep::sweep_hung_external;
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -37,17 +43,18 @@ use crate::repo::Repo;
 /// disconnected or has not yet connected. This is updated by the wake loop.
 pub type ListenerStatus = Arc<AtomicBool>;
 
-/// Run the scheduler loop until `shutdown` is cancelled.
+/// Run the main dispatch loop until `shutdown` is cancelled.
 ///
-/// - Recovers the event cursor on startup.
-/// - Listens on `config.notify_channel` for low-latency wakeups.
-/// - Also wakes on `config.poll_interval` so missed NOTIFYs are never permanently lost.
-/// - On each wake, calls [`schedule_new_deliveries`] to expand new events into delivery rows.
+/// Each wake cycle:
+/// 1. Discovers new events and expands callbacks into delivery rows (scheduling).
+/// 2. Fetches due deliveries and invokes the `Callback` implementation concurrently.
+/// 3. Rate-limited: sweeps hung external-mode rows for redelivery or dead-letter.
 ///
 /// The `listener_status` value is set to `true` while the LISTEN connection is up and
 /// `false` when it drops. Callers (e.g. the admin `/ready` endpoint) can inspect it.
 pub async fn run_scheduler(
     repo: Arc<dyn Repo>,
+    callback: Arc<dyn Callback>,
     config: DispatchConfig,
     mut listener: PgListener,
     listener_status: ListenerStatus,
@@ -69,10 +76,12 @@ pub async fn run_scheduler(
     debug!(cursor, "recovered event cursor from database");
 
     let poll_interval = config.poll_interval;
+    let sweep_interval = config.external_timeout_sweep_interval;
     let mut next_poll = Instant::now() + poll_interval;
+    let mut last_sweep = Instant::now();
 
-    // Tracks consecutive scheduling failures so we can apply a capped backoff and
-    // avoid log-spamming at full speed during a sustained DB outage.
+    // Tracks consecutive scheduling/dispatch failures so we can apply a capped backoff
+    // and avoid log-spamming at full speed during a sustained DB outage.
     let mut consecutive_errors: u32 = 0;
 
     loop {
@@ -119,7 +128,7 @@ pub async fn run_scheduler(
             // intentionally discarded — we just want to flush the buffer
         }
 
-        // Run a scheduling cycle regardless of which wake source fired.
+        // ── Step 1: discover new events, expand callbacks into deliveries ─────
         match schedule_new_deliveries(repo.as_ref(), &config, cursor).await {
             Ok(new_cursor) => {
                 cursor = new_cursor;
@@ -137,7 +146,24 @@ pub async fn run_scheduler(
                     100u64.saturating_mul(1u64 << consecutive_errors.min(6)),
                 ));
                 tokio::time::sleep(backoff).await;
+                // Reset the poll timer before continuing.
+                next_poll = Instant::now() + poll_interval;
+                continue;
             }
+        }
+
+        // ── Step 2: dispatch due deliveries ───────────────────────────────────
+        if let Err(e) = dispatch_due(repo.as_ref(), callback.as_ref(), &config).await {
+            error!(error = %e, "error fetching due deliveries for dispatch");
+            // Non-fatal: individual dispatch failures are handled inside dispatch_due.
+        }
+
+        // ── Step 3: external-completion timeout sweep (rate-limited) ─────────
+        if last_sweep.elapsed() >= sweep_interval {
+            if let Err(e) = sweep_hung_external(repo.as_ref(), &config).await {
+                error!(error = %e, "error during external-completion timeout sweep");
+            }
+            last_sweep = Instant::now();
         }
 
         // Reset the poll timer after every cycle so the next timer fire is a full

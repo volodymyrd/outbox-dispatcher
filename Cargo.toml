@@ -21,6 +21,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", features = ["toml"] }
+futures = "0.3"
 hex = "0.4"
 hmac = "0.13"
 outbox-dispatcher-admin-api = { path = "crates/admin-api" }

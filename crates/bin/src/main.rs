@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use outbox_dispatcher_core::{
     AppConfig, DatabaseConfig, DispatchConfig, KeyRing, LogConfig, LogFormat, PgRepo, run_scheduler,
 };
+use outbox_dispatcher_http_callback::HttpCallback;
 use sqlx::PgPool;
 use sqlx::postgres::{PgListener, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
@@ -62,10 +63,8 @@ async fn main() -> Result<()> {
     }
 
     // Fail fast if any configured signing key cannot be resolved from its env var.
-    // Bind the keyring so the allocation is held for the process lifetime and Phase 4
-    // dispatch wiring can pass it directly without a second decode pass.
-    let _keyring = match KeyRing::load(&config.signing_keys) {
-        Ok(kr) => kr,
+    let keyring = match KeyRing::load(&config.signing_keys) {
+        Ok(kr) => Arc::new(kr),
         Err(errors) => {
             for e in &errors.0 {
                 eprintln!("signing key error: {e}");
@@ -119,6 +118,11 @@ async fn main() -> Result<()> {
             let dispatch_config = DispatchConfig::from(config.dispatch.clone());
             let repo = Arc::new(PgRepo::new(pool.clone(), dispatch_config.clone()));
 
+            // Build the HTTP callback implementation backed by reqwest.
+            let http_callback = HttpCallback::new(&config.http_client, keyring)
+                .context("building HTTP callback client")?;
+            let callback: Arc<dyn outbox_dispatcher_core::Callback> = Arc::new(http_callback);
+
             // Create a dedicated connection for LISTEN/NOTIFY (the pool cannot be used
             // for LISTEN because each .execute() call may use a different connection).
             let listener = PgListener::connect_with(&pool)
@@ -138,9 +142,16 @@ async fn main() -> Result<()> {
             });
 
             info!("starting scheduler");
-            run_scheduler(repo, dispatch_config, listener, listener_status, shutdown)
-                .await
-                .context("scheduler exited with error")?;
+            run_scheduler(
+                repo,
+                callback,
+                dispatch_config,
+                listener,
+                listener_status,
+                shutdown,
+            )
+            .await
+            .context("scheduler exited with error")?;
 
             info!("outbox-dispatcher stopped cleanly");
         }

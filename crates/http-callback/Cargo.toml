@@ -6,6 +6,7 @@ license.workspace = true
 description = "HTTP webhook delivery adapter for outbox-dispatcher"
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
