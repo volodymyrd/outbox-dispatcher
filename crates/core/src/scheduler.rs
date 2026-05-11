@@ -23,17 +23,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sqlx::postgres::PgListener;
-use tokio::time::{Instant, sleep_until};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-
 use crate::callbacks::{parse_callbacks, payload_too_large_error};
 use crate::config::DispatchConfig;
 use crate::dispatch::{Callback, dispatch_due};
 use crate::error::Result;
 use crate::repo::Repo;
 use crate::timeout_sweep::sweep_hung_external;
+use sqlx::postgres::PgListener;
+use tokio::time::{Instant, sleep_until};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -42,6 +41,12 @@ use crate::timeout_sweep::sweep_hung_external;
 /// `true` means the LISTEN connection is established; `false` means it is
 /// disconnected or has not yet connected. This is updated by the wake loop.
 pub type ListenerStatus = Arc<AtomicBool>;
+
+/// A shared timestamp updated after each successful scheduler cycle.
+///
+/// The admin `/ready` endpoint uses this to check that the scheduler is still
+/// running within `2 × poll_interval`.
+pub type LastCycleAt = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
 /// Run the main dispatch loop until `shutdown` is cancelled.
 ///
@@ -52,13 +57,38 @@ pub type ListenerStatus = Arc<AtomicBool>;
 ///
 /// The `listener_status` value is set to `true` while the LISTEN connection is up and
 /// `false` when it drops. Callers (e.g. the admin `/ready` endpoint) can inspect it.
+///
+/// `last_cycle_at` is updated with `std::time::Instant::now()` after each successful
+/// cycle. The admin `/ready` endpoint checks this against `2 × poll_interval`.
 pub async fn run_scheduler(
+    repo: Arc<dyn Repo>,
+    callback: Arc<dyn Callback>,
+    config: DispatchConfig,
+    listener: PgListener,
+    listener_status: ListenerStatus,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    run_scheduler_with_cycle_tracker(
+        repo,
+        callback,
+        config,
+        listener,
+        listener_status,
+        shutdown,
+        None,
+    )
+    .await
+}
+
+/// Like [`run_scheduler`] but also updates `last_cycle_at` after each successful cycle.
+pub async fn run_scheduler_with_cycle_tracker(
     repo: Arc<dyn Repo>,
     callback: Arc<dyn Callback>,
     config: DispatchConfig,
     mut listener: PgListener,
     listener_status: ListenerStatus,
     shutdown: CancellationToken,
+    last_cycle_at: Option<LastCycleAt>,
 ) -> Result<()> {
     // Subscribe to the NOTIFY channel.
     listener
@@ -171,6 +201,14 @@ pub async fn run_scheduler(
         // Reset the poll timer after every cycle so the next timer fire is a full
         // poll_interval away from the last completed cycle.
         next_poll = Instant::now() + poll_interval;
+
+        // Update the last-cycle timestamp so the admin /ready endpoint knows the
+        // scheduler is still alive.
+        if let Some(ref tracker) = last_cycle_at
+            && let Ok(mut guard) = tracker.lock()
+        {
+            *guard = Some(std::time::Instant::now());
+        }
     }
 }
 
@@ -578,6 +616,17 @@ mod tests {
             Err(crate::error::Error::InvalidData(format!(
                 "event {event_id} not found"
             )))
+        }
+
+        async fn fetch_stats(&self) -> crate::error::Result<crate::schema::Stats> {
+            Ok(crate::schema::Stats {
+                events_total: 0,
+                deliveries_pending: 0,
+                deliveries_external_pending: 0,
+                deliveries_dead_lettered: 0,
+                oldest_pending_age_seconds: None,
+                callbacks: std::collections::HashMap::new(),
+            })
         }
     }
 

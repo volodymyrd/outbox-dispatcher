@@ -433,6 +433,17 @@ mod tests {
         async fn fetch_event_with_deliveries(&self, _: Uuid) -> Result<EventWithDeliveries> {
             Err(crate::error::Error::InvalidData("not found".into()))
         }
+
+        async fn fetch_stats(&self) -> Result<crate::schema::Stats> {
+            Ok(crate::schema::Stats {
+                events_total: 0,
+                deliveries_pending: 0,
+                deliveries_external_pending: 0,
+                deliveries_dead_lettered: 0,
+                oldest_pending_age_seconds: None,
+                callbacks: std::collections::HashMap::new(),
+            })
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

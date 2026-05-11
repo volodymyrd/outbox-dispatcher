@@ -1816,6 +1816,7 @@ name = "outbox-dispatcher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "outbox-dispatcher-admin-api",
@@ -1842,6 +1843,7 @@ dependencies = [
  "outbox-dispatcher-core",
  "serde",
  "serde_json",
+ "sqlx",
  "subtle",
  "thiserror",
  "tokio",

@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::config::DispatchConfig;
 use crate::error::Result;
 use crate::schema::{
-    CallbackTarget, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
-    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, SweepReport,
+    CallbackStats, CallbackTarget, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
+    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, Stats, StatsRow, SweepReport,
 };
 
 #[async_trait]
@@ -115,6 +115,9 @@ pub trait Repo: Send + Sync {
     async fn abandon_delivery(&self, id: i64) -> Result<bool>;
 
     async fn fetch_event_with_deliveries(&self, event_id: Uuid) -> Result<EventWithDeliveries>;
+
+    /// Returns aggregate delivery counts for the stats endpoint.
+    async fn fetch_stats(&self) -> Result<Stats>;
 }
 
 // ── Postgres implementation ────────────────────────────────────────────────────
@@ -716,6 +719,103 @@ impl Repo for PgRepo {
         .await?;
 
         Ok(EventWithDeliveries { event, deliveries })
+    }
+
+    async fn fetch_stats(&self) -> Result<Stats> {
+        let events_total: i64 =
+            sqlx::query_scalar!(r#"SELECT COUNT(*) AS "count!" FROM outbox_events"#)
+                .fetch_one(&self.pool)
+                .await?;
+
+        let deliveries_pending: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "count!"
+            FROM outbox_deliveries
+            WHERE dispatched_at IS NULL
+              AND processed_at  IS NULL
+              AND dead_letter   = FALSE
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let deliveries_external_pending: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "count!"
+            FROM outbox_deliveries
+            WHERE completion_mode = 'external'
+              AND dispatched_at   IS NOT NULL
+              AND processed_at    IS NULL
+              AND dead_letter     = FALSE
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let deliveries_dead_lettered: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "count!" FROM outbox_deliveries WHERE dead_letter = TRUE"#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let oldest_pending_age_seconds: Option<f64> = sqlx::query_scalar!(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (now() - MIN(available_at)))::float8
+            FROM outbox_deliveries
+            WHERE dispatched_at IS NULL
+              AND processed_at  IS NULL
+              AND dead_letter   = FALSE
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows = sqlx::query_as!(
+            StatsRow,
+            r#"
+            SELECT
+                callback_name,
+                COUNT(*) FILTER (
+                    WHERE dispatched_at IS NULL
+                      AND processed_at  IS NULL
+                      AND dead_letter   = FALSE
+                ) AS "pending!",
+                COUNT(*) FILTER (
+                    WHERE completion_mode = 'external'
+                      AND dispatched_at   IS NOT NULL
+                      AND processed_at    IS NULL
+                      AND dead_letter     = FALSE
+                ) AS "external_pending!",
+                COUNT(*) FILTER (
+                    WHERE dead_letter = TRUE
+                ) AS "dead_lettered!"
+            FROM outbox_deliveries
+            GROUP BY callback_name
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut callbacks = std::collections::HashMap::new();
+        for row in rows {
+            callbacks.insert(
+                row.callback_name,
+                CallbackStats {
+                    pending: row.pending,
+                    external_pending: row.external_pending,
+                    dead_lettered: row.dead_lettered,
+                },
+            );
+        }
+
+        Ok(Stats {
+            events_total,
+            deliveries_pending,
+            deliveries_external_pending,
+            deliveries_dead_lettered,
+            oldest_pending_age_seconds,
+            callbacks,
+        })
     }
 }
 
