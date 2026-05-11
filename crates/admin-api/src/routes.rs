@@ -8,7 +8,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
-use outbox_dispatcher_core::{PageParams, Repo};
+use outbox_dispatcher_core::{PageParams, Repo, RetryOutcome};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -32,29 +32,28 @@ pub struct AdminState {
 
 /// Build the admin [`Router`] with all routes, auth middleware, and shared state.
 ///
-/// The `auth_token` is the bearer token required by every protected endpoint.
+/// `/health` and `/ready` are public (no auth required) so that liveness/readiness
+/// probes from load balancers and orchestrators work without a bearer token.
+/// All other endpoints require `Authorization: Bearer <token>`.
 pub fn build_router(state: AdminState, auth_token: String) -> Router {
-    Router::new()
-        // Health and readiness — protected by the same bearer token for consistency,
-        // but lightweight (no db hit for /health).
+    let public = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        // Dead letters
+        .with_state(state.clone());
+
+    let protected = Router::new()
         .route("/v1/dead-letters", get(list_dead_letters))
-        // External pending
         .route("/v1/external-pending", get(list_external_pending))
-        // Event detail
         .route("/v1/events/{event_id}", get(get_event))
-        // Delivery mutations
         .route("/v1/deliveries/{id}/retry", post(retry_delivery))
         .route("/v1/deliveries/{id}/complete", post(complete_delivery))
         .route("/v1/deliveries/{id}/abandon", post(abandon_delivery))
-        // Stats
         .route("/v1/stats", get(get_stats))
-        // Auth middleware wraps all routes.
         .layer(middleware::from_fn(require_bearer_token))
         .layer(Extension(ExpectedToken(auth_token)))
-        .with_state(state)
+        .with_state(state);
+
+    public.merge(protected)
 }
 
 // ── /health ───────────────────────────────────────────────────────────────────
@@ -206,8 +205,13 @@ struct MutationResponse {
 
 async fn retry_delivery(State(state): State<AdminState>, Path(id): Path<i64>) -> Response {
     match state.repo.retry_delivery(id).await {
-        Ok(true) => Json(MutationResponse { ok: true }).into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "delivery not found").into_response(),
+        Ok(RetryOutcome::Reset) => Json(MutationResponse { ok: true }).into_response(),
+        Ok(RetryOutcome::NotFound) => (StatusCode::NOT_FOUND, "delivery not found").into_response(),
+        Ok(RetryOutcome::Locked) => (
+            StatusCode::CONFLICT,
+            "delivery is currently locked by a dispatcher; retry again shortly",
+        )
+            .into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -263,7 +267,7 @@ mod tests {
     use chrono::{DateTime, Utc};
     use outbox_dispatcher_core::{
         CallbackTarget, DeadLetterRow, DueDelivery, Error, EventWithDeliveries, ExternalPendingRow,
-        PageParams, RawEvent, Stats, SweepReport,
+        PageParams, RawEvent, RetryOutcome, Stats, SweepReport,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -277,10 +281,11 @@ mod tests {
         dead_letters: Vec<DeadLetterRow>,
         external_pending: Vec<ExternalPendingRow>,
         event: Option<EventWithDeliveries>,
-        retry_result: Option<bool>,
+        retry_result: Option<RetryOutcome>,
         complete_result: Option<bool>,
         abandon_result: Option<bool>,
         stats: Option<Stats>,
+        stats_error: bool,
     }
 
     #[async_trait]
@@ -384,8 +389,11 @@ mod tests {
             Ok(self.external_pending.clone())
         }
 
-        async fn retry_delivery(&self, _id: i64) -> outbox_dispatcher_core::error::Result<bool> {
-            Ok(self.retry_result.unwrap_or(false))
+        async fn retry_delivery(
+            &self,
+            _id: i64,
+        ) -> outbox_dispatcher_core::error::Result<RetryOutcome> {
+            Ok(self.retry_result.unwrap_or(RetryOutcome::NotFound))
         }
 
         async fn complete_delivery(&self, _id: i64) -> outbox_dispatcher_core::error::Result<bool> {
@@ -406,6 +414,9 @@ mod tests {
         }
 
         async fn fetch_stats(&self) -> outbox_dispatcher_core::error::Result<Stats> {
+            if self.stats_error {
+                return Err(Error::Database(sqlx::Error::RowNotFound));
+            }
             Ok(self.stats.clone().unwrap_or_else(|| Stats {
                 events_total: 0,
                 deliveries_pending: 0,
@@ -443,10 +454,10 @@ mod tests {
     // ── Auth tests ─────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn health_requires_auth() {
+    async fn health_returns_200_without_auth() {
         let app = build_test_app(MockRepo::default());
         let resp = send_request(app, Method::GET, "/health", None).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -457,9 +468,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_endpoint_rejected_without_auth() {
+        let app = build_test_app(MockRepo::default());
+        let resp = send_request(app, Method::GET, "/v1/dead-letters", None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn wrong_token_rejected() {
         let app = build_test_app(MockRepo::default());
-        let resp = send_request(app, Method::GET, "/health", Some("wrong-token")).await;
+        let resp = send_request(app, Method::GET, "/v1/dead-letters", Some("wrong-token")).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -468,7 +486,8 @@ mod tests {
     #[tokio::test]
     async fn ready_ok_when_all_checks_pass() {
         let app = build_test_app(MockRepo::default());
-        let resp = send_request(app, Method::GET, "/ready", Some("test-token")).await;
+        // /ready is public — no token needed.
+        let resp = send_request(app, Method::GET, "/ready", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -481,7 +500,7 @@ mod tests {
             ready_deadline: Duration::from_secs(60),
         };
         let app = build_router(state, "test-token".to_string());
-        let resp = send_request(app, Method::GET, "/ready", Some("test-token")).await;
+        let resp = send_request(app, Method::GET, "/ready", None).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -494,7 +513,7 @@ mod tests {
             ready_deadline: Duration::from_secs(60),
         };
         let app = build_router(state, "test-token".to_string());
-        let resp = send_request(app, Method::GET, "/ready", Some("test-token")).await;
+        let resp = send_request(app, Method::GET, "/ready", None).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -533,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn retry_delivery_not_found_returns_404() {
         let app = build_test_app(MockRepo {
-            retry_result: Some(false),
+            retry_result: Some(RetryOutcome::NotFound),
             ..MockRepo::default()
         });
         let resp = send_request(
@@ -549,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn retry_delivery_found_returns_200() {
         let app = build_test_app(MockRepo {
-            retry_result: Some(true),
+            retry_result: Some(RetryOutcome::Reset),
             ..MockRepo::default()
         });
         let resp = send_request(
@@ -560,6 +579,22 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn retry_delivery_locked_returns_409() {
+        let app = build_test_app(MockRepo {
+            retry_result: Some(RetryOutcome::Locked),
+            ..MockRepo::default()
+        });
+        let resp = send_request(
+            app,
+            Method::POST,
+            "/v1/deliveries/1/retry",
+            Some("test-token"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     // ── /v1/deliveries/{id}/complete ──────────────────────────────────────────
@@ -612,5 +647,15 @@ mod tests {
         assert!(json["events_total"].is_number());
         assert!(json["deliveries_pending"].is_number());
         assert!(json["callbacks"].is_object());
+    }
+
+    #[tokio::test]
+    async fn stats_returns_500_on_repo_error() {
+        let app = build_test_app(MockRepo {
+            stats_error: true,
+            ..MockRepo::default()
+        });
+        let resp = send_request(app, Method::GET, "/v1/stats", Some("test-token")).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

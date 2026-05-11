@@ -236,7 +236,7 @@ mod tests {
     use super::*;
     use crate::schema::{
         CallbackTarget, CompletionMode, DeadLetterRow, DueDelivery, EventWithDeliveries,
-        ExternalPendingRow, PageParams, RawEvent, SweepReport,
+        ExternalPendingRow, PageParams, RawEvent, RetryOutcome, SweepReport,
     };
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -418,8 +418,8 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn retry_delivery(&self, _: i64) -> Result<bool> {
-            Ok(false)
+        async fn retry_delivery(&self, _: i64) -> Result<RetryOutcome> {
+            Ok(RetryOutcome::NotFound)
         }
 
         async fn complete_delivery(&self, _: i64) -> Result<bool> {

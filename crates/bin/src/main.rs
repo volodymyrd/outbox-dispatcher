@@ -13,7 +13,7 @@ use outbox_dispatcher_http_callback::HttpCallback;
 use sqlx::PgPool;
 use sqlx::postgres::{PgListener, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Migrations embedded at compile time from the workspace-root `migrations/` directory.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -167,21 +167,30 @@ async fn run() -> Result<()> {
                 ),
             };
             let admin_router = build_router(admin_state, admin_token);
-            let admin_shutdown = shutdown.clone();
+            let admin_shutdown_signal = shutdown.clone();
+            let admin_shutdown_trigger = shutdown.clone();
             tokio::spawn(async move {
                 let addr: std::net::SocketAddr = admin_bind
                     .parse()
                     .expect("admin.bind was validated at startup");
                 info!(bind = %addr, "admin API listening");
-                let listener = tokio::net::TcpListener::bind(addr)
-                    .await
-                    .expect("failed to bind admin API listener");
-                axum::serve(listener, admin_router)
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!(error = %e, "failed to bind admin API listener; shutting down");
+                        admin_shutdown_trigger.cancel();
+                        return;
+                    }
+                };
+                if let Err(e) = axum::serve(listener, admin_router)
                     .with_graceful_shutdown(async move {
-                        admin_shutdown.cancelled().await;
+                        admin_shutdown_signal.cancelled().await;
                     })
                     .await
-                    .expect("admin API server error");
+                {
+                    error!(error = %e, "admin API server error; shutting down");
+                    admin_shutdown_trigger.cancel();
+                }
             });
 
             info!("starting scheduler");

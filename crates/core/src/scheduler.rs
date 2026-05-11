@@ -597,8 +597,8 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn retry_delivery(&self, _id: i64) -> crate::error::Result<bool> {
-            Ok(false)
+        async fn retry_delivery(&self, _id: i64) -> crate::error::Result<crate::schema::RetryOutcome> {
+            Ok(crate::schema::RetryOutcome::NotFound)
         }
 
         async fn complete_delivery(&self, _id: i64) -> crate::error::Result<bool> {

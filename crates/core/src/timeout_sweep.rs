@@ -150,8 +150,8 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn retry_delivery(&self, _: i64) -> CoreResult<bool> {
-            Ok(false)
+        async fn retry_delivery(&self, _: i64) -> CoreResult<crate::schema::RetryOutcome> {
+            Ok(crate::schema::RetryOutcome::NotFound)
         }
 
         async fn complete_delivery(&self, _: i64) -> CoreResult<bool> {

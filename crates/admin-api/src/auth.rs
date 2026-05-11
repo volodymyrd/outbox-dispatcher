@@ -21,8 +21,9 @@ pub async fn require_bearer_token(request: Request, next: Next) -> Response {
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|provided| {
+        .and_then(|s| s.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, provided)| {
             // Constant-time comparison: both slices padded to the longer length so
             // the comparison never short-circuits on length mismatch alone.
             let provided_bytes = provided.as_bytes();
@@ -122,6 +123,18 @@ mod tests {
         assert_eq!(
             send(app, Some("Bearer something")).await,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_accepted_case_insensitively() {
+        assert_eq!(
+            send(build_app("secret-token"), Some("bearer secret-token")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(build_app("secret-token"), Some("BEARER secret-token")).await,
+            StatusCode::OK
         );
     }
 

@@ -245,6 +245,17 @@ pub struct StatsRow {
     pub dead_lettered: i64,
 }
 
+/// Outcome of an admin retry request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryOutcome {
+    /// Row reset; will be picked up by the next dispatcher cycle.
+    Reset,
+    /// No delivery row with this id.
+    NotFound,
+    /// Row is currently locked by an in-flight dispatcher; refused to avoid double-dispatch.
+    Locked,
+}
+
 /// Metrics report from the external-completion timeout sweeper.
 #[derive(Debug, Default)]
 pub struct SweepReport {
