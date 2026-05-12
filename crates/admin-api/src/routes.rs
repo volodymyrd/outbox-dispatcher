@@ -433,6 +433,23 @@ mod tests {
                 callbacks: HashMap::new(),
             }))
         }
+
+        async fn delete_terminal_events(
+            &self,
+            _dead_letter_cutoff: chrono::DateTime<chrono::Utc>,
+            _processed_cutoff: chrono::DateTime<chrono::Utc>,
+            _batch_limit: i64,
+        ) -> outbox_dispatcher_core::error::Result<u64> {
+            Ok(0)
+        }
+
+        async fn oldest_terminal_event_age_seconds(
+            &self,
+            _dead_letter_cutoff: chrono::DateTime<chrono::Utc>,
+            _processed_cutoff: chrono::DateTime<chrono::Utc>,
+        ) -> outbox_dispatcher_core::error::Result<Option<f64>> {
+            Ok(None)
+        }
     }
 
     fn build_test_app(repo: MockRepo) -> Router {

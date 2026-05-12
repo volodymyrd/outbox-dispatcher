@@ -24,6 +24,7 @@ use tracing::{debug, error, warn};
 
 use crate::config::DispatchConfig;
 use crate::error::Result;
+use crate::metrics;
 use crate::repo::Repo;
 use crate::retry::compute_next_available_at;
 use crate::schema::{CallbackError, CallbackTarget, CompletionMode, DueDelivery, EventForDelivery};
@@ -105,6 +106,9 @@ async fn dispatch_one(
     config: &DispatchConfig,
     due: DueDelivery,
 ) {
+    let cb_name = due.target.name.as_str();
+    let mode_str = due.target.mode.as_str();
+
     // ── Lock the row before invoking the callback ─────────────────────────────
     //
     // `locked_until` bounds the duplicate-dispatch window across replicas and
@@ -129,44 +133,56 @@ async fn dispatch_one(
     let event = build_event_for_delivery(&due);
 
     // ── Invoke the callback under a per-callback timeout ──────────────────────
+    let dispatch_start = std::time::Instant::now();
     let result =
         tokio::time::timeout(due.target.timeout, callback.deliver(&due.target, &event)).await;
+    let elapsed_secs = dispatch_start.elapsed().as_secs_f64();
 
     // ── Write result back ─────────────────────────────────────────────────────
     match result {
         // 2xx — success
-        Ok(Ok(())) => match due.target.mode {
-            CompletionMode::Managed => {
-                if let Err(e) = repo.mark_dispatched_managed(due.delivery_id).await {
-                    error!(
-                        delivery_id = due.delivery_id,
-                        error = %e,
-                        "failed to mark delivery as managed-dispatched"
-                    );
+        Ok(Ok(())) => {
+            metrics::record_dispatch_duration(cb_name, mode_str, elapsed_secs);
+            metrics::inc_deliveries_total(cb_name, mode_str, metrics::result::OK);
+
+            match due.target.mode {
+                CompletionMode::Managed => {
+                    if let Err(e) = repo.mark_dispatched_managed(due.delivery_id).await {
+                        error!(
+                            delivery_id = due.delivery_id,
+                            error = %e,
+                            "failed to mark delivery as managed-dispatched"
+                        );
+                    }
+                }
+                CompletionMode::External => {
+                    if let Err(e) = repo.mark_dispatched_external(due.delivery_id).await {
+                        error!(
+                            delivery_id = due.delivery_id,
+                            error = %e,
+                            "failed to mark delivery as external-dispatched"
+                        );
+                    }
                 }
             }
-            CompletionMode::External => {
-                if let Err(e) = repo.mark_dispatched_external(due.delivery_id).await {
-                    error!(
-                        delivery_id = due.delivery_id,
-                        error = %e,
-                        "failed to mark delivery as external-dispatched"
-                    );
-                }
-            }
-        },
+        }
 
         // Transient failure from the callback implementation
         Ok(Err(CallbackError::Transient {
             reason,
             retry_after,
         })) => {
+            metrics::record_dispatch_duration(cb_name, mode_str, elapsed_secs);
+            metrics::inc_deliveries_total(cb_name, mode_str, metrics::result::TRANSIENT);
+
             let next_attempt = due.attempts + 1;
             let next_available =
                 compute_next_available_at(next_attempt, retry_after, &due.target.backoff);
             let dead = next_attempt >= due.target.max_attempts as i32;
 
             if dead {
+                metrics::inc_dead_letters_total(cb_name);
+                metrics::inc_completion_cycles_exhausted_total(cb_name);
                 warn!(
                     delivery_id = due.delivery_id,
                     attempts = next_attempt,
@@ -197,6 +213,9 @@ async fn dispatch_one(
 
         // Tokio timeout — treat as a transient failure
         Err(_timeout) => {
+            metrics::record_dispatch_duration(cb_name, mode_str, elapsed_secs);
+            metrics::inc_deliveries_total(cb_name, mode_str, metrics::result::TIMEOUT);
+
             let next_attempt = due.attempts + 1;
             let next_available = compute_next_available_at(next_attempt, None, &due.target.backoff);
             let dead = next_attempt >= due.target.max_attempts as i32;
@@ -208,6 +227,8 @@ async fn dispatch_one(
             );
 
             if dead {
+                metrics::inc_dead_letters_total(cb_name);
+                metrics::inc_completion_cycles_exhausted_total(cb_name);
                 warn!(
                     delivery_id = due.delivery_id,
                     max_attempts = due.target.max_attempts,
@@ -447,6 +468,23 @@ mod tests {
 
         async fn ping(&self) -> Result<()> {
             Ok(())
+        }
+
+        async fn delete_terminal_events(
+            &self,
+            _dead_letter_cutoff: DateTime<Utc>,
+            _processed_cutoff: DateTime<Utc>,
+            _batch_limit: i64,
+        ) -> Result<u64> {
+            Ok(0)
+        }
+
+        async fn oldest_terminal_event_age_seconds(
+            &self,
+            _dead_letter_cutoff: DateTime<Utc>,
+            _processed_cutoff: DateTime<Utc>,
+        ) -> Result<Option<f64>> {
+            Ok(None)
         }
     }
 

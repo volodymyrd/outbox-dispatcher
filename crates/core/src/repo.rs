@@ -122,6 +122,30 @@ pub trait Repo: Send + Sync {
 
     /// Returns aggregate delivery counts for the stats endpoint.
     async fn fetch_stats(&self) -> Result<Stats>;
+
+    // ── Retention ──────────────────────────────────────────────────────────
+
+    /// Deletes up to `batch_limit` fully-terminal events whose age exceeds the
+    /// relevant retention window. Returns the number of deleted event rows
+    /// (deliveries are removed via `ON DELETE CASCADE`).
+    ///
+    /// `dead_letter_cutoff` = now() − dead_letter_retention_days  
+    /// `processed_cutoff`   = now() − processed_retention_days
+    async fn delete_terminal_events(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+        batch_limit: i64,
+    ) -> Result<u64>;
+
+    /// Returns the age in seconds of the oldest retention-eligible event still
+    /// present (i.e. all deliveries terminal, older than the shortest retention
+    /// window). Returns `None` when no eligible events exist or retention is off.
+    async fn oldest_terminal_event_age_seconds(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+    ) -> Result<Option<f64>>;
 }
 
 // ── Postgres implementation ────────────────────────────────────────────────────
@@ -829,6 +853,90 @@ impl Repo for PgRepo {
             oldest_pending_age_seconds: totals.oldest_pending_age_seconds,
             callbacks,
         })
+    }
+
+    async fn delete_terminal_events(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+        batch_limit: i64,
+    ) -> Result<u64> {
+        // Delete up to `batch_limit` fully-terminal events past their retention window.
+        // Foreign key `ON DELETE CASCADE` removes the delivery rows automatically.
+        //
+        // An event is terminal when no delivery is still in-flight:
+        //   processed_at IS NOT NULL  OR  dead_letter = TRUE
+        // (external rows awaiting completion are NOT terminal — dispatched_at IS NOT NULL
+        //  AND processed_at IS NULL AND dead_letter = FALSE)
+        //
+        // The longer window (dead_letter) applies when any delivery is dead-lettered.
+        let rows_affected = sqlx::query_scalar!(
+            r#"
+            WITH candidates AS (
+                SELECT e.id
+                FROM outbox_events e
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM outbox_deliveries d
+                    WHERE d.event_id = e.event_id
+                      AND d.processed_at IS NULL
+                      AND d.dead_letter   = FALSE
+                )
+                AND e.created_at < CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM outbox_deliveries d
+                        WHERE d.event_id = e.event_id
+                          AND d.dead_letter = TRUE
+                    ) THEN $1::timestamptz
+                    ELSE $2::timestamptz
+                END
+                ORDER BY e.id
+                LIMIT $3
+            )
+            DELETE FROM outbox_events
+            WHERE id IN (SELECT id FROM candidates)
+            RETURNING id
+            "#,
+            dead_letter_cutoff,
+            processed_cutoff,
+            batch_limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows_affected.len() as u64)
+    }
+
+    async fn oldest_terminal_event_age_seconds(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        let age: Option<f64> = sqlx::query_scalar!(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (now() - MIN(e.created_at)))::float8
+            FROM outbox_events e
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM outbox_deliveries d
+                WHERE d.event_id = e.event_id
+                  AND d.processed_at IS NULL
+                  AND d.dead_letter   = FALSE
+            )
+            AND e.created_at < CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM outbox_deliveries d
+                    WHERE d.event_id = e.event_id
+                      AND d.dead_letter = TRUE
+                ) THEN $1::timestamptz
+                ELSE $2::timestamptz
+            END
+            "#,
+            dead_letter_cutoff,
+            processed_cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(age)
     }
 }
 

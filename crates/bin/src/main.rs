@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use outbox_dispatcher_admin_api::{AdminState, build_router};
 use outbox_dispatcher_core::{
-    AppConfig, DatabaseConfig, DispatchConfig, KeyRing, LogConfig, LogFormat, PgRepo,
-    run_scheduler_with_cycle_tracker,
+    AppConfig, DatabaseConfig, DispatchConfig, KeyRing, LogConfig, LogFormat, ObservabilityConfig,
+    PgRepo, run_retention_worker, run_scheduler_with_cycle_tracker, schedule_new_deliveries,
 };
 use outbox_dispatcher_http_callback::HttpCallback;
 use sqlx::PgPool;
@@ -38,6 +38,15 @@ enum Command {
     Migrations {
         #[command(subcommand)]
         action: MigrationsAction,
+    },
+    /// Re-scan outbox_events since a given timestamp and ensure deliveries exist.
+    ///
+    /// Idempotent — safe to run multiple times. Useful after a crash during
+    /// scheduling or after restoring a database backup that rewound the cursor.
+    Rescan {
+        /// ISO-8601 timestamp to scan from (e.g. "2026-01-01T00:00:00Z").
+        #[arg(long)]
+        since: String,
     },
 }
 
@@ -84,7 +93,7 @@ async fn run() -> Result<()> {
         }
     };
 
-    init_tracing(&config.log).context("initialising tracing subscriber")?;
+    init_tracing(&config.log, &config.observability).context("initialising tracing subscriber")?;
     info!(env = %app_env, "outbox-dispatcher starting");
 
     if config.dispatch.allow_insecure_urls {
@@ -117,6 +126,63 @@ async fn run() -> Result<()> {
             return Ok(());
         }
 
+        Some(Command::Rescan { since }) => {
+            let since_ts = since
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .with_context(|| {
+                    format!(
+                        "invalid --since timestamp '{since}'; \
+                         use ISO-8601, e.g. 2026-01-01T00:00:00Z"
+                    )
+                })?;
+
+            let pool = connect_pool(&config.database).await?;
+            if !cli.skip_migrations {
+                run_migrations(&pool).await?;
+            }
+            validate_schema(&pool).await?;
+
+            let dispatch_config = DispatchConfig::from(config.dispatch.clone());
+            let repo = Arc::new(PgRepo::new(pool.clone(), dispatch_config.clone()));
+
+            // Find the cursor starting point: highest event id with created_at < since_ts.
+            let cursor: i64 = sqlx::query_scalar!(
+                r#"SELECT COALESCE(MAX(id), 0) AS "id!" FROM outbox_events WHERE created_at < $1"#,
+                since_ts,
+            )
+            .fetch_one(&pool)
+            .await
+            .context("querying rescan start cursor")?;
+
+            info!(
+                since = %since_ts,
+                start_cursor = cursor,
+                "starting rescan"
+            );
+
+            // Iterate events in batches, calling ensure_deliveries for each.
+            let mut current_cursor = cursor;
+            let mut total_batches = 0u64;
+            loop {
+                let new_cursor =
+                    schedule_new_deliveries(repo.as_ref(), &dispatch_config, current_cursor)
+                        .await
+                        .context("rescan batch failed")?;
+                if new_cursor == current_cursor {
+                    break; // no more events
+                }
+                current_cursor = new_cursor;
+                total_batches += 1;
+            }
+
+            info!(
+                batches = total_batches,
+                final_cursor = current_cursor,
+                "rescan complete"
+            );
+            return Ok(());
+        }
+
         None => {
             let pool = connect_pool(&config.database).await?;
 
@@ -125,6 +191,9 @@ async fn run() -> Result<()> {
             }
 
             validate_schema(&pool).await?;
+
+            // Install the Prometheus metrics exporter before starting any workers.
+            init_metrics(&config.observability).context("initialising Prometheus exporter")?;
 
             let dispatch_config = DispatchConfig::from(config.dispatch.clone());
             let repo = Arc::new(PgRepo::new(pool.clone(), dispatch_config.clone()));
@@ -192,6 +261,16 @@ async fn run() -> Result<()> {
                     admin_shutdown_trigger.cancel();
                 }
             });
+
+            // Spawn the optional retention worker (disabled by default).
+            if config.retention.enabled {
+                let retention_repo = repo.clone();
+                let retention_cfg = config.retention.clone();
+                let retention_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    run_retention_worker(retention_repo, retention_cfg, retention_shutdown).await;
+                });
+            }
 
             info!("starting scheduler");
             run_scheduler_with_cycle_tracker(
@@ -280,25 +359,84 @@ async fn connect_pool(db: &DatabaseConfig) -> Result<PgPool> {
 
 // ── Observability ──────────────────────────────────────────────────────────────
 
-fn init_tracing(log: &LogConfig) -> Result<()> {
+fn init_tracing(log: &LogConfig, obs: &ObservabilityConfig) -> Result<()> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     let filter = tracing_subscriber::EnvFilter::try_new(
         std::env::var("RUST_LOG").unwrap_or_else(|_| log.filter.clone()),
     )
     .context("invalid log filter directive")?;
-    match log.format {
-        LogFormat::Json => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
-        }
-        LogFormat::Pretty => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .try_init()
-                .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
+
+    // Optionally attach an OpenTelemetry tracing layer when an OTLP endpoint is configured.
+    // We build two code paths (with/without OTel) to avoid complex type-erasure.
+    if !obs.otel_endpoint.is_empty() {
+        use opentelemetry_otlp::WithExportConfig;
+
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(&obs.otel_endpoint)
+            .build()
+            .context("building OTLP span exporter")?;
+
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .build();
+
+        // Obtain the tracer before moving the provider into the global registry.
+        let tracer =
+            opentelemetry::trace::TracerProvider::tracer(&tracer_provider, "outbox-dispatcher");
+        opentelemetry::global::set_tracer_provider(tracer_provider);
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        // fmt layer and otel layer must both be added to the same subscriber base.
+        // Using `json()` or plain fmt both work; otel layer is indifferent to field format.
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(otel_layer)
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
+
+        info!(endpoint = %obs.otel_endpoint, "OpenTelemetry tracing enabled");
+    } else {
+        match log.format {
+            LogFormat::Json => {
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(filter)
+                    .try_init()
+                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
+            }
+            LogFormat::Pretty => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .try_init()
+                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
+            }
         }
     }
+
+    Ok(())
+}
+
+/// Install the Prometheus metrics exporter and start the scrape HTTP listener.
+///
+/// The exporter listens on `obs.metrics_bind` and serves the standard `/metrics`
+/// endpoint. The listener runs in a background thread managed by the exporter.
+fn init_metrics(obs: &ObservabilityConfig) -> Result<()> {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    let addr: std::net::SocketAddr = obs
+        .metrics_bind
+        .parse()
+        .context("parsing observability.metrics_bind")?;
+
+    PrometheusBuilder::new()
+        .with_http_listener(addr)
+        .install()
+        .context("installing Prometheus metrics exporter")?;
+
+    info!(bind = %addr, "Prometheus metrics endpoint listening");
     Ok(())
 }

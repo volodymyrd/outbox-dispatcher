@@ -14,12 +14,14 @@ use tracing::{info, warn};
 
 use crate::config::DispatchConfig;
 use crate::error::Result;
+use crate::metrics;
 use crate::repo::Repo;
 
 /// Run one sweep cycle: reset hung external-mode rows and/or dead-letter exhausted ones.
 ///
-/// Logs outcomes and returns the `SweepReport` for metrics (Phase 7). Errors from
-/// the repo are returned to the caller so the main loop can decide how to handle them.
+/// Emits `outbox_external_timeout_resets_total` and `outbox_completion_cycles_exhausted_total`
+/// metrics. Errors from the repo are returned to the caller so the main loop can decide
+/// how to handle them.
 pub async fn sweep_hung_external(repo: &dyn Repo, config: &DispatchConfig) -> Result<()> {
     let report = repo
         .reset_hung_external(Utc::now(), config.max_completion_cycles as i32)
@@ -30,12 +32,19 @@ pub async fn sweep_hung_external(repo: &dyn Repo, config: &DispatchConfig) -> Re
             reset = report.reset,
             "external timeout sweep reset deliveries for redelivery"
         );
+        // We don't have per-callback counts from the sweeper, so use "_all" as label.
+        for _ in 0..report.reset {
+            metrics::inc_external_timeout_resets_total("_all");
+        }
     }
     if report.exhausted > 0 {
         warn!(
             exhausted = report.exhausted,
             "external timeout sweep dead-lettered rows after max_completion_cycles"
         );
+        for _ in 0..report.exhausted {
+            metrics::inc_completion_cycles_exhausted_total("_all");
+        }
     }
     Ok(())
 }
@@ -179,6 +188,23 @@ mod tests {
 
         async fn ping(&self) -> CoreResult<()> {
             Ok(())
+        }
+
+        async fn delete_terminal_events(
+            &self,
+            _dead_letter_cutoff: DateTime<chrono::Utc>,
+            _processed_cutoff: DateTime<chrono::Utc>,
+            _batch_limit: i64,
+        ) -> CoreResult<u64> {
+            Ok(0)
+        }
+
+        async fn oldest_terminal_event_age_seconds(
+            &self,
+            _dead_letter_cutoff: DateTime<chrono::Utc>,
+            _processed_cutoff: DateTime<chrono::Utc>,
+        ) -> CoreResult<Option<f64>> {
+            Ok(None)
         }
     }
 

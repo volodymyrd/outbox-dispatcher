@@ -3,7 +3,9 @@ pub mod config;
 pub mod dispatch;
 pub mod error;
 pub mod keyring;
+pub mod metrics;
 pub mod repo;
+pub mod retention;
 pub mod retry;
 pub mod scheduler;
 pub mod schema;
@@ -15,12 +17,13 @@ pub use callbacks::{
 };
 pub use config::{
     AdminConfig, AppConfig, DatabaseConfig, DispatchConfig, HttpClientConfig, LogConfig, LogFormat,
-    RetentionConfig, SigningKeyConfig,
+    ObservabilityConfig, RetentionConfig, SigningKeyConfig,
 };
 pub use dispatch::{Callback, dispatch_due};
 pub use error::{Error, Result, ValidationErrors};
 pub use keyring::KeyRing;
 pub use repo::{PgRepo, Repo};
+pub use retention::{RetentionReport, run_retention_worker};
 pub use retry::compute_next_available_at;
 pub use scheduler::{
     LastCycleAt, ListenerStatus, run_scheduler, run_scheduler_with_cycle_tracker,

@@ -27,6 +27,7 @@ use crate::callbacks::{parse_callbacks, payload_too_large_error};
 use crate::config::DispatchConfig;
 use crate::dispatch::{Callback, dispatch_due};
 use crate::error::Result;
+use crate::metrics;
 use crate::repo::Repo;
 use crate::timeout_sweep::sweep_hung_external;
 use sqlx::postgres::PgListener;
@@ -102,6 +103,7 @@ pub async fn run_scheduler_with_cycle_tracker(
         })?;
 
     listener_status.store(true, Ordering::Release);
+    metrics::set_listener_connection_status(true);
     info!(channel = %config.notify_channel, "LISTEN connection established");
 
     // Recover the event cursor so we don't re-process already-scheduled events.
@@ -127,6 +129,7 @@ pub async fn run_scheduler_with_cycle_tracker(
             _ = shutdown.cancelled() => {
                 info!("scheduler received shutdown signal, stopping");
                 listener_status.store(false, Ordering::Release);
+                metrics::set_listener_connection_status(false);
                 return Ok(());
             }
 
@@ -140,12 +143,14 @@ pub async fn run_scheduler_with_cycle_tracker(
                             "received NOTIFY",
                         );
                         listener_status.store(true, Ordering::Release);
+                        metrics::set_listener_connection_status(true);
                     }
                     Err(e) => {
                         // sqlx PgListener reconnects automatically; we update the status
                         // gauge and let the poll-timer keep us functional.
                         warn!(error = %e, "LISTEN connection lost; will rely on poll-timer until reconnected");
                         listener_status.store(false, Ordering::Release);
+                        metrics::set_listener_connection_status(false);
                     }
                 }
             }
@@ -188,10 +193,12 @@ pub async fn run_scheduler_with_cycle_tracker(
         }
 
         // ── Step 2: dispatch due deliveries ───────────────────────────────────
+        let cycle_start = std::time::Instant::now();
         if let Err(e) = dispatch_due(repo.as_ref(), callback.as_ref(), &config).await {
             error!(error = %e, "error fetching due deliveries for dispatch");
             // Non-fatal: individual dispatch failures are handled inside dispatch_due.
         }
+        metrics::record_cycle_duration(cycle_start.elapsed().as_secs_f64());
 
         // ── Step 3: external-completion timeout sweep (rate-limited) ─────────
         if last_sweep.elapsed() >= sweep_interval {
@@ -252,6 +259,7 @@ pub async fn schedule_new_deliveries(
                 limit_bytes = config.payload_size_limit_bytes,
                 "payload too large — dead-lettering all callbacks"
             );
+            metrics::inc_payload_size_rejections_total(&event.kind);
             let names = extract_callback_names(&event.callbacks);
             let entries: Vec<(String, String)> =
                 names.into_iter().map(|n| (n, reason.clone())).collect();
@@ -294,6 +302,16 @@ pub async fn schedule_new_deliveries(
                     .into_iter()
                     .map(|n| (n, reason.clone()))
                     .collect();
+                for (_, r) in &entries {
+                    // Extract the short reason prefix for the metric label.
+                    let label = r
+                        .strip_prefix("invalid_callback: ")
+                        .unwrap_or(r.as_str())
+                        .split(':')
+                        .next()
+                        .unwrap_or("unknown");
+                    metrics::inc_invalid_callbacks_total(label);
+                }
                 repo.create_invalid_deliveries(event.event_id, &entries)
                     .await?;
             } else {
@@ -303,9 +321,24 @@ pub async fn schedule_new_deliveries(
                     callbacks_json = %event.callbacks,
                     "callbacks JSONB is structurally corrupt — skipping event (poison pill)"
                 );
+                metrics::inc_corrupted_rows_total(metrics::stage::SCHEDULE);
             }
             new_cursor = event.id;
             continue;
+        }
+
+        // Emit events_total once per successfully-parsed event.
+        metrics::inc_events_total(&event.kind);
+
+        // Emit invalid_callbacks_total for each structurally invalid callback.
+        for (_, reason) in &parsed.invalid {
+            let label = reason
+                .strip_prefix("invalid_callback: ")
+                .unwrap_or(reason.as_str())
+                .split(':')
+                .next()
+                .unwrap_or("unknown");
+            metrics::inc_invalid_callbacks_total(label);
         }
 
         // Schedule valid callbacks. Propagate DB errors so the cursor stays at the last
@@ -635,6 +668,23 @@ mod tests {
                 oldest_pending_age_seconds: None,
                 callbacks: std::collections::HashMap::new(),
             })
+        }
+
+        async fn delete_terminal_events(
+            &self,
+            _dead_letter_cutoff: chrono::DateTime<Utc>,
+            _processed_cutoff: chrono::DateTime<Utc>,
+            _batch_limit: i64,
+        ) -> crate::error::Result<u64> {
+            Ok(0)
+        }
+
+        async fn oldest_terminal_event_age_seconds(
+            &self,
+            _dead_letter_cutoff: chrono::DateTime<Utc>,
+            _processed_cutoff: chrono::DateTime<Utc>,
+        ) -> crate::error::Result<Option<f64>> {
+            Ok(None)
         }
     }
 

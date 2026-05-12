@@ -345,6 +345,32 @@ impl Default for RetentionConfig {
     }
 }
 
+// ── Observability ─────────────────────────────────────────────────────────────
+
+fn default_metrics_bind() -> String {
+    "0.0.0.0:9091".to_string()
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// Socket address to expose the Prometheus `/metrics` scrape endpoint.
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: String,
+    /// OTLP gRPC endpoint for OpenTelemetry traces. If empty, tracing is disabled.
+    #[serde(default)]
+    pub otel_endpoint: String,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            metrics_bind: default_metrics_bind(),
+            otel_endpoint: String::new(),
+        }
+    }
+}
+
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -362,6 +388,8 @@ pub struct AppConfig {
     pub http_client: HttpClientConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 // ── Validation bounds (centralised so conditions and error messages stay in sync) ──
@@ -568,6 +596,18 @@ impl AppConfig {
                     "retention.batch_limit must be between 1 and {MAX_RETENTION_BATCH}"
                 ));
             }
+        }
+        if self
+            .observability
+            .metrics_bind
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
+            errors.push(format!(
+                "observability.metrics_bind '{}' is not a valid socket address \
+                 (expected IP:port, e.g. 0.0.0.0:9091 or [::]:9091)",
+                self.observability.metrics_bind
+            ));
         }
 
         if errors.is_empty() {
@@ -1615,5 +1655,40 @@ filter = "info"
         }
 
         assert_eq!(cfg.database.url, "postgres://from-env/db");
+    }
+
+    // ── ObservabilityConfig ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_observability_defaults_when_absent() {
+        let cfg = build_config(full_toml());
+        assert_eq!(cfg.observability.metrics_bind, "0.0.0.0:9091");
+        assert_eq!(cfg.observability.otel_endpoint, "");
+    }
+
+    #[test]
+    fn test_observability_config_from_toml() {
+        let toml = format!(
+            "{}\n\n[observability]\nmetrics_bind = \"127.0.0.1:9091\"\notel_endpoint = \"http://localhost:4317\"",
+            full_toml()
+        );
+        let cfg = build_config(&toml);
+        assert_eq!(cfg.observability.metrics_bind, "127.0.0.1:9091");
+        assert_eq!(cfg.observability.otel_endpoint, "http://localhost:4317");
+    }
+
+    #[test]
+    fn test_validate_observability_metrics_bind_invalid() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.metrics_bind = "not-an-addr".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("metrics_bind")));
+    }
+
+    #[test]
+    fn test_validate_observability_metrics_bind_valid() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.metrics_bind = "0.0.0.0:9091".to_string();
+        assert!(cfg.validate().is_ok());
     }
 }
