@@ -176,6 +176,10 @@ mod tests {
                 callbacks: std::collections::HashMap::new(),
             })
         }
+
+        async fn ping(&self) -> CoreResult<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

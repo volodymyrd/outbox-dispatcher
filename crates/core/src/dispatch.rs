@@ -444,6 +444,10 @@ mod tests {
                 callbacks: std::collections::HashMap::new(),
             })
         }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
