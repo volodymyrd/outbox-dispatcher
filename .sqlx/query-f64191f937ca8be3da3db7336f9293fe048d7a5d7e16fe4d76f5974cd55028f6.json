@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE outbox_deliveries\n            SET attempts          = 0,\n                last_error        = NULL,\n                available_at      = now(),\n                dispatched_at     = NULL,\n                processed_at      = NULL,\n                completion_cycles = 0,\n                dead_letter       = FALSE,\n                locked_until      = NULL\n            WHERE id = $1\n              AND (locked_until IS NULL OR locked_until < now())\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f64191f937ca8be3da3db7336f9293fe048d7a5d7e16fe4d76f5974cd55028f6"
+}

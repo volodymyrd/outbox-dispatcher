@@ -1,17 +1,19 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use outbox_dispatcher_admin_api::{AdminState, build_router};
 use outbox_dispatcher_core::{
-    AppConfig, DatabaseConfig, DispatchConfig, KeyRing, LogConfig, LogFormat, PgRepo, run_scheduler,
+    AppConfig, DatabaseConfig, DispatchConfig, KeyRing, LogConfig, LogFormat, PgRepo,
+    run_scheduler_with_cycle_tracker,
 };
 use outbox_dispatcher_http_callback::HttpCallback;
 use sqlx::PgPool;
 use sqlx::postgres::{PgListener, PgPoolOptions};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Migrations embedded at compile time from the workspace-root `migrations/` directory.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -140,6 +142,9 @@ async fn run() -> Result<()> {
 
             let listener_status = Arc::new(AtomicBool::new(false));
 
+            // Shared state for the /ready endpoint: updated by the scheduler after each cycle.
+            let last_cycle_at = Arc::new(AtomicI64::new(0));
+
             // Graceful-shutdown token — wired to SIGTERM/SIGINT.
             let shutdown = CancellationToken::new();
             let shutdown_clone = shutdown.clone();
@@ -150,14 +155,53 @@ async fn run() -> Result<()> {
                 }
             });
 
+            // Spawn the admin HTTP server on a separate task.
+            let admin_bind = config.admin.bind.clone();
+            let admin_token = config.admin.auth_token.clone();
+            let admin_state = AdminState {
+                repo: repo.clone(),
+                listener_status: listener_status.clone(),
+                last_cycle_at: last_cycle_at.clone(),
+                ready_deadline: Duration::from_secs(
+                    config.dispatch.poll_interval_secs.saturating_mul(2),
+                ),
+            };
+            let admin_router = build_router(admin_state, admin_token);
+            let admin_shutdown_signal = shutdown.clone();
+            let admin_shutdown_trigger = shutdown.clone();
+            tokio::spawn(async move {
+                let addr: std::net::SocketAddr = admin_bind
+                    .parse()
+                    .expect("admin.bind was validated at startup");
+                info!(bind = %addr, "admin API listening");
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!(error = %e, "failed to bind admin API listener; shutting down");
+                        admin_shutdown_trigger.cancel();
+                        return;
+                    }
+                };
+                if let Err(e) = axum::serve(listener, admin_router)
+                    .with_graceful_shutdown(async move {
+                        admin_shutdown_signal.cancelled().await;
+                    })
+                    .await
+                {
+                    error!(error = %e, "admin API server error; shutting down");
+                    admin_shutdown_trigger.cancel();
+                }
+            });
+
             info!("starting scheduler");
-            run_scheduler(
+            run_scheduler_with_cycle_tracker(
                 repo,
                 callback,
                 dispatch_config,
                 listener,
                 listener_status,
                 shutdown,
+                Some(last_cycle_at),
             )
             .await
             .context("scheduler exited with error")?;

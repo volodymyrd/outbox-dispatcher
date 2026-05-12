@@ -236,7 +236,7 @@ mod tests {
     use super::*;
     use crate::schema::{
         CallbackTarget, CompletionMode, DeadLetterRow, DueDelivery, EventWithDeliveries,
-        ExternalPendingRow, PageParams, RawEvent, SweepReport,
+        ExternalPendingRow, PageParams, RawEvent, RetryOutcome, SweepReport,
     };
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -418,8 +418,8 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn retry_delivery(&self, _: i64) -> Result<bool> {
-            Ok(false)
+        async fn retry_delivery(&self, _: i64) -> Result<RetryOutcome> {
+            Ok(RetryOutcome::NotFound)
         }
 
         async fn complete_delivery(&self, _: i64) -> Result<bool> {
@@ -432,6 +432,21 @@ mod tests {
 
         async fn fetch_event_with_deliveries(&self, _: Uuid) -> Result<EventWithDeliveries> {
             Err(crate::error::Error::InvalidData("not found".into()))
+        }
+
+        async fn fetch_stats(&self) -> Result<crate::schema::Stats> {
+            Ok(crate::schema::Stats {
+                events_total: 0,
+                deliveries_pending: 0,
+                deliveries_external_pending: 0,
+                deliveries_dead_lettered: 0,
+                oldest_pending_age_seconds: None,
+                callbacks: std::collections::HashMap::new(),
+            })
+        }
+
+        async fn ping(&self) -> Result<()> {
+            Ok(())
         }
     }
 

@@ -8,8 +8,9 @@ use uuid::Uuid;
 use crate::config::DispatchConfig;
 use crate::error::Result;
 use crate::schema::{
-    CallbackTarget, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
-    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, SweepReport,
+    CallbackStats, CallbackTarget, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
+    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, RetryOutcome, Stats, StatsRow,
+    SweepReport,
 };
 
 #[async_trait]
@@ -102,11 +103,10 @@ pub trait Repo: Send + Sync {
 
     /// Resets all mutable columns so the delivery re-enters the pending queue.
     ///
-    /// Does not guard against an in-flight dispatcher that currently holds a lock on
-    /// this row. Callers (admin API) should ensure the row is not actively locked
-    /// before calling this. A `locked_until` guard will be added when the admin API
-    /// is implemented in Phase 6.
-    async fn retry_delivery(&self, id: i64) -> Result<bool>;
+    /// Refuses to reset a row that is currently locked by an in-flight dispatcher
+    /// (i.e. `locked_until IS NOT NULL AND locked_until >= now()`) and returns
+    /// [`RetryOutcome::Locked`] in that case to avoid double-dispatch.
+    async fn retry_delivery(&self, id: i64) -> Result<RetryOutcome>;
 
     /// Sets `processed_at = COALESCE(processed_at, now())`. Idempotent.
     async fn complete_delivery(&self, id: i64) -> Result<bool>;
@@ -115,6 +115,13 @@ pub trait Repo: Send + Sync {
     async fn abandon_delivery(&self, id: i64) -> Result<bool>;
 
     async fn fetch_event_with_deliveries(&self, event_id: Uuid) -> Result<EventWithDeliveries>;
+
+    /// Cheap database-reachability probe for `/ready`. Returns `Ok(())` if a trivial
+    /// round-trip to the database succeeds.
+    async fn ping(&self) -> Result<()>;
+
+    /// Returns aggregate delivery counts for the stats endpoint.
+    async fn fetch_stats(&self) -> Result<Stats>;
 }
 
 // ── Postgres implementation ────────────────────────────────────────────────────
@@ -596,7 +603,7 @@ impl Repo for PgRepo {
               AND ($2::text   IS NULL OR d.callback_name = $2)
               AND ($3::float8 IS NULL
                    OR EXTRACT(EPOCH FROM (now() - d.dispatched_at)) > $3)
-            ORDER BY d.dispatched_at
+            ORDER BY d.id DESC
             LIMIT $4
             "#,
             page.cursor,
@@ -610,7 +617,7 @@ impl Repo for PgRepo {
         Ok(rows)
     }
 
-    async fn retry_delivery(&self, id: i64) -> Result<bool> {
+    async fn retry_delivery(&self, id: i64) -> Result<RetryOutcome> {
         let result = sqlx::query!(
             r#"
             UPDATE outbox_deliveries
@@ -623,13 +630,28 @@ impl Repo for PgRepo {
                 dead_letter       = FALSE,
                 locked_until      = NULL
             WHERE id = $1
+              AND (locked_until IS NULL OR locked_until < now())
             "#,
             id,
         )
         .execute(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            return Ok(RetryOutcome::Reset);
+        }
+        // Distinguish "not found" from "locked" with a single follow-up SELECT.
+        let exists = sqlx::query_scalar!(
+            r#"SELECT EXISTS(SELECT 1 FROM outbox_deliveries WHERE id = $1) AS "exists!""#,
+            id,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(if exists {
+            RetryOutcome::Locked
+        } else {
+            RetryOutcome::NotFound
+        })
     }
 
     async fn complete_delivery(&self, id: i64) -> Result<bool> {
@@ -716,6 +738,97 @@ impl Repo for PgRepo {
         .await?;
 
         Ok(EventWithDeliveries { event, deliveries })
+    }
+
+    async fn ping(&self) -> Result<()> {
+        sqlx::query_scalar!(r#"SELECT 1 AS "one!""#)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn fetch_stats(&self) -> Result<Stats> {
+        let events_total: i64 =
+            sqlx::query_scalar!(r#"SELECT COUNT(*) AS "count!" FROM outbox_events"#)
+                .fetch_one(&self.pool)
+                .await?;
+
+        let totals = sqlx::query!(
+            r#"
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE dispatched_at IS NULL
+                      AND processed_at  IS NULL
+                      AND dead_letter   = FALSE
+                ) AS "pending!: i64",
+                COUNT(*) FILTER (
+                    WHERE completion_mode = 'external'
+                      AND dispatched_at   IS NOT NULL
+                      AND processed_at    IS NULL
+                      AND dead_letter     = FALSE
+                ) AS "external_pending!: i64",
+                COUNT(*) FILTER (
+                    WHERE dead_letter = TRUE
+                ) AS "dead_lettered!: i64",
+                EXTRACT(EPOCH FROM (
+                    now() - MIN(available_at) FILTER (
+                        WHERE dispatched_at IS NULL
+                          AND processed_at  IS NULL
+                          AND dead_letter   = FALSE
+                    )
+                ))::float8 AS oldest_pending_age_seconds
+            FROM outbox_deliveries
+            "#
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let rows = sqlx::query_as!(
+            StatsRow,
+            r#"
+            SELECT
+                callback_name,
+                COUNT(*) FILTER (
+                    WHERE dispatched_at IS NULL
+                      AND processed_at  IS NULL
+                      AND dead_letter   = FALSE
+                ) AS "pending!",
+                COUNT(*) FILTER (
+                    WHERE completion_mode = 'external'
+                      AND dispatched_at   IS NOT NULL
+                      AND processed_at    IS NULL
+                      AND dead_letter     = FALSE
+                ) AS "external_pending!",
+                COUNT(*) FILTER (
+                    WHERE dead_letter = TRUE
+                ) AS "dead_lettered!"
+            FROM outbox_deliveries
+            GROUP BY callback_name
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut callbacks = std::collections::HashMap::new();
+        for row in rows {
+            callbacks.insert(
+                row.callback_name,
+                CallbackStats {
+                    pending: row.pending,
+                    external_pending: row.external_pending,
+                    dead_lettered: row.dead_lettered,
+                },
+            );
+        }
+
+        Ok(Stats {
+            events_total,
+            deliveries_pending: totals.pending,
+            deliveries_external_pending: totals.external_pending,
+            deliveries_dead_lettered: totals.dead_lettered,
+            oldest_pending_age_seconds: totals.oldest_pending_age_seconds,
+            callbacks,
+        })
     }
 }
 

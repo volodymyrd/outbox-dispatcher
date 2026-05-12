@@ -215,6 +215,47 @@ pub struct RawEventSerializable {
     pub created_at: DateTime<Utc>,
 }
 
+/// Per-callback breakdown returned by `GET /v1/stats`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CallbackStats {
+    pub pending: i64,
+    pub external_pending: i64,
+    pub dead_lettered: i64,
+}
+
+/// Aggregate counts for `GET /v1/stats`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Stats {
+    pub events_total: i64,
+    pub deliveries_pending: i64,
+    pub deliveries_external_pending: i64,
+    pub deliveries_dead_lettered: i64,
+    /// Age of the oldest pending delivery in seconds, or `None` if none exist.
+    pub oldest_pending_age_seconds: Option<f64>,
+    /// Per-callback breakdown keyed by `callback_name`.
+    pub callbacks: std::collections::HashMap<String, CallbackStats>,
+}
+
+/// Internal row type returned by the stats query.
+#[derive(Debug, sqlx::FromRow)]
+pub struct StatsRow {
+    pub callback_name: String,
+    pub pending: i64,
+    pub external_pending: i64,
+    pub dead_lettered: i64,
+}
+
+/// Outcome of an admin retry request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryOutcome {
+    /// Row reset; will be picked up by the next dispatcher cycle.
+    Reset,
+    /// No delivery row with this id.
+    NotFound,
+    /// Row is currently locked by an in-flight dispatcher; refused to avoid double-dispatch.
+    Locked,
+}
+
 /// Metrics report from the external-completion timeout sweeper.
 #[derive(Debug, Default)]
 pub struct SweepReport {
