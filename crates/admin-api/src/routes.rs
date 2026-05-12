@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -23,7 +23,9 @@ pub struct AdminState {
     /// Reflects whether the LISTEN/NOTIFY connection is up.
     pub listener_status: Arc<AtomicBool>,
     /// Tracks when the last successful scheduler cycle completed.
-    pub last_cycle_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    ///
+    /// Stores milliseconds since the Unix epoch, or `0` if no cycle has completed yet.
+    pub last_cycle_at: Arc<AtomicI64>,
     /// `2 × poll_interval` — the readiness deadline for the last-cycle check.
     pub ready_deadline: Duration,
 }
@@ -73,14 +75,14 @@ struct ReadyResponse {
 }
 
 async fn ready(State(state): State<AdminState>) -> Response {
-    let db_reachable = state.repo.fetch_stats().await.is_ok();
+    let db_reachable = state.repo.ping().await.is_ok();
     let listener_up = state.listener_status.load(Ordering::Relaxed);
-    let last_cycle_ok = state
-        .last_cycle_at
-        .lock()
-        .unwrap()
-        .map(|t| t.elapsed() <= state.ready_deadline)
-        .unwrap_or(false);
+    let last_cycle_ok = {
+        let stored = state.last_cycle_at.load(Ordering::Acquire);
+        stored != 0
+            && chrono::Utc::now().timestamp_millis().saturating_sub(stored)
+                <= state.ready_deadline.as_millis() as i64
+    };
 
     let all_ok = db_reachable && listener_up && last_cycle_ok;
     let status_code = if all_ok {
@@ -270,7 +272,8 @@ mod tests {
         PageParams, RawEvent, RetryOutcome, Stats, SweepReport,
     };
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI64;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -413,6 +416,10 @@ mod tests {
                 .ok_or(Error::Database(sqlx::Error::RowNotFound))
         }
 
+        async fn ping(&self) -> outbox_dispatcher_core::error::Result<()> {
+            Ok(())
+        }
+
         async fn fetch_stats(&self) -> outbox_dispatcher_core::error::Result<Stats> {
             if self.stats_error {
                 return Err(Error::Database(sqlx::Error::RowNotFound));
@@ -432,7 +439,7 @@ mod tests {
         let state = AdminState {
             repo: Arc::new(repo),
             listener_status: Arc::new(AtomicBool::new(true)),
-            last_cycle_at: Arc::new(Mutex::new(Some(Instant::now()))),
+            last_cycle_at: Arc::new(AtomicI64::new(chrono::Utc::now().timestamp_millis())),
             ready_deadline: Duration::from_secs(60),
         };
         build_router(state, "test-token".to_string())
@@ -496,7 +503,7 @@ mod tests {
         let state = AdminState {
             repo: Arc::new(MockRepo::default()),
             listener_status: Arc::new(AtomicBool::new(true)),
-            last_cycle_at: Arc::new(Mutex::new(None)), // no cycle yet
+            last_cycle_at: Arc::new(AtomicI64::new(0)), // no cycle yet
             ready_deadline: Duration::from_secs(60),
         };
         let app = build_router(state, "test-token".to_string());
@@ -509,7 +516,7 @@ mod tests {
         let state = AdminState {
             repo: Arc::new(MockRepo::default()),
             listener_status: Arc::new(AtomicBool::new(false)), // listener down
-            last_cycle_at: Arc::new(Mutex::new(Some(Instant::now()))),
+            last_cycle_at: Arc::new(AtomicI64::new(chrono::Utc::now().timestamp_millis())),
             ready_deadline: Duration::from_secs(60),
         };
         let app = build_router(state, "test-token".to_string());

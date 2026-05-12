@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -143,7 +143,7 @@ async fn run() -> Result<()> {
             let listener_status = Arc::new(AtomicBool::new(false));
 
             // Shared state for the /ready endpoint: updated by the scheduler after each cycle.
-            let last_cycle_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+            let last_cycle_at = Arc::new(AtomicI64::new(0));
 
             // Graceful-shutdown token — wired to SIGTERM/SIGINT.
             let shutdown = CancellationToken::new();

@@ -116,6 +116,10 @@ pub trait Repo: Send + Sync {
 
     async fn fetch_event_with_deliveries(&self, event_id: Uuid) -> Result<EventWithDeliveries>;
 
+    /// Cheap database-reachability probe for `/ready`. Returns `Ok(())` if a trivial
+    /// round-trip to the database succeeds.
+    async fn ping(&self) -> Result<()>;
+
     /// Returns aggregate delivery counts for the stats endpoint.
     async fn fetch_stats(&self) -> Result<Stats>;
 }
@@ -734,6 +738,13 @@ impl Repo for PgRepo {
         .await?;
 
         Ok(EventWithDeliveries { event, deliveries })
+    }
+
+    async fn ping(&self) -> Result<()> {
+        sqlx::query_scalar!(r#"SELECT 1 AS "one!""#)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn fetch_stats(&self) -> Result<Stats> {

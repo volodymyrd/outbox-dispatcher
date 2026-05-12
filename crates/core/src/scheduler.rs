@@ -20,7 +20,7 @@
 //!    loop drains any in-progress scheduling/dispatch step and returns cleanly.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use crate::callbacks::{parse_callbacks, payload_too_large_error};
@@ -44,9 +44,12 @@ pub type ListenerStatus = Arc<AtomicBool>;
 
 /// A shared timestamp updated after each successful scheduler cycle.
 ///
+/// Stores milliseconds since the Unix epoch (`chrono::Utc::now().timestamp_millis()`),
+/// or `0` if no cycle has completed yet. Lock-free and async-safe.
+///
 /// The admin `/ready` endpoint uses this to check that the scheduler is still
 /// running within `2 × poll_interval`.
-pub type LastCycleAt = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
+pub type LastCycleAt = Arc<AtomicI64>;
 
 /// Run the main dispatch loop until `shutdown` is cancelled.
 ///
@@ -58,7 +61,7 @@ pub type LastCycleAt = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 /// The `listener_status` value is set to `true` while the LISTEN connection is up and
 /// `false` when it drops. Callers (e.g. the admin `/ready` endpoint) can inspect it.
 ///
-/// `last_cycle_at` is updated with `std::time::Instant::now()` after each successful
+/// `last_cycle_at` is updated with `chrono::Utc::now().timestamp_millis()` after each successful
 /// cycle. The admin `/ready` endpoint checks this against `2 × poll_interval`.
 pub async fn run_scheduler(
     repo: Arc<dyn Repo>,
@@ -204,10 +207,8 @@ pub async fn run_scheduler_with_cycle_tracker(
 
         // Update the last-cycle timestamp so the admin /ready endpoint knows the
         // scheduler is still alive.
-        if let Some(ref tracker) = last_cycle_at
-            && let Ok(mut guard) = tracker.lock()
-        {
-            *guard = Some(std::time::Instant::now());
+        if let Some(ref tracker) = last_cycle_at {
+            tracker.store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
         }
     }
 }
@@ -597,7 +598,10 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn retry_delivery(&self, _id: i64) -> crate::error::Result<crate::schema::RetryOutcome> {
+        async fn retry_delivery(
+            &self,
+            _id: i64,
+        ) -> crate::error::Result<crate::schema::RetryOutcome> {
             Ok(crate::schema::RetryOutcome::NotFound)
         }
 
@@ -616,6 +620,10 @@ mod tests {
             Err(crate::error::Error::InvalidData(format!(
                 "event {event_id} not found"
             )))
+        }
+
+        async fn ping(&self) -> crate::error::Result<()> {
+            Ok(())
         }
 
         async fn fetch_stats(&self) -> crate::error::Result<crate::schema::Stats> {

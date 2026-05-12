@@ -24,8 +24,10 @@ pub async fn require_bearer_token(request: Request, next: Next) -> Response {
         .and_then(|s| s.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
         .map(|(_, provided)| {
-            // Constant-time comparison: both slices padded to the longer length so
-            // the comparison never short-circuits on length mismatch alone.
+            // Constant-time compare of the token bytes via `subtle::ConstantTimeEq`.
+            // Note: the slice impl short-circuits on length mismatch, so token length
+            // is not protected — acceptable here because the bearer token is
+            // operator-controlled and its length is not considered secret.
             let provided_bytes = provided.as_bytes();
             let expected_bytes = expected.0.as_bytes();
             bool::from(provided_bytes.ct_eq(expected_bytes))
