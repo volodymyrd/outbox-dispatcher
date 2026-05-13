@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use outbox_dispatcher_core::{
-    Callback, CallbackError, CallbackTarget, EventForDelivery, HttpClientConfig, KeyRing,
+    Callback, CallbackError, CallbackTarget, EventForDelivery, HttpClientConfig, KeyRing, metrics,
 };
 use reqwest::{Client, ClientBuilder};
 use tracing::{debug, warn};
@@ -96,6 +96,10 @@ impl Callback for HttpCallback {
                     }
                     None => {
                         // Unknown key id — transient error; retry on normal backoff.
+                        metrics::inc_signing_key_resolution_failures(
+                            key_id.as_str(),
+                            target.name.as_str(),
+                        );
                         return Err(CallbackError::Transient {
                             reason: format!("signing_key_id '{key_id}' not registered"),
                             retry_after: None,

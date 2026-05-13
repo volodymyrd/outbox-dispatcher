@@ -552,14 +552,14 @@ from thundering.
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 1 | Spec metrics declared but never emitted | `crates/core/src/metrics.rs:114-181` + `crates/http-callback/src/client.rs:97` | High | Correctness | TODO | 5 of the §12.1 metrics have no call site |
-| 2 | OTel tracer provider not shut down | `crates/bin/src/main.rs:373-401` | Medium | Correctness | TODO | Buffered spans dropped on SIGTERM |
-| 3 | Retention reason label hard-coded to `processed` | `crates/core/src/retention.rs:125-132` | Medium | Correctness | TODO | `dead_letter` label never set |
-| 4 | `log.format` ignored when OTel is enabled | `crates/bin/src/main.rs:373-401` | Medium | Config | TODO | JSON config silently downgraded to pretty |
-| 5 | `warn!` for routine retention deletions | `crates/core/src/retention.rs:131` | Low | Idiom | TODO | Should be `info!` (or removed — duplicate of L92) |
-| 6 | `oldest_event_age` gauge sentinel collides | `crates/core/src/retention.rs:86-90` | Low | Correctness | TODO | Use `f64::NAN` instead of `0.0` |
-| 7 | Counter increments in a `for` loop | `crates/core/src/timeout_sweep.rs:36-47` | Low | Performance | TODO | Use `.increment(N)` once |
-| 8 | Retention worker has no startup jitter | `crates/core/src/retention.rs:70-78` | Low | Concurrency | TODO | Multi-replica thundering herd risk |
+| 1 | Spec metrics declared but never emitted | `crates/core/src/metrics.rs:114-181` + `crates/http-callback/src/client.rs:97` | High | Correctness | DONE | Signing-key metric wired in `client.rs`; queue-state gauges published by new `run_stats_sampler` task in `main.rs` |
+| 2 | OTel tracer provider not shut down | `crates/bin/src/main.rs:373-401` | Medium | Correctness | DONE | `init_tracing` returns `Option<SdkTracerProvider>`; shutdown called after scheduler exits |
+| 3 | Retention reason label hard-coded to `processed` | `crates/core/src/retention.rs:125-132` | Medium | Correctness | DONE | Added `RetentionDeleted` struct; SQL now returns per-bucket counts; both labels emitted |
+| 4 | `log.format` ignored when OTel is enabled | `crates/bin/src/main.rs:373-401` | Medium | Config | DONE | `init_tracing` builds `fmt_layer` from `log.format` before branching on OTel |
+| 5 | `warn!` for routine retention deletions | `crates/core/src/retention.rs:131` | Low | Idiom | DONE | Removed stale `warn!`; success reported via the `info!` already at L92 |
+| 6 | `oldest_event_age` gauge sentinel collides | `crates/core/src/retention.rs:86-90` | Low | Correctness | DONE | Publishes `f64::NAN` when no eligible events remain |
+| 7 | Counter increments in a `for` loop | `crates/core/src/timeout_sweep.rs:36-47` | Low | Performance | DONE | Added `inc_*_by(count)` helpers; `for` loops replaced with single `increment(N)` calls |
+| 8 | Retention worker has no startup jitter | `crates/core/src/retention.rs:70-78` | Low | Concurrency | DONE | Random initial delay `0..cleanup_interval_secs` added before the main loop |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

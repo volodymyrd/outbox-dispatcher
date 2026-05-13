@@ -159,6 +159,13 @@ pub fn inc_external_timeout_resets_total(callback: &str) {
         .increment(1);
 }
 
+/// Increment `outbox_external_timeout_resets_total{callback}` by `count`.
+#[inline]
+pub fn inc_external_timeout_resets_total_by(callback: &str, count: u64) {
+    metrics::counter!(EXTERNAL_TIMEOUT_RESETS_TOTAL, "callback" => callback.to_owned())
+        .increment(count);
+}
+
 /// Increment `outbox_completion_cycles_exhausted_total{callback}`.
 #[inline]
 pub fn inc_completion_cycles_exhausted_total(callback: &str) {
@@ -167,6 +174,16 @@ pub fn inc_completion_cycles_exhausted_total(callback: &str) {
         "callback" => callback.to_owned()
     )
     .increment(1);
+}
+
+/// Increment `outbox_completion_cycles_exhausted_total{callback}` by `count`.
+#[inline]
+pub fn inc_completion_cycles_exhausted_total_by(callback: &str, count: u64) {
+    metrics::counter!(
+        COMPLETION_CYCLES_EXHAUSTED_TOTAL,
+        "callback" => callback.to_owned()
+    )
+    .increment(count);
 }
 
 /// Increment `outbox_signing_key_resolution_failures_total{signing_key_id, callback}`.
@@ -283,8 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn inc_external_timeout_resets_total_by_does_not_panic() {
+        inc_external_timeout_resets_total_by("cb", 42);
+    }
+
+    #[test]
     fn inc_completion_cycles_exhausted_total_does_not_panic() {
         inc_completion_cycles_exhausted_total("cb");
+    }
+
+    #[test]
+    fn inc_completion_cycles_exhausted_total_by_does_not_panic() {
+        inc_completion_cycles_exhausted_total_by("cb", 7);
     }
 
     #[test]

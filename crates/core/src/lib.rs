@@ -32,6 +32,6 @@ pub use scheduler::{
 pub use schema::{
     CallbackError, CallbackStats, CallbackTarget, CompletionMode, DeadLetterRow, DeliveryRow,
     DueDelivery, EventForDelivery, EventWithDeliveries, ExternalPendingRow, PageParams, RawEvent,
-    RawEventSerializable, RetryOutcome, Stats, StatsRow, SweepReport,
+    RawEventSerializable, RetentionDeleted, RetryOutcome, Stats, StatsRow, SweepReport,
 };
 pub use timeout_sweep::sweep_hung_external;

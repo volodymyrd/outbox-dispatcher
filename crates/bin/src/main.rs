@@ -7,7 +7,8 @@ use clap::{Parser, Subcommand};
 use outbox_dispatcher_admin_api::{AdminState, build_router};
 use outbox_dispatcher_core::{
     AppConfig, DatabaseConfig, DispatchConfig, KeyRing, LogConfig, LogFormat, ObservabilityConfig,
-    PgRepo, run_retention_worker, run_scheduler_with_cycle_tracker, schedule_new_deliveries,
+    PgRepo, Repo, metrics, run_retention_worker, run_scheduler_with_cycle_tracker,
+    schedule_new_deliveries,
 };
 use outbox_dispatcher_http_callback::HttpCallback;
 use sqlx::PgPool;
@@ -93,7 +94,8 @@ async fn run() -> Result<()> {
         }
     };
 
-    init_tracing(&config.log, &config.observability).context("initialising tracing subscriber")?;
+    let tracer_provider = init_tracing(&config.log, &config.observability)
+        .context("initialising tracing subscriber")?;
     info!(env = %app_env, "outbox-dispatcher starting");
 
     if config.dispatch.allow_insecure_urls {
@@ -272,6 +274,16 @@ async fn run() -> Result<()> {
                 });
             }
 
+            // Spawn the periodic stats sampler that publishes queue-state gauges.
+            {
+                let stats_repo = repo.clone();
+                let poll_interval = Duration::from_secs(config.dispatch.poll_interval_secs);
+                let stats_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    run_stats_sampler(stats_repo, poll_interval, stats_shutdown).await;
+                });
+            }
+
             info!("starting scheduler");
             run_scheduler_with_cycle_tracker(
                 repo,
@@ -284,6 +296,13 @@ async fn run() -> Result<()> {
             )
             .await
             .context("scheduler exited with error")?;
+
+            // Flush any buffered spans before the process exits.
+            if let Some(provider) = tracer_provider
+                && let Err(e) = provider.shutdown()
+            {
+                warn!(error = ?e, "OpenTelemetry tracer shutdown failed");
+            }
 
             info!("outbox-dispatcher stopped cleanly");
         }
@@ -359,7 +378,10 @@ async fn connect_pool(db: &DatabaseConfig) -> Result<PgPool> {
 
 // ── Observability ──────────────────────────────────────────────────────────────
 
-fn init_tracing(log: &LogConfig, obs: &ObservabilityConfig) -> Result<()> {
+fn init_tracing(
+    log: &LogConfig,
+    obs: &ObservabilityConfig,
+) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -368,8 +390,17 @@ fn init_tracing(log: &LogConfig, obs: &ObservabilityConfig) -> Result<()> {
     )
     .context("invalid log filter directive")?;
 
+    // Build the fmt layer, respecting `log.format` in both code paths.
+    let fmt_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync> = match log.format {
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(true),
+        ),
+        LogFormat::Pretty => Box::new(tracing_subscriber::fmt::layer()),
+    };
+
     // Optionally attach an OpenTelemetry tracing layer when an OTLP endpoint is configured.
-    // We build two code paths (with/without OTel) to avoid complex type-erasure.
     if !obs.otel_endpoint.is_empty() {
         use opentelemetry_otlp::WithExportConfig;
 
@@ -386,38 +417,29 @@ fn init_tracing(log: &LogConfig, obs: &ObservabilityConfig) -> Result<()> {
         // Obtain the tracer before moving the provider into the global registry.
         let tracer =
             opentelemetry::trace::TracerProvider::tracer(&tracer_provider, "outbox-dispatcher");
+        // Keep a clone for graceful shutdown; the global registry owns the original.
+        let provider_for_shutdown = tracer_provider.clone();
         opentelemetry::global::set_tracer_provider(tracer_provider);
         let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-        // fmt layer and otel layer must both be added to the same subscriber base.
-        // Using `json()` or plain fmt both work; otel layer is indifferent to field format.
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer())
+            .with(fmt_layer)
             .with(otel_layer)
             .try_init()
             .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
 
         info!(endpoint = %obs.otel_endpoint, "OpenTelemetry tracing enabled");
+        Ok(Some(provider_for_shutdown))
     } else {
-        match log.format {
-            LogFormat::Json => {
-                tracing_subscriber::fmt()
-                    .json()
-                    .with_env_filter(filter)
-                    .try_init()
-                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
-            }
-            LogFormat::Pretty => {
-                tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .try_init()
-                    .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
-            }
-        }
-    }
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .try_init()
+            .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
 
-    Ok(())
+        Ok(None)
+    }
 }
 
 /// Install the Prometheus metrics exporter and start the scrape HTTP listener.
@@ -439,4 +461,35 @@ fn init_metrics(obs: &ObservabilityConfig) -> Result<()> {
 
     info!(bind = %addr, "Prometheus metrics endpoint listening");
     Ok(())
+}
+
+// ── Stats sampler ──────────────────────────────────────────────────────────────
+
+/// Periodically calls `repo.fetch_stats()` and publishes queue-state gauges so
+/// `outbox_lag_seconds`, `outbox_pending_deliveries`, and
+/// `outbox_external_pending_deliveries` are populated for Prometheus scraping.
+///
+/// Runs every `interval` (typically the scheduler's `poll_interval`) and stops when
+/// `shutdown` is cancelled.
+async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: CancellationToken) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        match repo.fetch_stats().await {
+            Ok(stats) => {
+                metrics::set_lag_seconds(stats.oldest_pending_age_seconds.unwrap_or(0.0));
+                for (cb, s) in &stats.callbacks {
+                    metrics::set_pending_deliveries(cb, "managed", s.pending as f64);
+                    metrics::set_external_pending_deliveries(cb, s.external_pending as f64);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "stats sampler: fetch_stats failed");
+            }
+        }
+    }
 }

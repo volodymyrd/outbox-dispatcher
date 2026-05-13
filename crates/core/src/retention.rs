@@ -25,20 +25,21 @@ use std::time::Duration;
 
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::config::RetentionConfig;
 use crate::error::Result;
 use crate::metrics;
 use crate::repo::Repo;
+use crate::schema::RetentionDeleted;
 
 // ── Public types ───────────────────────────────────────────────────────────────
 
 /// Summary of one retention cycle.
 #[derive(Debug, Default, Clone)]
 pub struct RetentionReport {
-    /// Total event rows deleted in this cycle.
-    pub deleted: u64,
+    /// Per-reason deletion counts for this cycle.
+    pub deleted: RetentionDeleted,
     /// Age in seconds of the oldest retention-eligible event still present after
     /// this cycle; `None` when no eligible events remain.
     pub oldest_age_seconds: Option<f64>,
@@ -67,6 +68,22 @@ pub async fn run_retention_worker(
         "retention worker started"
     );
 
+    // Apply a random initial delay (up to one full interval) so that multiple
+    // replicas starting simultaneously do not all wake at the same instant.
+    if config.cleanup_interval_secs > 0 {
+        use rand::RngExt;
+        let jitter_secs = rand::rng().random_range(0..config.cleanup_interval_secs);
+        let initial_jitter = Duration::from_secs(jitter_secs);
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                info!("retention worker received shutdown signal during startup jitter, stopping");
+                return;
+            }
+            _ = tokio::time::sleep(initial_jitter) => {}
+        }
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -86,11 +103,17 @@ pub async fn run_retention_worker(
                 if let Some(age) = report.oldest_age_seconds {
                     metrics::set_retention_oldest_event_age_seconds(age);
                 } else {
-                    metrics::set_retention_oldest_event_age_seconds(0.0);
+                    // No eligible events: publish NaN so alerts on "oldest age > N"
+                    // don't trigger for an empty queue.
+                    metrics::set_retention_oldest_event_age_seconds(f64::NAN);
                 }
 
-                if report.deleted > 0 {
-                    info!(deleted = report.deleted, "retention cycle completed");
+                if report.deleted.processed > 0 || report.deleted.dead_letter > 0 {
+                    info!(
+                        processed = report.deleted.processed,
+                        dead_letter = report.deleted.dead_letter,
+                        "retention cycle completed"
+                    );
                 }
             }
             Err(e) => {
@@ -108,10 +131,6 @@ async fn run_retention_cycle(repo: &dyn Repo, config: &RetentionConfig) -> Resul
     let processed_cutoff = now - chrono::Duration::days(config.processed_retention_days as i64);
     let dead_letter_cutoff = now - chrono::Duration::days(config.dead_letter_retention_days as i64);
 
-    // Delete terminal events in bounded batches. We always delete the
-    // processed-cutoff window as $1 for rows where any delivery is dead-lettered,
-    // and dead-letter-cutoff as $2 otherwise. Per the TDD the longer window
-    // (dead_letter_retention_days) applies when any delivery is dead-lettered.
     let deleted = repo
         .delete_terminal_events(
             dead_letter_cutoff,
@@ -120,15 +139,17 @@ async fn run_retention_cycle(repo: &dyn Repo, config: &RetentionConfig) -> Resul
         )
         .await?;
 
-    // Emit per-bucket deletion counters. We use a single "mixed" bucket here
-    // because the DB query combines both windows in one DELETE. The TDD separates
-    // `processed` vs `dead_letter` but it is not possible to distinguish the count
-    // from a single RETURNING clause without splitting the query.
-    if deleted > 0 {
-        // Attribute all deletions to "processed" for simplicity; a future iteration
-        // can split the query to produce separate counts.
-        metrics::inc_retention_deletions_total(metrics::retention_reason::PROCESSED, deleted);
-        warn!(deleted, "retention worker deleted terminal events");
+    if deleted.processed > 0 {
+        metrics::inc_retention_deletions_total(
+            metrics::retention_reason::PROCESSED,
+            deleted.processed,
+        );
+    }
+    if deleted.dead_letter > 0 {
+        metrics::inc_retention_deletions_total(
+            metrics::retention_reason::DEAD_LETTER,
+            deleted.dead_letter,
+        );
     }
 
     // Query the oldest eligible event age for the gauge.
@@ -301,7 +322,7 @@ mod tests {
             dead_letter_cutoff: DateTime<Utc>,
             processed_cutoff: DateTime<Utc>,
             batch_limit: i64,
-        ) -> CoreResult<u64> {
+        ) -> CoreResult<RetentionDeleted> {
             let mut s = self.state.lock().unwrap();
             if s.delete_error {
                 return Err(crate::error::Error::InvalidData(
@@ -310,7 +331,10 @@ mod tests {
             }
             s.delete_calls
                 .push((dead_letter_cutoff, processed_cutoff, batch_limit));
-            Ok(s.deleted_count)
+            Ok(RetentionDeleted {
+                processed: s.deleted_count,
+                dead_letter: 0,
+            })
         }
 
         async fn oldest_terminal_event_age_seconds(
@@ -362,7 +386,8 @@ mod tests {
         let cfg = default_config();
         let report = run_retention_cycle(repo.as_ref(), &cfg).await.unwrap();
 
-        assert_eq!(report.deleted, 5);
+        assert_eq!(report.deleted.processed, 5);
+        assert_eq!(report.deleted.dead_letter, 0);
         assert_eq!(report.oldest_age_seconds, Some(86400.0));
         assert_eq!(repo.age_calls().len(), 1);
     }
@@ -373,7 +398,8 @@ mod tests {
         let cfg = default_config();
         let report = run_retention_cycle(repo.as_ref(), &cfg).await.unwrap();
 
-        assert_eq!(report.deleted, 0);
+        assert_eq!(report.deleted.processed, 0);
+        assert_eq!(report.deleted.dead_letter, 0);
         assert!(report.oldest_age_seconds.is_none());
     }
 

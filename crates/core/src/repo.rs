@@ -9,8 +9,8 @@ use crate::config::DispatchConfig;
 use crate::error::Result;
 use crate::schema::{
     CallbackStats, CallbackTarget, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
-    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, RetryOutcome, Stats, StatsRow,
-    SweepReport,
+    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, RetentionDeleted, RetryOutcome,
+    Stats, StatsRow, SweepReport,
 };
 
 #[async_trait]
@@ -126,8 +126,9 @@ pub trait Repo: Send + Sync {
     // ── Retention ──────────────────────────────────────────────────────────
 
     /// Deletes up to `batch_limit` fully-terminal events whose age exceeds the
-    /// relevant retention window. Returns the number of deleted event rows
-    /// (deliveries are removed via `ON DELETE CASCADE`).
+    /// relevant retention window. Returns per-reason deletion counts
+    /// (`RetentionDeleted.processed` + `RetentionDeleted.dead_letter`; deliveries
+    /// are removed via `ON DELETE CASCADE`).
     ///
     /// `dead_letter_cutoff` = now() − dead_letter_retention_days  
     /// `processed_cutoff`   = now() − processed_retention_days
@@ -136,7 +137,7 @@ pub trait Repo: Send + Sync {
         dead_letter_cutoff: DateTime<Utc>,
         processed_cutoff: DateTime<Utc>,
         batch_limit: i64,
-    ) -> Result<u64>;
+    ) -> Result<RetentionDeleted>;
 
     /// Returns the age in seconds of the oldest retention-eligible event still
     /// present (i.e. all deliveries terminal, older than the shortest retention
@@ -860,7 +861,7 @@ impl Repo for PgRepo {
         dead_letter_cutoff: DateTime<Utc>,
         processed_cutoff: DateTime<Utc>,
         batch_limit: i64,
-    ) -> Result<u64> {
+    ) -> Result<RetentionDeleted> {
         // Delete up to `batch_limit` fully-terminal events past their retention window.
         // Foreign key `ON DELETE CASCADE` removes the delivery rows automatically.
         //
@@ -870,10 +871,16 @@ impl Repo for PgRepo {
         //  AND processed_at IS NULL AND dead_letter = FALSE)
         //
         // The longer window (dead_letter) applies when any delivery is dead-lettered.
-        let rows_affected = sqlx::query_scalar!(
+        // We return a `reason` column so callers can emit per-bucket metrics.
+        let rows = sqlx::query!(
             r#"
             WITH candidates AS (
-                SELECT e.id
+                SELECT e.id,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM outbox_deliveries d
+                           WHERE d.event_id = e.event_id
+                             AND d.dead_letter = TRUE
+                       ) THEN 'dead_letter' ELSE 'processed' END AS reason
                 FROM outbox_events e
                 WHERE NOT EXISTS (
                     SELECT 1
@@ -892,10 +899,15 @@ impl Repo for PgRepo {
                 END
                 ORDER BY e.id
                 LIMIT $3
+            ),
+            deleted AS (
+                DELETE FROM outbox_events
+                WHERE id IN (SELECT id FROM candidates)
+                RETURNING id
             )
-            DELETE FROM outbox_events
-            WHERE id IN (SELECT id FROM candidates)
-            RETURNING id
+            SELECT c.reason
+            FROM candidates c
+            WHERE c.id IN (SELECT id FROM deleted)
             "#,
             dead_letter_cutoff,
             processed_cutoff,
@@ -903,7 +915,15 @@ impl Repo for PgRepo {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows_affected.len() as u64)
+
+        let mut result = RetentionDeleted::default();
+        for row in rows {
+            match row.reason.as_deref() {
+                Some("dead_letter") => result.dead_letter += 1,
+                _ => result.processed += 1,
+            }
+        }
+        Ok(result)
     }
 
     async fn oldest_terminal_event_age_seconds(

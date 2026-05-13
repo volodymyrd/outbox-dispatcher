@@ -675,8 +675,8 @@ mod tests {
             _dead_letter_cutoff: chrono::DateTime<Utc>,
             _processed_cutoff: chrono::DateTime<Utc>,
             _batch_limit: i64,
-        ) -> crate::error::Result<u64> {
-            Ok(0)
+        ) -> crate::error::Result<crate::schema::RetentionDeleted> {
+            Ok(crate::schema::RetentionDeleted::default())
         }
 
         async fn oldest_terminal_event_age_seconds(

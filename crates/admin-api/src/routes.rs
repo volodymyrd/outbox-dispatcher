@@ -439,8 +439,9 @@ mod tests {
             _dead_letter_cutoff: chrono::DateTime<chrono::Utc>,
             _processed_cutoff: chrono::DateTime<chrono::Utc>,
             _batch_limit: i64,
-        ) -> outbox_dispatcher_core::error::Result<u64> {
-            Ok(0)
+        ) -> outbox_dispatcher_core::error::Result<outbox_dispatcher_core::RetentionDeleted>
+        {
+            Ok(outbox_dispatcher_core::RetentionDeleted::default())
         }
 
         async fn oldest_terminal_event_age_seconds(

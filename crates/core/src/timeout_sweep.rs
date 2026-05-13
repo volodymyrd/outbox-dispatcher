@@ -33,18 +33,14 @@ pub async fn sweep_hung_external(repo: &dyn Repo, config: &DispatchConfig) -> Re
             "external timeout sweep reset deliveries for redelivery"
         );
         // We don't have per-callback counts from the sweeper, so use "_all" as label.
-        for _ in 0..report.reset {
-            metrics::inc_external_timeout_resets_total("_all");
-        }
+        metrics::inc_external_timeout_resets_total_by("_all", report.reset);
     }
     if report.exhausted > 0 {
         warn!(
             exhausted = report.exhausted,
             "external timeout sweep dead-lettered rows after max_completion_cycles"
         );
-        for _ in 0..report.exhausted {
-            metrics::inc_completion_cycles_exhausted_total("_all");
-        }
+        metrics::inc_completion_cycles_exhausted_total_by("_all", report.exhausted);
     }
     Ok(())
 }
@@ -195,8 +191,8 @@ mod tests {
             _dead_letter_cutoff: DateTime<chrono::Utc>,
             _processed_cutoff: DateTime<chrono::Utc>,
             _batch_limit: i64,
-        ) -> CoreResult<u64> {
-            Ok(0)
+        ) -> CoreResult<crate::schema::RetentionDeleted> {
+            Ok(crate::schema::RetentionDeleted::default())
         }
 
         async fn oldest_terminal_event_age_seconds(

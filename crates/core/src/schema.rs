@@ -265,6 +265,15 @@ pub struct SweepReport {
     pub exhausted: u64,
 }
 
+/// Per-reason deletion counts returned by `Repo::delete_terminal_events`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RetentionDeleted {
+    /// Events deleted whose deliveries were all successfully processed.
+    pub processed: u64,
+    /// Events deleted whose deliveries included at least one dead-lettered delivery.
+    pub dead_letter: u64,
+}
+
 /// The standardized error returned by delivery implementations.
 #[derive(Debug)]
 pub enum CallbackError {
