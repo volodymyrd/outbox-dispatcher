@@ -548,11 +548,283 @@ from thundering.
 
 ---
 
+---
+
+## Second-pass review (2026-05-13T15:07:35Z)
+
+The eight findings above are addressed. The following new findings were identified during a
+re-review of the resulting code paths.
+
+### Finding 9 — Stats sampler hard-codes `mode="managed"` for all pending deliveries
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:485-488` |
+| **Severity** | Medium |
+| **Category** | Correctness |
+
+**Problem**
+
+`Repo::fetch_stats` returns a single `pending` count per callback that aggregates
+**both** `managed` and `external` mode rows still awaiting dispatch (the SQL filter
+in `crates/core/src/repo.rs:815-820` does not constrain `completion_mode`). The
+stats sampler then publishes that combined count with a hard-coded `mode="managed"`
+label, so an external-only callback shows up on the dashboard as "managed pending"
+and the `mode="external"` series is permanently empty. Spec §12.1 defines
+`outbox_pending_deliveries{callback, mode}` as a per-mode gauge; the current
+emission contradicts that contract.
+
+**Context** (`crates/bin/src/main.rs:482-489`)
+
+```rust
+match repo.fetch_stats().await {
+    Ok(stats) => {
+        metrics::set_lag_seconds(stats.oldest_pending_age_seconds.unwrap_or(0.0));
+        for (cb, s) in &stats.callbacks {
+            metrics::set_pending_deliveries(cb, "managed", s.pending as f64);
+            metrics::set_external_pending_deliveries(cb, s.external_pending as f64);
+        }
+    }
+```
+
+**Recommended fix**
+
+Split the per-callback pending count by `completion_mode` in `fetch_stats`. Extend
+`CallbackStats` with `pending_managed` and `pending_external`, change the SQL
+GROUP BY to emit both filters, and publish two gauge series per callback:
+
+```rust
+// schema.rs
+pub struct CallbackStats {
+    pub pending_managed: i64,
+    pub pending_external: i64,
+    pub external_pending: i64,   // post-dispatch, awaiting completion
+    pub dead_lettered: i64,
+}
+
+// repo.rs (StatsRow SQL)
+COUNT(*) FILTER (
+    WHERE completion_mode = 'managed'
+      AND dispatched_at IS NULL
+      AND processed_at  IS NULL
+      AND dead_letter   = FALSE
+) AS "pending_managed!",
+COUNT(*) FILTER (
+    WHERE completion_mode = 'external'
+      AND dispatched_at IS NULL
+      AND processed_at  IS NULL
+      AND dead_letter   = FALSE
+) AS "pending_external!",
+
+// main.rs
+for (cb, s) in &stats.callbacks {
+    metrics::set_pending_deliveries(cb, "managed",  s.pending_managed  as f64);
+    metrics::set_pending_deliveries(cb, "external", s.pending_external as f64);
+    metrics::set_external_pending_deliveries(cb, s.external_pending as f64);
+}
+```
+
+**Why this fix**
+
+Operators alerting on `outbox_pending_deliveries{mode="external"}` will silently
+miss real backlogs today; the metric name claims a `mode` label that has no
+information content. Splitting the count restores the contract.
+
+---
+
+### Finding 10 — Stats sampler leaves stale gauges for drained callbacks
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:482-489` |
+| **Severity** | Low |
+| **Category** | Correctness |
+
+**Problem**
+
+The sampler only writes a gauge value for callbacks that appear in the current
+`fetch_stats` result. The `StatsRow` SQL emits one row per `callback_name` *that
+has at least one delivery row*; if every delivery for a callback is retention-
+deleted (or, while retention is disabled, never happens) the row disappears and
+the gauge with that label keeps its last-written value forever. A callback that
+drained from 200 → 0 pending will scrape as `200` indefinitely.
+
+**Recommended fix**
+
+Track the set of callback labels emitted on the previous tick and overwrite each
+omitted label with `0.0` on the next tick (or use the
+`metrics_exporter_prometheus::PrometheusHandle::clear_metric` API, if exposed,
+to drop the series). A minimal patch:
+
+```rust
+let mut last_callbacks: HashSet<String> = HashSet::new();
+loop {
+    // ... select! ...
+    if let Ok(stats) = repo.fetch_stats().await {
+        let mut now_seen = HashSet::new();
+        for (cb, s) in &stats.callbacks {
+            now_seen.insert(cb.clone());
+            // ... set gauges ...
+        }
+        for stale in last_callbacks.difference(&now_seen) {
+            metrics::set_pending_deliveries(stale, "managed",  0.0);
+            metrics::set_pending_deliveries(stale, "external", 0.0);
+            metrics::set_external_pending_deliveries(stale, 0.0);
+        }
+        last_callbacks = now_seen;
+    }
+}
+```
+
+**Why this fix**
+
+Stale gauges are a textbook Prometheus pitfall: ops will see a phantom backlog
+that never clears, and alerts won't auto-resolve. The fix is local to the sampler.
+
+---
+
+### Finding 11 — Lag gauge emits `0.0` instead of `NaN` when queue is empty
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:484` |
+| **Severity** | Low |
+| **Category** | Correctness |
+
+**Problem**
+
+```rust
+metrics::set_lag_seconds(stats.oldest_pending_age_seconds.unwrap_or(0.0));
+```
+
+The retention worker already learned this lesson — Finding 6 replaced the same
+`0.0` sentinel with `f64::NAN` so that alerts on
+`outbox_retention_oldest_event_age_seconds > N` don't conflate "queue empty"
+with "freshly enqueued event". The same conflation now lives in the stats
+sampler for `outbox_lag_seconds`.
+
+**Recommended fix**
+
+```rust
+metrics::set_lag_seconds(stats.oldest_pending_age_seconds.unwrap_or(f64::NAN));
+```
+
+**Why this fix**
+
+Consistency with Finding 6's fix and the Prometheus convention that NaN samples
+are rendered as missing — alerts on "lag > N" will quietly stay quiet on an
+empty queue.
+
+---
+
+### Finding 12 — OpenTelemetry tracer has no `service.name` resource
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:413-415` |
+| **Severity** | Medium |
+| **Category** | Observability |
+
+**Problem**
+
+`SdkTracerProvider::builder()` is built with only the batch exporter; no
+`Resource` is attached, so emitted spans carry no `service.name` /
+`service.version` attributes. Most OTLP backends (Jaeger, Tempo, Grafana Cloud
+Traces, Honeycomb, Datadog APM) key on `service.name` for indexing — without it
+spans land under the placeholder `unknown_service` or are dropped entirely.
+
+**Context** (`crates/bin/src/main.rs:413-419`)
+
+```rust
+let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+    .with_batch_exporter(exporter)
+    .build();
+
+let tracer =
+    opentelemetry::trace::TracerProvider::tracer(&tracer_provider, "outbox-dispatcher");
+```
+
+**Recommended fix**
+
+```rust
+use opentelemetry_sdk::Resource;
+use opentelemetry::KeyValue;
+
+let resource = Resource::builder()
+    .with_attributes([
+        KeyValue::new("service.name", "outbox-dispatcher"),
+        KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+        KeyValue::new("deployment.environment", app_env.clone()),
+    ])
+    .build();
+
+let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+    .with_resource(resource)
+    .with_batch_exporter(exporter)
+    .build();
+```
+
+**Why this fix**
+
+Phase 7's deliverable is end-to-end observability; spans that can't be queried
+in the trace backend are functionally inert. `service.name` is the one resource
+attribute every OTLP backend treats as mandatory, and `CARGO_PKG_VERSION` /
+`APP_ENV` are already available at this point in startup.
+
+---
+
+### Finding 13 — `outbox_external_pending_seconds` histogram still not emitted
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/metrics.rs:140-147` |
+| **Severity** | Low |
+| **Category** | Correctness |
+
+**Problem**
+
+Follow-up to Finding 1: of the five missing-call-site metrics, four were addressed
+by the new stats sampler and the http-callback edit. The histogram
+`outbox_external_pending_seconds` is still exported as a `pub fn` helper with no
+production call site — only the unit test in `metrics.rs:288-290` exercises it.
+Spec §12.1 names this metric explicitly, and operators dashboarding on per-row
+external-pending-age distributions will see an empty series.
+
+**Recommended fix**
+
+Either wire it from the stats sampler by adding a repo method that returns a
+sample of pending external-completion row ages, then `record_external_pending_seconds`
+in a loop:
+
+```rust
+// repo.rs
+async fn sample_external_pending_ages(&self, sample_size: i64) -> Result<Vec<(String, f64)>>;
+
+// main.rs (inside run_stats_sampler)
+if let Ok(samples) = repo.sample_external_pending_ages(1000).await {
+    for (cb, age_secs) in samples {
+        metrics::record_external_pending_seconds(&cb, age_secs);
+    }
+}
+```
+
+…or, if a histogram of per-row ages is not actually wanted, delete the helper
+and the metric constant entirely so the public surface matches what the binary
+emits.
+
+**Why this fix**
+
+The metric registry advertises a contract; an always-empty histogram is more
+misleading than no metric at all. Whichever direction is chosen, the contract
+and the implementation should agree.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 1 | Spec metrics declared but never emitted | `crates/core/src/metrics.rs:114-181` + `crates/http-callback/src/client.rs:97` | High | Correctness | DONE | Signing-key metric wired in `client.rs`; queue-state gauges published by new `run_stats_sampler` task in `main.rs` |
+| 1 | Spec metrics declared but never emitted | `crates/core/src/metrics.rs:114-181` + `crates/http-callback/src/client.rs:97` | High | Correctness | DONE | Signing-key metric wired in `client.rs`; queue-state gauges published by new `run_stats_sampler` task in `main.rs`. Follow-up F13 covers the remaining histogram. |
 | 2 | OTel tracer provider not shut down | `crates/bin/src/main.rs:373-401` | Medium | Correctness | DONE | `init_tracing` returns `Option<SdkTracerProvider>`; shutdown called after scheduler exits |
 | 3 | Retention reason label hard-coded to `processed` | `crates/core/src/retention.rs:125-132` | Medium | Correctness | DONE | Added `RetentionDeleted` struct; SQL now returns per-bucket counts; both labels emitted |
 | 4 | `log.format` ignored when OTel is enabled | `crates/bin/src/main.rs:373-401` | Medium | Config | DONE | `init_tracing` builds `fmt_layer` from `log.format` before branching on OTel |
@@ -560,6 +832,11 @@ from thundering.
 | 6 | `oldest_event_age` gauge sentinel collides | `crates/core/src/retention.rs:86-90` | Low | Correctness | DONE | Publishes `f64::NAN` when no eligible events remain |
 | 7 | Counter increments in a `for` loop | `crates/core/src/timeout_sweep.rs:36-47` | Low | Performance | DONE | Added `inc_*_by(count)` helpers; `for` loops replaced with single `increment(N)` calls |
 | 8 | Retention worker has no startup jitter | `crates/core/src/retention.rs:70-78` | Low | Concurrency | DONE | Random initial delay `0..cleanup_interval_secs` added before the main loop |
+| 9 | Stats sampler hard-codes `mode="managed"` | `crates/bin/src/main.rs:485-488` | Medium | Correctness | TODO | `pending` count includes both modes; `mode="external"` gauge series is permanently empty |
+| 10 | Stale gauges for drained callbacks | `crates/bin/src/main.rs:482-489` | Low | Correctness | TODO | Track last-seen callbacks and zero out missing labels on the next tick |
+| 11 | `outbox_lag_seconds` emits 0.0 instead of NaN | `crates/bin/src/main.rs:484` | Low | Correctness | TODO | Same pattern as the F6 fix — use `f64::NAN` so empty-queue scrape isn't ambiguous |
+| 12 | OTel tracer missing `service.name` resource | `crates/bin/src/main.rs:413-415` | Medium | Observability | TODO | Add `Resource` with `service.name`, `service.version`, `deployment.environment` |
+| 13 | `outbox_external_pending_seconds` never emitted | `crates/core/src/metrics.rs:140-147` | Low | Correctness | TODO | Either wire it from a new `Repo::sample_external_pending_ages` call or delete the helper |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
