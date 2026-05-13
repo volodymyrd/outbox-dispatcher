@@ -43,16 +43,106 @@ pub const MAX_CALLBACKS_PER_EVENT_LIMIT: u32 = 1_000;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/// Stable classification of why a callback failed structural validation.
+///
+/// Used as a Prometheus label value for `outbox_invalid_callbacks_total{reason}`.
+/// Values are short, snake_case, and will never be removed — only new variants
+/// may be added (adding a variant is a non-breaking change for dashboards).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidReason {
+    NotArray,
+    TooManyCallbacks,
+    NotAnObject,
+    MissingName,
+    NameNotString,
+    NameInvalid,
+    MissingUrl,
+    UrlNotString,
+    UrlMalformed,
+    UrlHasUserinfo,
+    UrlBadScheme,
+    UrlNoHost,
+    UrlPrivateHost,
+    MissingSigningKeyId,
+    InvalidMode,
+    HeadersNotObject,
+    HeaderNameInvalid,
+    HeaderReserved,
+    HeaderDuplicate,
+    HeaderValueInvalid,
+    MaxAttemptsNotInteger,
+    MaxAttemptsOutOfRange,
+    BackoffNotArray,
+    BackoffEmpty,
+    BackoffElementInvalid,
+    BackoffElementOutOfRange,
+    TimeoutNotInteger,
+    TimeoutOutOfRange,
+    ExternalTimeoutNotInteger,
+    ExternalTimeoutOutOfRange,
+    MaxCompletionCyclesNotInteger,
+    MaxCompletionCyclesOutOfRange,
+    ExternalMissingTimeout,
+    DuplicateName,
+    Other,
+}
+
+impl InvalidReason {
+    /// Returns a short, stable snake_case string suitable as a Prometheus label value.
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            Self::NotArray => "not_array",
+            Self::TooManyCallbacks => "too_many_callbacks",
+            Self::NotAnObject => "not_an_object",
+            Self::MissingName => "missing_name",
+            Self::NameNotString => "name_not_string",
+            Self::NameInvalid => "name_invalid",
+            Self::MissingUrl => "missing_url",
+            Self::UrlNotString => "url_not_string",
+            Self::UrlMalformed => "url_malformed",
+            Self::UrlHasUserinfo => "url_has_userinfo",
+            Self::UrlBadScheme => "url_bad_scheme",
+            Self::UrlNoHost => "url_no_host",
+            Self::UrlPrivateHost => "url_private_host",
+            Self::MissingSigningKeyId => "missing_signing_key_id",
+            Self::InvalidMode => "invalid_mode",
+            Self::HeadersNotObject => "headers_not_object",
+            Self::HeaderNameInvalid => "header_name_invalid",
+            Self::HeaderReserved => "header_reserved",
+            Self::HeaderDuplicate => "header_duplicate",
+            Self::HeaderValueInvalid => "header_value_invalid",
+            Self::MaxAttemptsNotInteger => "max_attempts_not_integer",
+            Self::MaxAttemptsOutOfRange => "max_attempts_out_of_range",
+            Self::BackoffNotArray => "backoff_not_array",
+            Self::BackoffEmpty => "backoff_empty",
+            Self::BackoffElementInvalid => "backoff_element_invalid",
+            Self::BackoffElementOutOfRange => "backoff_element_out_of_range",
+            Self::TimeoutNotInteger => "timeout_not_integer",
+            Self::TimeoutOutOfRange => "timeout_out_of_range",
+            Self::ExternalTimeoutNotInteger => "external_timeout_not_integer",
+            Self::ExternalTimeoutOutOfRange => "external_timeout_out_of_range",
+            Self::MaxCompletionCyclesNotInteger => "max_completion_cycles_not_integer",
+            Self::MaxCompletionCyclesOutOfRange => "max_completion_cycles_out_of_range",
+            Self::ExternalMissingTimeout => "external_missing_timeout",
+            Self::DuplicateName => "duplicate_name",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Result of structurally parsing and validating a callbacks JSON array.
 #[derive(Debug)]
 pub struct ParsedCallbacks {
     /// Callbacks that passed all structural checks and are ready for scheduling.
     pub valid: Vec<CallbackTarget>,
-    /// Callbacks that failed structural validation: (name_or_index, error_message).
+    /// Callbacks that failed structural validation.
     ///
-    /// The error message is already prefixed with `"invalid_callback: "` so it can
-    /// be stored directly in `outbox_deliveries.last_error`.
-    pub invalid: Vec<(String, String)>,
+    /// Each entry is `(name_or_index, reason_code, error_message)` where:
+    /// - `name_or_index` is the callback name or a positional fallback like `"[0]"`.
+    /// - `reason_code` is a stable [`InvalidReason`] used as a Prometheus metric label.
+    /// - `error_message` is already prefixed with `"invalid_callback: "` and can be
+    ///   stored directly in `outbox_deliveries.last_error`.
+    pub invalid: Vec<(String, InvalidReason, String)>,
 }
 
 // ── Public functions ──────────────────────────────────────────────────────────
@@ -87,6 +177,7 @@ pub fn parse_callbacks(
     let Some(array) = callbacks_json.as_array() else {
         invalid.push((
             "<root>".to_string(),
+            InvalidReason::NotArray,
             "invalid_callback: top-level callbacks value is not a JSON array".to_string(),
         ));
         return ParsedCallbacks { valid, invalid };
@@ -95,6 +186,7 @@ pub fn parse_callbacks(
     if array.len() > config.max_callbacks_per_event as usize {
         invalid.push((
             "<root>".to_string(),
+            InvalidReason::TooManyCallbacks,
             format!(
                 "invalid_callback: too many callbacks in event ({}); max is {}",
                 array.len(),
@@ -110,6 +202,7 @@ pub fn parse_callbacks(
                 if !seen_names.insert(target.name.clone()) {
                     invalid.push((
                         target.name,
+                        InvalidReason::DuplicateName,
                         "invalid_callback: duplicate callback name within event".to_string(),
                     ));
                 } else {
@@ -162,7 +255,7 @@ pub fn validate_named_callback(
     };
 
     parse_one_callback(element, idx, config)
-        .map_err(|(_, reason)| NamedCallbackError::Invalid(reason))
+        .map_err(|(_, _, reason)| NamedCallbackError::Invalid(reason))
 }
 
 /// Produces the canonical `last_error` string for a schedule-time payload-size rejection.
@@ -182,10 +275,11 @@ fn parse_one_callback(
     element: &serde_json::Value,
     index: usize,
     config: &DispatchConfig,
-) -> Result<CallbackTarget, (String, String)> {
+) -> Result<CallbackTarget, (String, InvalidReason, String)> {
     let obj = element.as_object().ok_or_else(|| {
         (
             format!("[{index}]"),
+            InvalidReason::NotAnObject,
             "invalid_callback: element is not an object".to_string(),
         )
     })?;
@@ -194,12 +288,14 @@ fn parse_one_callback(
         None => {
             return Err((
                 format!("[{index}]"),
+                InvalidReason::MissingName,
                 "invalid_callback: missing required field 'name'".to_string(),
             ));
         }
         Some(v) => v.as_str().ok_or_else(|| {
             (
                 format!("[{index}]"),
+                InvalidReason::NameNotString,
                 "invalid_callback: 'name' must be a string".to_string(),
             )
         })?,
@@ -209,18 +305,29 @@ fn parse_one_callback(
     if !is_valid_callback_name(&name) {
         return Err((
             name,
+            InvalidReason::NameInvalid,
             "invalid_callback: name must match ^[a-z][a-z0-9_]{2,63}$".to_string(),
         ));
     }
 
     // Validate every other field inside a closure so errors can be tagged with
     // `name` in a single place instead of cloning it nine times.
-    let body = || -> Result<CallbackTarget, String> {
+    let body = || -> Result<CallbackTarget, (InvalidReason, String)> {
         let url = obj
             .get("url")
-            .ok_or_else(|| "invalid_callback: missing required field 'url'".to_string())?
+            .ok_or_else(|| {
+                (
+                    InvalidReason::MissingUrl,
+                    "invalid_callback: missing required field 'url'".to_string(),
+                )
+            })?
             .as_str()
-            .ok_or_else(|| "invalid_callback: 'url' must be a string".to_string())?
+            .ok_or_else(|| {
+                (
+                    InvalidReason::UrlNotString,
+                    "invalid_callback: 'url' must be a string".to_string(),
+                )
+            })?
             .to_string();
 
         validate_url(
@@ -236,9 +343,12 @@ fn parse_one_callback(
             .and_then(|v| v.as_str())
             .map(str::to_owned);
         if !config.allow_unsigned_callbacks && signing_key_id.is_none() {
-            return Err("invalid_callback: missing required field 'signing_key_id' \
+            return Err((
+                InvalidReason::MissingSigningKeyId,
+                "invalid_callback: missing required field 'signing_key_id' \
                  (set allow_unsigned_callbacks=true to omit)"
-                .to_string());
+                    .to_string(),
+            ));
         }
 
         let headers = parse_headers(obj.get("headers"))?;
@@ -254,9 +364,12 @@ fn parse_one_callback(
 
         // External mode requires a timeout so the sweeper knows when to redeliver.
         if mode == CompletionMode::External && external_completion_timeout.is_none() {
-            return Err("invalid_callback: mode='external' requires \
+            return Err((
+                InvalidReason::ExternalMissingTimeout,
+                "invalid_callback: mode='external' requires \
                  'external_completion_timeout_seconds'"
-                .to_string());
+                    .to_string(),
+            ));
         }
 
         Ok(CallbackTarget {
@@ -273,7 +386,7 @@ fn parse_one_callback(
         })
     };
 
-    body().map_err(|reason| (name, reason))
+    body().map_err(|(code, reason)| (name, code, reason))
 }
 
 fn is_valid_callback_name(name: &str) -> bool {
@@ -293,13 +406,20 @@ fn validate_url(
     url_str: &str,
     allow_insecure: bool,
     allow_private_ip_targets: bool,
-) -> Result<(), String> {
-    let parsed = url::Url::parse(url_str)
-        .map_err(|_| format!("invalid_callback: url '{url_str}' is structurally malformed"))?;
+) -> Result<(), (InvalidReason, String)> {
+    let parsed = url::Url::parse(url_str).map_err(|_| {
+        (
+            InvalidReason::UrlMalformed,
+            format!("invalid_callback: url '{url_str}' is structurally malformed"),
+        )
+    })?;
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(format!(
-            "invalid_callback: url '{url_str}' must not contain userinfo (username/password)"
+        return Err((
+            InvalidReason::UrlHasUserinfo,
+            format!(
+                "invalid_callback: url '{url_str}' must not contain userinfo (username/password)"
+            ),
         ));
     }
 
@@ -307,24 +427,33 @@ fn validate_url(
     match (scheme, allow_insecure) {
         ("https", _) | ("http", true) => {}
         _ => {
-            return Err(if allow_insecure {
-                format!(
-                    "invalid_callback: url must use http:// or https:// scheme; got '{url_str}'"
-                )
-            } else {
-                format!("invalid_callback: url must use https:// scheme; got '{url_str}'")
-            });
+            return Err((
+                InvalidReason::UrlBadScheme,
+                if allow_insecure {
+                    format!(
+                        "invalid_callback: url must use http:// or https:// scheme; got '{url_str}'"
+                    )
+                } else {
+                    format!("invalid_callback: url must use https:// scheme; got '{url_str}'")
+                },
+            ));
         }
     }
 
-    let host = parsed
-        .host()
-        .ok_or_else(|| format!("invalid_callback: url '{url_str}' has no host"))?;
+    let host = parsed.host().ok_or_else(|| {
+        (
+            InvalidReason::UrlNoHost,
+            format!("invalid_callback: url '{url_str}' has no host"),
+        )
+    })?;
 
     if !allow_private_ip_targets && is_private_host(host) {
-        return Err(format!(
-            "invalid_callback: url '{url_str}' targets a private or loopback address \
-             (set allow_private_ip_targets=true to allow local targets)"
+        return Err((
+            InvalidReason::UrlPrivateHost,
+            format!(
+                "invalid_callback: url '{url_str}' targets a private or loopback address \
+                 (set allow_private_ip_targets=true to allow local targets)"
+            ),
         ));
     }
 
@@ -377,12 +506,13 @@ fn is_blocked_domain(d: &str) -> bool {
         || lower.ends_with(".home.arpa")
 }
 
-fn parse_mode(mode_str: Option<&str>) -> Result<CompletionMode, String> {
+fn parse_mode(mode_str: Option<&str>) -> Result<CompletionMode, (InvalidReason, String)> {
     match mode_str.unwrap_or("managed") {
         "managed" => Ok(CompletionMode::Managed),
         "external" => Ok(CompletionMode::External),
-        other => Err(format!(
-            "invalid_callback: mode must be 'managed' or 'external'; got '{other}'"
+        other => Err((
+            InvalidReason::InvalidMode,
+            format!("invalid_callback: mode must be 'managed' or 'external'; got '{other}'"),
         )),
     }
 }
@@ -430,42 +560,58 @@ const RESERVED_HEADERS: &[&str] = &[
     "proxy-authorization",
 ];
 
-fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, String>, String> {
+fn parse_headers(
+    val: Option<&serde_json::Value>,
+) -> Result<HashMap<String, String>, (InvalidReason, String)> {
     let Some(val) = val else {
         return Ok(HashMap::new());
     };
-    let obj = val
-        .as_object()
-        .ok_or_else(|| "invalid_callback: headers must be a JSON object".to_string())?;
+    let obj = val.as_object().ok_or_else(|| {
+        (
+            InvalidReason::HeadersNotObject,
+            "invalid_callback: headers must be a JSON object".to_string(),
+        )
+    })?;
     let mut headers = HashMap::new();
     let mut seen_lower: HashSet<String> = HashSet::new();
     for (k, v) in obj {
         if !is_valid_header_name(k) {
-            return Err(format!(
-                "invalid_callback: header name '{k}' contains invalid characters"
+            return Err((
+                InvalidReason::HeaderNameInvalid,
+                format!("invalid_callback: header name '{k}' contains invalid characters"),
             ));
         }
         let k_lower = k.to_ascii_lowercase();
         if RESERVED_HEADERS.contains(&k_lower.as_str()) || k_lower.starts_with("x-outbox-") {
-            return Err(format!(
-                "invalid_callback: header '{k}' is reserved and cannot be set"
+            return Err((
+                InvalidReason::HeaderReserved,
+                format!("invalid_callback: header '{k}' is reserved and cannot be set"),
             ));
         }
         if !seen_lower.insert(k_lower) {
-            return Err(format!(
-                "invalid_callback: header '{k}' is a duplicate (header names are case-insensitive)"
+            return Err((
+                InvalidReason::HeaderDuplicate,
+                format!(
+                    "invalid_callback: header '{k}' is a duplicate (header names are case-insensitive)"
+                ),
             ));
         }
-        let val_str = v
-            .as_str()
-            .ok_or_else(|| format!("invalid_callback: header '{k}' value must be a string"))?;
+        let val_str = v.as_str().ok_or_else(|| {
+            (
+                InvalidReason::HeaderValueInvalid,
+                format!("invalid_callback: header '{k}' value must be a string"),
+            )
+        })?;
         if val_str
             .bytes()
             .any(|b| (b < 0x20 && b != b'\t') || b >= 0x7f)
         {
-            return Err(format!(
-                "invalid_callback: header '{k}' value contains illegal characters \
-                 (control characters and non-ASCII bytes are not allowed)"
+            return Err((
+                InvalidReason::HeaderValueInvalid,
+                format!(
+                    "invalid_callback: header '{k}' value contains illegal characters \
+                     (control characters and non-ASCII bytes are not allowed)"
+                ),
             ));
         }
         headers.insert(k.clone(), val_str.to_string());
@@ -473,14 +619,23 @@ fn parse_headers(val: Option<&serde_json::Value>) -> Result<HashMap<String, Stri
     Ok(headers)
 }
 
-fn parse_max_attempts(val: Option<&serde_json::Value>, default: u32) -> Result<u32, String> {
+fn parse_max_attempts(
+    val: Option<&serde_json::Value>,
+    default: u32,
+) -> Result<u32, (InvalidReason, String)> {
     let Some(v) = val else { return Ok(default) };
-    let n = v
-        .as_u64()
-        .ok_or_else(|| "invalid_callback: max_attempts must be a positive integer".to_string())?;
+    let n = v.as_u64().ok_or_else(|| {
+        (
+            InvalidReason::MaxAttemptsNotInteger,
+            "invalid_callback: max_attempts must be a positive integer".to_string(),
+        )
+    })?;
     if !(1..=MAX_PER_CALLBACK_ATTEMPTS).contains(&n) {
-        return Err(format!(
-            "invalid_callback: max_attempts must be between 1 and {MAX_PER_CALLBACK_ATTEMPTS}; got {n}"
+        return Err((
+            InvalidReason::MaxAttemptsOutOfRange,
+            format!(
+                "invalid_callback: max_attempts must be between 1 and {MAX_PER_CALLBACK_ATTEMPTS}; got {n}"
+            ),
         ));
     }
     Ok(n as u32)
@@ -489,28 +644,44 @@ fn parse_max_attempts(val: Option<&serde_json::Value>, default: u32) -> Result<u
 fn parse_backoff(
     val: Option<&serde_json::Value>,
     default: &[Duration],
-) -> Result<Vec<Duration>, String> {
+) -> Result<Vec<Duration>, (InvalidReason, String)> {
     let Some(v) = val else {
         return Ok(default.to_vec());
     };
-    let arr = v
-        .as_array()
-        .ok_or_else(|| "invalid_callback: backoff_seconds must be an array".to_string())?;
+    let arr = v.as_array().ok_or_else(|| {
+        (
+            InvalidReason::BackoffNotArray,
+            "invalid_callback: backoff_seconds must be an array".to_string(),
+        )
+    })?;
     if arr.is_empty() {
-        return Err("invalid_callback: backoff_seconds must not be empty".to_string());
+        return Err((
+            InvalidReason::BackoffEmpty,
+            "invalid_callback: backoff_seconds must not be empty".to_string(),
+        ));
     }
     arr.iter()
         .map(|e| {
             let n = e.as_u64().ok_or_else(|| {
-                "invalid_callback: backoff_seconds elements must be positive integers".to_string()
+                (
+                    InvalidReason::BackoffElementInvalid,
+                    "invalid_callback: backoff_seconds elements must be positive integers"
+                        .to_string(),
+                )
             })?;
             if n == 0 {
-                return Err("invalid_callback: backoff_seconds elements must be > 0".to_string());
+                return Err((
+                    InvalidReason::BackoffElementInvalid,
+                    "invalid_callback: backoff_seconds elements must be > 0".to_string(),
+                ));
             }
             if n > MAX_BACKOFF_ELEMENT_SECS {
-                return Err(format!(
-                    "invalid_callback: backoff_seconds elements must be <= \
-                     {MAX_BACKOFF_ELEMENT_SECS}; got {n}"
+                return Err((
+                    InvalidReason::BackoffElementOutOfRange,
+                    format!(
+                        "invalid_callback: backoff_seconds elements must be <= \
+                         {MAX_BACKOFF_ELEMENT_SECS}; got {n}"
+                    ),
                 ));
             }
             Ok(Duration::from_secs(n))
@@ -518,29 +689,46 @@ fn parse_backoff(
         .collect()
 }
 
-fn parse_timeout(val: Option<&serde_json::Value>, default: Duration) -> Result<Duration, String> {
+fn parse_timeout(
+    val: Option<&serde_json::Value>,
+    default: Duration,
+) -> Result<Duration, (InvalidReason, String)> {
     let Some(v) = val else { return Ok(default) };
     let n = v.as_u64().ok_or_else(|| {
-        "invalid_callback: timeout_seconds must be a positive integer".to_string()
+        (
+            InvalidReason::TimeoutNotInteger,
+            "invalid_callback: timeout_seconds must be a positive integer".to_string(),
+        )
     })?;
     if !(1..=MAX_HANDLER_TIMEOUT_SECS).contains(&n) {
-        return Err(format!(
-            "invalid_callback: timeout_seconds must be between 1 and {MAX_HANDLER_TIMEOUT_SECS}; got {n}"
+        return Err((
+            InvalidReason::TimeoutOutOfRange,
+            format!(
+                "invalid_callback: timeout_seconds must be between 1 and {MAX_HANDLER_TIMEOUT_SECS}; got {n}"
+            ),
         ));
     }
     Ok(Duration::from_secs(n))
 }
 
-fn parse_external_timeout(val: Option<&serde_json::Value>) -> Result<Option<Duration>, String> {
+fn parse_external_timeout(
+    val: Option<&serde_json::Value>,
+) -> Result<Option<Duration>, (InvalidReason, String)> {
     let Some(v) = val else { return Ok(None) };
     let n = v.as_u64().ok_or_else(|| {
-        "invalid_callback: external_completion_timeout_seconds must be a positive integer"
-            .to_string()
+        (
+            InvalidReason::ExternalTimeoutNotInteger,
+            "invalid_callback: external_completion_timeout_seconds must be a positive integer"
+                .to_string(),
+        )
     })?;
     if !(1..=MAX_EXTERNAL_TIMEOUT_SECS).contains(&n) {
-        return Err(format!(
-            "invalid_callback: external_completion_timeout_seconds must be between 1 and \
-             {MAX_EXTERNAL_TIMEOUT_SECS}; got {n}"
+        return Err((
+            InvalidReason::ExternalTimeoutOutOfRange,
+            format!(
+                "invalid_callback: external_completion_timeout_seconds must be between 1 and \
+                 {MAX_EXTERNAL_TIMEOUT_SECS}; got {n}"
+            ),
         ));
     }
     Ok(Some(Duration::from_secs(n)))
@@ -549,15 +737,21 @@ fn parse_external_timeout(val: Option<&serde_json::Value>) -> Result<Option<Dura
 fn parse_max_completion_cycles(
     val: Option<&serde_json::Value>,
     default: u32,
-) -> Result<u32, String> {
+) -> Result<u32, (InvalidReason, String)> {
     let Some(v) = val else { return Ok(default) };
     let n = v.as_u64().ok_or_else(|| {
-        "invalid_callback: max_completion_cycles must be a positive integer".to_string()
+        (
+            InvalidReason::MaxCompletionCyclesNotInteger,
+            "invalid_callback: max_completion_cycles must be a positive integer".to_string(),
+        )
     })?;
     if !(1..=MAX_COMPLETION_CYCLES_LIMIT).contains(&n) {
-        return Err(format!(
-            "invalid_callback: max_completion_cycles must be between 1 and \
-             {MAX_COMPLETION_CYCLES_LIMIT}; got {n}"
+        return Err((
+            InvalidReason::MaxCompletionCyclesOutOfRange,
+            format!(
+                "invalid_callback: max_completion_cycles must be between 1 and \
+                 {MAX_COMPLETION_CYCLES_LIMIT}; got {n}"
+            ),
         ));
     }
     Ok(n as u32)
@@ -666,7 +860,7 @@ mod tests {
         let result = parse_callbacks(&json!({}), &default_config());
         assert!(result.valid.is_empty());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("not a JSON array"));
+        assert!(result.invalid[0].2.contains("not a JSON array"));
     }
 
     #[test]
@@ -704,10 +898,10 @@ mod tests {
         assert_eq!(result.invalid.len(), 1);
         assert!(
             result.invalid[0]
-                .1
+                .2
                 .contains("external_completion_timeout_seconds"),
             "got: {}",
-            result.invalid[0].1
+            result.invalid[0].2
         );
     }
 
@@ -834,7 +1028,7 @@ mod tests {
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert!(result.valid.is_empty());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("'name'"));
+        assert!(result.invalid[0].2.contains("'name'"));
     }
 
     #[test]
@@ -842,7 +1036,7 @@ mod tests {
         let cb = json!({ "name": "Ab", "url": "https://example.com/", "signing_key_id": "k" });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("invalid_callback"));
+        assert!(result.invalid[0].2.contains("invalid_callback"));
     }
 
     #[test]
@@ -850,7 +1044,7 @@ mod tests {
         let cb = json!({ "name": "abc", "signing_key_id": "k" });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("'url'"));
+        assert!(result.invalid[0].2.contains("'url'"));
     }
 
     #[test]
@@ -862,7 +1056,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("https://"));
+        assert!(result.invalid[0].2.contains("https://"));
     }
 
     #[test]
@@ -897,7 +1091,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("mode"));
+        assert!(result.invalid[0].2.contains("mode"));
     }
 
     #[test]
@@ -905,7 +1099,7 @@ mod tests {
         let cb = json!({ "name": "abc", "url": "https://example.com/" });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("signing_key_id"));
+        assert!(result.invalid[0].2.contains("signing_key_id"));
     }
 
     #[test]
@@ -926,7 +1120,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("Authorization"));
+        assert!(result.invalid[0].2.contains("Authorization"));
     }
 
     #[test]
@@ -939,7 +1133,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("Cookie"));
+        assert!(result.invalid[0].2.contains("Cookie"));
     }
 
     #[test]
@@ -952,7 +1146,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("X-Outbox-Event-Id"));
+        assert!(result.invalid[0].2.contains("X-Outbox-Event-Id"));
     }
 
     #[test]
@@ -965,7 +1159,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("header name"));
+        assert!(result.invalid[0].2.contains("header name"));
     }
 
     #[test]
@@ -1134,7 +1328,7 @@ mod tests {
         let result = parse_callbacks(&cbs, &default_config());
         assert_eq!(result.valid.len(), 1);
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("duplicate"));
+        assert!(result.invalid[0].2.contains("duplicate"));
     }
 
     #[test]
@@ -1163,7 +1357,7 @@ mod tests {
             { "name": "1bad", "url": "https://example.com/", "signing_key_id": "k" }
         ]);
         let result = parse_callbacks(&cbs, &default_config());
-        assert!(result.invalid[0].1.starts_with("invalid_callback:"));
+        assert!(result.invalid[0].2.starts_with("invalid_callback:"));
     }
 
     #[test]
@@ -1176,7 +1370,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("reserved"));
+        assert!(result.invalid[0].2.contains("reserved"));
     }
 
     #[test]
@@ -1189,7 +1383,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("reserved"));
+        assert!(result.invalid[0].2.contains("reserved"));
     }
 
     #[test]
@@ -1202,7 +1396,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("control characters"));
+        assert!(result.invalid[0].2.contains("control characters"));
     }
 
     #[test]
@@ -1215,7 +1409,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("control characters"));
+        assert!(result.invalid[0].2.contains("control characters"));
     }
 
     #[test]
@@ -1237,7 +1431,7 @@ mod tests {
                 1,
                 "non-object headers must be rejected"
             );
-            assert!(result.invalid[0].1.contains("JSON object"));
+            assert!(result.invalid[0].2.contains("JSON object"));
         }
     }
 
@@ -1250,7 +1444,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("malformed"));
+        assert!(result.invalid[0].2.contains("malformed"));
     }
 
     // ── H2: additional reserved headers ──────────────────────────────────────
@@ -1265,7 +1459,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("reserved"));
+        assert!(result.invalid[0].2.contains("reserved"));
     }
 
     #[test]
@@ -1278,7 +1472,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("reserved"));
+        assert!(result.invalid[0].2.contains("reserved"));
     }
 
     #[test]
@@ -1291,7 +1485,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("reserved"));
+        assert!(result.invalid[0].2.contains("reserved"));
     }
 
     // ── L1: case-insensitive duplicate header detection ───────────────────────
@@ -1306,7 +1500,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("duplicate"));
+        assert!(result.invalid[0].2.contains("duplicate"));
     }
 
     // ── H3: URL host and SSRF checks ─────────────────────────────────────────
@@ -1320,7 +1514,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1332,7 +1526,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1344,7 +1538,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1356,7 +1550,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1401,7 +1595,7 @@ mod tests {
         let result = parse_callbacks(&cbs, &config);
         assert!(result.valid.is_empty());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("too many callbacks"));
+        assert!(result.invalid[0].2.contains("too many callbacks"));
     }
 
     #[test]
@@ -1430,7 +1624,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("userinfo"));
+        assert!(result.invalid[0].2.contains("userinfo"));
     }
 
     #[test]
@@ -1442,7 +1636,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("userinfo"));
+        assert!(result.invalid[0].2.contains("userinfo"));
     }
 
     // ── IPv6 SSRF: additional blocked ranges ─────────────────────────────────
@@ -1456,7 +1650,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1468,7 +1662,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1480,7 +1674,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1492,7 +1686,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1504,7 +1698,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     // ── backoff element ceiling ───────────────────────────────────────────────
@@ -1522,7 +1716,7 @@ mod tests {
         assert_eq!(result.invalid.len(), 1);
         assert!(
             result.invalid[0]
-                .1
+                .2
                 .contains("backoff_seconds elements must be <=")
         );
     }
@@ -1560,7 +1754,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1573,7 +1767,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     // ── Header obs-text (non-ASCII bytes) ────────────────────────────────────
@@ -1589,7 +1783,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("illegal characters"));
+        assert!(result.invalid[0].2.contains("illegal characters"));
     }
 
     // ── Fix #1: domain-name denylist (SSRF stopgap) ──────────────────────────
@@ -1603,7 +1797,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1615,7 +1809,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1627,7 +1821,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1639,7 +1833,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1651,7 +1845,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     // ── Trailing-dot FQDN bypass (regression for SSRF stopgap) ──────────────
@@ -1667,7 +1861,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1679,7 +1873,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1691,7 +1885,7 @@ mod tests {
         });
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
-        assert!(result.invalid[0].1.contains("private or loopback"));
+        assert!(result.invalid[0].2.contains("private or loopback"));
     }
 
     #[test]
@@ -1725,9 +1919,9 @@ mod tests {
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
         assert!(
-            result.invalid[0].1.contains("must be a string"),
+            result.invalid[0].2.contains("must be a string"),
             "got: {}",
-            result.invalid[0].1
+            result.invalid[0].2
         );
     }
 
@@ -1737,9 +1931,9 @@ mod tests {
         let result = parse_callbacks(&json!([cb]), &default_config());
         assert_eq!(result.invalid.len(), 1);
         assert!(
-            result.invalid[0].1.contains("must be a string"),
+            result.invalid[0].2.contains("must be a string"),
             "got: {}",
-            result.invalid[0].1
+            result.invalid[0].2
         );
     }
 

@@ -1034,8 +1034,8 @@ which couples observability stability to internal error text — every reword in
 | 11 | `outbox_lag_seconds` emits 0.0 instead of NaN | `crates/bin/src/main.rs:484` | Low | Correctness | DONE | `unwrap_or(f64::NAN)` consistent with F6 fix |
 | 12 | OTel tracer missing `service.name` resource | `crates/bin/src/main.rs:413-415` | Medium | Observability | DONE | `Resource` with `service.name`, `service.version`, `deployment.environment` added; `app_env` passed into `init_tracing` |
 | 13 | `outbox_external_pending_seconds` never emitted | `crates/core/src/metrics.rs:140-147` | Low | Correctness | DONE | New `Repo::sample_external_pending_ages` method + `PgRepo` impl; wired from `run_stats_sampler` |
-| 14 | `outbox_completion_cycles_exhausted_total` over-emitted on every max-attempts dead-letter | `crates/core/src/dispatch.rs:184-185,230-231` | Medium | Correctness | TODO | Drop the call from both dispatch branches; the legitimate emit lives in `timeout_sweep.rs:43` |
-| 15 | `outbox_invalid_callbacks_total` label uses free-text reason fragments | `crates/core/src/scheduler.rs:302-316,322-330` | Low | Idiom / Observability | TODO | Introduce a stable `InvalidReason` code in `callbacks.rs`; never pass raw error text as a Prometheus label |
+| 14 | `outbox_completion_cycles_exhausted_total` over-emitted on every max-attempts dead-letter | `crates/core/src/dispatch.rs:184-185,230-231` | Medium | Correctness | DONE | Removed both `inc_completion_cycles_exhausted_total` calls from the dispatch transient-failure and timeout dead-letter branches; the metric is now only emitted by `timeout_sweep.rs` as intended |
+| 15 | `outbox_invalid_callbacks_total` label uses free-text reason fragments | `crates/core/src/scheduler.rs:302-316,322-330` | Low | Idiom / Observability | DONE | Added `InvalidReason` enum with `metric_label()` to `callbacks.rs`; `ParsedCallbacks.invalid` changed to `(name, InvalidReason, message)`; both `scheduler.rs` emit sites now call `reason_code.metric_label()` for a stable, bounded Prometheus label |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
@@ -1046,15 +1046,8 @@ which couples observability stability to internal error text — every reword in
 
 ## PR state
 
-**Status: READY TO MERGE (with two small follow-ups)**
+**Status: READY TO MERGE**
 
-- All 13 previously-flagged findings are fully addressed (verified in the diff and by
-  reading the affected files at HEAD).
-- `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  and `cargo test --workspace --lib` all pass cleanly (297 unit tests green).
-- Two new findings (F14, F15) are non-blocking: F14 is a metric over-emission with a
-  trivial one-line-each fix in `dispatch.rs`; F15 is an idiomatic improvement that
-  prevents label-cardinality drift. Neither affects delivery correctness, dispatch
-  safety, or security.
-- Recommend merging Phase 7 and addressing F14 + F15 in a small follow-up PR (or
-  squashing into this PR if the author prefers a single tidy phase-7 commit).
+- All 15 findings are fully addressed.
+- `cargo fmt --all`, `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  and `cargo test --workspace` all pass cleanly (277 unit + 13 integration tests green).

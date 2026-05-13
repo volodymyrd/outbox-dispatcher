@@ -287,30 +287,24 @@ pub async fn schedule_new_deliveries(
         //   (b) Valid array that fails an array-level check (e.g. too many callbacks).
         //       Dead-letter every named entry so the rejection is visible to operators
         //       via the admin dead-letter list.
-        if parsed.valid.is_empty() && parsed.invalid.iter().all(|(n, _)| n == "<root>") {
+        if parsed.valid.is_empty() && parsed.invalid.iter().all(|(n, _, _)| n == "<root>") {
             if event.callbacks.is_array() {
                 // Array exists but failed an array-level check (e.g. too many callbacks).
                 // Dead-letter every entry so the rejection is visible in the dead-letter list.
-                let reason = parsed
+                let (reason_code, reason_msg) = parsed
                     .invalid
                     .first()
-                    .map(|(_, r)| r.clone())
-                    .unwrap_or_else(|| {
-                        "invalid_callback: unspecified array-level rejection".to_string()
-                    });
+                    .map(|(_, code, msg)| (*code, msg.clone()))
+                    .unwrap_or((
+                        crate::callbacks::InvalidReason::Other,
+                        "invalid_callback: unspecified array-level rejection".to_string(),
+                    ));
                 let entries: Vec<(String, String)> = extract_callback_names(&event.callbacks)
                     .into_iter()
-                    .map(|n| (n, reason.clone()))
+                    .map(|n| (n, reason_msg.clone()))
                     .collect();
-                for (_, r) in &entries {
-                    // Extract the short reason prefix for the metric label.
-                    let label = r
-                        .strip_prefix("invalid_callback: ")
-                        .unwrap_or(r.as_str())
-                        .split(':')
-                        .next()
-                        .unwrap_or("unknown");
-                    metrics::inc_invalid_callbacks_total(label);
+                for _ in &entries {
+                    metrics::inc_invalid_callbacks_total(reason_code.metric_label());
                 }
                 repo.create_invalid_deliveries(event.event_id, &entries)
                     .await?;
@@ -331,14 +325,8 @@ pub async fn schedule_new_deliveries(
         metrics::inc_events_total(&event.kind);
 
         // Emit invalid_callbacks_total for each structurally invalid callback.
-        for (_, reason) in &parsed.invalid {
-            let label = reason
-                .strip_prefix("invalid_callback: ")
-                .unwrap_or(reason.as_str())
-                .split(':')
-                .next()
-                .unwrap_or("unknown");
-            metrics::inc_invalid_callbacks_total(label);
+        for (_, reason_code, _) in &parsed.invalid {
+            metrics::inc_invalid_callbacks_total(reason_code.metric_label());
         }
 
         // Schedule valid callbacks. Propagate DB errors so the cursor stays at the last
@@ -350,7 +338,12 @@ pub async fn schedule_new_deliveries(
 
         // Dead-letter structurally invalid callbacks. Same rule: propagate DB errors.
         if !parsed.invalid.is_empty() {
-            repo.create_invalid_deliveries(event.event_id, &parsed.invalid)
+            let invalid_entries: Vec<(String, String)> = parsed
+                .invalid
+                .iter()
+                .map(|(name, _, msg)| (name.clone(), msg.clone()))
+                .collect();
+            repo.create_invalid_deliveries(event.event_id, &invalid_entries)
                 .await?;
         }
 

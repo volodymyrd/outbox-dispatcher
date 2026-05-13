@@ -182,7 +182,6 @@ async fn dispatch_one(
 
             if dead {
                 metrics::inc_dead_letters_total(cb_name);
-                metrics::inc_completion_cycles_exhausted_total(cb_name);
                 warn!(
                     delivery_id = due.delivery_id,
                     attempts = next_attempt,
@@ -228,7 +227,6 @@ async fn dispatch_one(
 
             if dead {
                 metrics::inc_dead_letters_total(cb_name);
-                metrics::inc_completion_cycles_exhausted_total(cb_name);
                 warn!(
                     delivery_id = due.delivery_id,
                     max_attempts = due.target.max_attempts,
