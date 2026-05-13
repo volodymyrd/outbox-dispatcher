@@ -820,6 +820,203 @@ and the implementation should agree.
 
 ---
 
+---
+
+## Third-pass review (2026-05-13T15:28:35Z)
+
+Findings 1–13 are all addressed. The following new findings were identified on a
+fresh re-read of the resulting code paths in the `phase7` branch (PR #6).
+
+### Finding 14 — `outbox_completion_cycles_exhausted_total` over-emitted on every max-attempts dead-letter
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/dispatch.rs:184-185,230-231` |
+| **Severity** | Medium |
+| **Category** | Correctness |
+
+**Problem**
+
+`outbox_completion_cycles_exhausted_total{callback}` is documented (§12.1 and the
+metric index in `crates/core/src/metrics.rs:21-22`) as counting external-mode
+deliveries that were dead-lettered specifically because they exhausted
+`max_completion_cycles` — i.e. the receiver kept failing to POST the
+external-completion confirmation. The legitimate emit point is
+`crates/core/src/timeout_sweep.rs:43`.
+
+`dispatch.rs` now also bumps the same counter for **every** max-attempts
+exhaustion in the dispatch path — once after a transient-failure dead-letter
+(`dispatch.rs:184-185`) and once after a callback-timeout dead-letter
+(`dispatch.rs:230-231`). Those are regular delivery exhaustions, already covered
+by `outbox_dead_letters_total{callback}`. Dashboards keyed on
+`outbox_completion_cycles_exhausted_total` will therefore double-count: every
+dead-letter increments both metrics, and an operator alerting on "external
+completion confirmation is failing" will fire false positives whenever a
+managed-mode webhook simply runs out of retries.
+
+**Context** (`crates/core/src/dispatch.rs:180-237`)
+
+```rust
+let dead = next_attempt >= due.target.max_attempts as i32;
+
+if dead {
+    metrics::inc_dead_letters_total(cb_name);
+    metrics::inc_completion_cycles_exhausted_total(cb_name);   // ← wrong: not a completion-cycle event
+    warn!(
+        delivery_id = due.delivery_id,
+        attempts = next_attempt,
+        max_attempts = due.target.max_attempts,
+        reason = %reason,
+        "delivery exhausted retries — dead-lettering"
+    );
+}
+// ...
+// Tokio timeout — treat as a transient failure
+Err(_timeout) => {
+    // ...
+    if dead {
+        metrics::inc_dead_letters_total(cb_name);
+        metrics::inc_completion_cycles_exhausted_total(cb_name);   // ← same bug
+        warn!(
+            delivery_id = due.delivery_id,
+            max_attempts = due.target.max_attempts,
+            "delivery exhausted retries after timeout — dead-lettering"
+        );
+    }
+```
+
+**Recommended fix**
+
+Drop the `inc_completion_cycles_exhausted_total` call from both dispatch
+branches; leave it only in `timeout_sweep.rs` where the exhaustion is genuinely
+about external completion cycles:
+
+```rust
+if dead {
+    metrics::inc_dead_letters_total(cb_name);
+    warn!(
+        delivery_id = due.delivery_id,
+        attempts = next_attempt,
+        max_attempts = due.target.max_attempts,
+        reason = %reason,
+        "delivery exhausted retries — dead-lettering"
+    );
+}
+```
+
+**Why this fix**
+
+Two distinct events (max-attempts exhaustion vs. completion-cycles exhaustion)
+should map to two distinct counters. Conflating them either makes the
+completion-cycles counter unusable for alerting or double-counts the
+dead-letter rate. Operators who want a single "anything dead-lettered" series
+already have `outbox_dead_letters_total`.
+
+---
+
+### Finding 15 — `outbox_invalid_callbacks_total` label has unbounded, free-text values
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/scheduler.rs:302-316,322-330` |
+| **Severity** | Low |
+| **Category** | Idiom / Observability |
+
+**Problem**
+
+The label-derivation logic strips the `"invalid_callback: "` prefix from the
+parser's error message and takes the chunk before the first `:` as the metric
+label:
+
+```rust
+let label = r
+    .strip_prefix("invalid_callback: ")
+    .unwrap_or(r.as_str())
+    .split(':')
+    .next()
+    .unwrap_or("unknown");
+metrics::inc_invalid_callbacks_total(label);
+```
+
+The parser's reason strings (see `crates/core/src/callbacks.rs:188-558`) include
+free-text fragments such as
+`"url 'https://attacker.example/foo' must use https:// scheme; got 'http'"`,
+`"header 'X-Custom-Foo' is reserved and cannot be set"`, and
+`"max_attempts must be between 1 and 50; got 200"`. After the split-on-`:` the
+labels become things like `url 'https`, `header 'X-Custom-Foo' is reserved and cannot be set`,
+or `max_attempts must be between 1 and 50; got 200` — i.e. arbitrarily long,
+user-influenced strings rather than stable short identifiers. This produces:
+
+- High-cardinality time-series in Prometheus (one per distinct header name or
+  reason variant); the metric explodes if an attacker can submit varied
+  callback specs.
+- Labels that are hostile to dashboards (long sentences, embedded quotes).
+- A contract that silently changes whenever an error message in
+  `callbacks.rs` is reworded.
+
+**Recommended fix**
+
+Have `parse_callbacks` (and `payload_too_large_error`) return a structured
+reason code in addition to the human-readable string. A minimal version uses a
+small enum mapped to a stable static label:
+
+```rust
+// callbacks.rs
+pub enum InvalidReason {
+    MissingName,
+    NameInvalid,
+    MissingUrl,
+    UrlNotHttps,
+    UrlPrivateHost,
+    HeaderReserved,
+    HeaderInvalidName,
+    MaxAttemptsOutOfRange,
+    DuplicateName,
+    TooManyCallbacks,
+    PayloadTooLarge,
+    // …
+    Other,
+}
+
+impl InvalidReason {
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            Self::MissingName            => "missing_name",
+            Self::NameInvalid            => "name_invalid",
+            Self::MissingUrl             => "missing_url",
+            Self::UrlNotHttps            => "url_not_https",
+            Self::UrlPrivateHost         => "url_private_host",
+            Self::HeaderReserved         => "header_reserved",
+            Self::HeaderInvalidName      => "header_invalid_name",
+            Self::MaxAttemptsOutOfRange  => "max_attempts_out_of_range",
+            Self::DuplicateName          => "duplicate_name",
+            Self::TooManyCallbacks       => "too_many_callbacks",
+            Self::PayloadTooLarge        => "payload_too_large",
+            Self::Other                  => "other",
+        }
+    }
+}
+
+// scheduler.rs
+for (_, reason) in &parsed.invalid {
+    metrics::inc_invalid_callbacks_total(reason.code.metric_label());
+}
+```
+
+If the refactor is too invasive for this PR, an interim fix is to keep the
+free-text reasons but map them to a small set of stable labels at the emit site
+via a pattern match on prefixes, and never pass user input straight through.
+
+**Why this fix**
+
+Prometheus best practice is bounded, short, stable label values. The current
+emit point makes the metric's cardinality a function of message wording and
+operator-submitted strings (callback name, URL scheme prefix, header name),
+which couples observability stability to internal error text — every reword in
+`callbacks.rs` silently breaks dashboards.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
@@ -837,8 +1034,27 @@ and the implementation should agree.
 | 11 | `outbox_lag_seconds` emits 0.0 instead of NaN | `crates/bin/src/main.rs:484` | Low | Correctness | DONE | `unwrap_or(f64::NAN)` consistent with F6 fix |
 | 12 | OTel tracer missing `service.name` resource | `crates/bin/src/main.rs:413-415` | Medium | Observability | DONE | `Resource` with `service.name`, `service.version`, `deployment.environment` added; `app_env` passed into `init_tracing` |
 | 13 | `outbox_external_pending_seconds` never emitted | `crates/core/src/metrics.rs:140-147` | Low | Correctness | DONE | New `Repo::sample_external_pending_ages` method + `PgRepo` impl; wired from `run_stats_sampler` |
+| 14 | `outbox_completion_cycles_exhausted_total` over-emitted on every max-attempts dead-letter | `crates/core/src/dispatch.rs:184-185,230-231` | Medium | Correctness | TODO | Drop the call from both dispatch branches; the legitimate emit lives in `timeout_sweep.rs:43` |
+| 15 | `outbox_invalid_callbacks_total` label uses free-text reason fragments | `crates/core/src/scheduler.rs:302-316,322-330` | Low | Idiom / Observability | TODO | Introduce a stable `InvalidReason` code in `callbacks.rs`; never pass raw error text as a Prometheus label |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
 > - If a finding is intentionally skipped or cannot be applied, change `TODO` to `SKIPPED` and add a short reason in the **Notes** column.
 > - Do not delete rows — the table is the authoritative implementation log.
+
+---
+
+## PR state
+
+**Status: READY TO MERGE (with two small follow-ups)**
+
+- All 13 previously-flagged findings are fully addressed (verified in the diff and by
+  reading the affected files at HEAD).
+- `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  and `cargo test --workspace --lib` all pass cleanly (297 unit tests green).
+- Two new findings (F14, F15) are non-blocking: F14 is a metric over-emission with a
+  trivial one-line-each fix in `dispatch.rs`; F15 is an idiomatic improvement that
+  prevents label-cardinality drift. Neither affects delivery correctness, dispatch
+  safety, or security.
+- Recommend merging Phase 7 and addressing F14 + F15 in a small follow-up PR (or
+  squashing into this PR if the author prefers a single tidy phase-7 commit).
