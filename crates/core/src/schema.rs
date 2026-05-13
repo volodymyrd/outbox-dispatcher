@@ -218,7 +218,11 @@ pub struct RawEventSerializable {
 /// Per-callback breakdown returned by `GET /v1/stats`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CallbackStats {
-    pub pending: i64,
+    /// Deliveries awaiting first dispatch in `managed` completion mode.
+    pub pending_managed: i64,
+    /// Deliveries awaiting first dispatch in `external` completion mode.
+    pub pending_external: i64,
+    /// Deliveries dispatched in `external` mode and awaiting completion confirmation.
     pub external_pending: i64,
     pub dead_lettered: i64,
 }
@@ -240,7 +244,8 @@ pub struct Stats {
 #[derive(Debug, sqlx::FromRow)]
 pub struct StatsRow {
     pub callback_name: String,
-    pub pending: i64,
+    pub pending_managed: i64,
+    pub pending_external: i64,
     pub external_pending: i64,
     pub dead_lettered: i64,
 }

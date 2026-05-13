@@ -670,6 +670,13 @@ mod tests {
             })
         }
 
+        async fn sample_external_pending_ages(
+            &self,
+            _sample_size: i64,
+        ) -> crate::error::Result<Vec<(String, f64)>> {
+            Ok(Vec::new())
+        }
+
         async fn delete_terminal_events(
             &self,
             _dead_letter_cutoff: chrono::DateTime<Utc>,

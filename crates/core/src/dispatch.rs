@@ -466,6 +466,13 @@ mod tests {
             })
         }
 
+        async fn sample_external_pending_ages(
+            &self,
+            _sample_size: i64,
+        ) -> Result<Vec<(String, f64)>> {
+            Ok(Vec::new())
+        }
+
         async fn ping(&self) -> Result<()> {
             Ok(())
         }

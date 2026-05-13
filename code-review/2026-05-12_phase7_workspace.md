@@ -832,11 +832,11 @@ and the implementation should agree.
 | 6 | `oldest_event_age` gauge sentinel collides | `crates/core/src/retention.rs:86-90` | Low | Correctness | DONE | Publishes `f64::NAN` when no eligible events remain |
 | 7 | Counter increments in a `for` loop | `crates/core/src/timeout_sweep.rs:36-47` | Low | Performance | DONE | Added `inc_*_by(count)` helpers; `for` loops replaced with single `increment(N)` calls |
 | 8 | Retention worker has no startup jitter | `crates/core/src/retention.rs:70-78` | Low | Concurrency | DONE | Random initial delay `0..cleanup_interval_secs` added before the main loop |
-| 9 | Stats sampler hard-codes `mode="managed"` | `crates/bin/src/main.rs:485-488` | Medium | Correctness | TODO | `pending` count includes both modes; `mode="external"` gauge series is permanently empty |
-| 10 | Stale gauges for drained callbacks | `crates/bin/src/main.rs:482-489` | Low | Correctness | TODO | Track last-seen callbacks and zero out missing labels on the next tick |
-| 11 | `outbox_lag_seconds` emits 0.0 instead of NaN | `crates/bin/src/main.rs:484` | Low | Correctness | TODO | Same pattern as the F6 fix — use `f64::NAN` so empty-queue scrape isn't ambiguous |
-| 12 | OTel tracer missing `service.name` resource | `crates/bin/src/main.rs:413-415` | Medium | Observability | TODO | Add `Resource` with `service.name`, `service.version`, `deployment.environment` |
-| 13 | `outbox_external_pending_seconds` never emitted | `crates/core/src/metrics.rs:140-147` | Low | Correctness | TODO | Either wire it from a new `Repo::sample_external_pending_ages` call or delete the helper |
+| 9 | Stats sampler hard-codes `mode="managed"` | `crates/bin/src/main.rs:485-488` | Medium | Correctness | DONE | `CallbackStats` split into `pending_managed`/`pending_external`; SQL updated; both `mode` series emitted |
+| 10 | Stale gauges for drained callbacks | `crates/bin/src/main.rs:482-489` | Low | Correctness | DONE | `last_callbacks` set tracks previous tick; missing labels zeroed on next tick |
+| 11 | `outbox_lag_seconds` emits 0.0 instead of NaN | `crates/bin/src/main.rs:484` | Low | Correctness | DONE | `unwrap_or(f64::NAN)` consistent with F6 fix |
+| 12 | OTel tracer missing `service.name` resource | `crates/bin/src/main.rs:413-415` | Medium | Observability | DONE | `Resource` with `service.name`, `service.version`, `deployment.environment` added; `app_env` passed into `init_tracing` |
+| 13 | `outbox_external_pending_seconds` never emitted | `crates/core/src/metrics.rs:140-147` | Low | Correctness | DONE | New `Repo::sample_external_pending_ages` method + `PgRepo` impl; wired from `run_stats_sampler` |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

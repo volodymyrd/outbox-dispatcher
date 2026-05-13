@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::time::Duration;
@@ -94,7 +95,7 @@ async fn run() -> Result<()> {
         }
     };
 
-    let tracer_provider = init_tracing(&config.log, &config.observability)
+    let tracer_provider = init_tracing(&config.log, &config.observability, &app_env)
         .context("initialising tracing subscriber")?;
     info!(env = %app_env, "outbox-dispatcher starting");
 
@@ -381,6 +382,7 @@ async fn connect_pool(db: &DatabaseConfig) -> Result<PgPool> {
 fn init_tracing(
     log: &LogConfig,
     obs: &ObservabilityConfig,
+    app_env: &str,
 ) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -402,7 +404,9 @@ fn init_tracing(
 
     // Optionally attach an OpenTelemetry tracing layer when an OTLP endpoint is configured.
     if !obs.otel_endpoint.is_empty() {
+        use opentelemetry::KeyValue;
         use opentelemetry_otlp::WithExportConfig;
+        use opentelemetry_sdk::Resource;
 
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
@@ -410,7 +414,16 @@ fn init_tracing(
             .build()
             .context("building OTLP span exporter")?;
 
+        let resource = Resource::builder()
+            .with_attributes([
+                KeyValue::new("service.name", "outbox-dispatcher"),
+                KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                KeyValue::new("deployment.environment", app_env.to_owned()),
+            ])
+            .build();
+
         let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(resource)
             .with_batch_exporter(exporter)
             .build();
 
@@ -468,10 +481,15 @@ fn init_metrics(obs: &ObservabilityConfig) -> Result<()> {
 /// Periodically calls `repo.fetch_stats()` and publishes queue-state gauges so
 /// `outbox_lag_seconds`, `outbox_pending_deliveries`, and
 /// `outbox_external_pending_deliveries` are populated for Prometheus scraping.
+/// Also samples per-row ages for the `outbox_external_pending_seconds` histogram.
 ///
 /// Runs every `interval` (typically the scheduler's `poll_interval`) and stops when
 /// `shutdown` is cancelled.
 async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: CancellationToken) {
+    // Track callbacks seen on the previous tick so we can zero out stale series
+    // when a callback drains to zero and disappears from fetch_stats results.
+    let mut last_callbacks: HashSet<String> = HashSet::new();
+
     loop {
         tokio::select! {
             biased;
@@ -481,14 +499,42 @@ async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: Ca
 
         match repo.fetch_stats().await {
             Ok(stats) => {
-                metrics::set_lag_seconds(stats.oldest_pending_age_seconds.unwrap_or(0.0));
+                // Use NaN when the queue is empty so alerts on "lag > N" don't
+                // conflate "no pending events" with "freshly-enqueued event at age 0".
+                metrics::set_lag_seconds(stats.oldest_pending_age_seconds.unwrap_or(f64::NAN));
+
+                let mut now_seen: HashSet<String> = HashSet::new();
                 for (cb, s) in &stats.callbacks {
-                    metrics::set_pending_deliveries(cb, "managed", s.pending as f64);
+                    now_seen.insert(cb.clone());
+                    metrics::set_pending_deliveries(cb, "managed", s.pending_managed as f64);
+                    metrics::set_pending_deliveries(cb, "external", s.pending_external as f64);
                     metrics::set_external_pending_deliveries(cb, s.external_pending as f64);
                 }
+
+                // Zero out gauges for callbacks that have fully drained so scrapes
+                // don't show phantom backlogs from stale label sets.
+                for stale in last_callbacks.difference(&now_seen) {
+                    metrics::set_pending_deliveries(stale, "managed", 0.0);
+                    metrics::set_pending_deliveries(stale, "external", 0.0);
+                    metrics::set_external_pending_deliveries(stale, 0.0);
+                }
+                last_callbacks = now_seen;
             }
             Err(e) => {
                 warn!(error = %e, "stats sampler: fetch_stats failed");
+            }
+        }
+
+        // Populate the outbox_external_pending_seconds histogram with per-row ages
+        // for external-mode deliveries currently awaiting completion confirmation.
+        match repo.sample_external_pending_ages(1000).await {
+            Ok(samples) => {
+                for (cb, age_secs) in samples {
+                    metrics::record_external_pending_seconds(&cb, age_secs);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "stats sampler: sample_external_pending_ages failed");
             }
         }
     }

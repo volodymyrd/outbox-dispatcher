@@ -123,6 +123,12 @@ pub trait Repo: Send + Sync {
     /// Returns aggregate delivery counts for the stats endpoint.
     async fn fetch_stats(&self) -> Result<Stats>;
 
+    /// Returns up to `sample_size` `(callback_name, age_seconds)` pairs for
+    /// external-mode deliveries currently awaiting completion confirmation.
+    /// Used by the stats sampler to populate the
+    /// `outbox_external_pending_seconds` histogram.
+    async fn sample_external_pending_ages(&self, sample_size: i64) -> Result<Vec<(String, f64)>>;
+
     // ── Retention ──────────────────────────────────────────────────────────
 
     /// Deletes up to `batch_limit` fully-terminal events whose age exceeds the
@@ -814,10 +820,17 @@ impl Repo for PgRepo {
             SELECT
                 callback_name,
                 COUNT(*) FILTER (
-                    WHERE dispatched_at IS NULL
+                    WHERE completion_mode = 'managed'
+                      AND dispatched_at IS NULL
                       AND processed_at  IS NULL
                       AND dead_letter   = FALSE
-                ) AS "pending!",
+                ) AS "pending_managed!",
+                COUNT(*) FILTER (
+                    WHERE completion_mode = 'external'
+                      AND dispatched_at IS NULL
+                      AND processed_at  IS NULL
+                      AND dead_letter   = FALSE
+                ) AS "pending_external!",
                 COUNT(*) FILTER (
                     WHERE completion_mode = 'external'
                       AND dispatched_at   IS NOT NULL
@@ -839,7 +852,8 @@ impl Repo for PgRepo {
             callbacks.insert(
                 row.callback_name,
                 CallbackStats {
-                    pending: row.pending,
+                    pending_managed: row.pending_managed,
+                    pending_external: row.pending_external,
                     external_pending: row.external_pending,
                     dead_lettered: row.dead_lettered,
                 },
@@ -854,6 +868,31 @@ impl Repo for PgRepo {
             oldest_pending_age_seconds: totals.oldest_pending_age_seconds,
             callbacks,
         })
+    }
+
+    async fn sample_external_pending_ages(&self, sample_size: i64) -> Result<Vec<(String, f64)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                callback_name,
+                EXTRACT(EPOCH FROM (now() - dispatched_at))::float8 AS "age_seconds!"
+            FROM outbox_deliveries
+            WHERE completion_mode = 'external'
+              AND dispatched_at   IS NOT NULL
+              AND processed_at    IS NULL
+              AND dead_letter     = FALSE
+            ORDER BY dispatched_at
+            LIMIT $1
+            "#,
+            sample_size
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.callback_name, r.age_seconds))
+            .collect())
     }
 
     async fn delete_terminal_events(
