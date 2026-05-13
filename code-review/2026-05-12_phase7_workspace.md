@@ -1044,10 +1044,383 @@ which couples observability stability to internal error text — every reword in
 
 ---
 
-## PR state
+## Fourth-pass review (2026-05-13T15:48:03Z)
 
-**Status: READY TO MERGE**
+Findings 1–15 are all addressed and verified. A fresh re-read of the resulting code
+on `phase7` (HEAD: `fb27ed5`) surfaced four additional findings: one Medium, three Low.
 
-- All 15 findings are fully addressed.
-- `cargo fmt --all`, `cargo check --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
-  and `cargo test --workspace` all pass cleanly (277 unit + 13 integration tests green).
+### Finding 16 — Spawned background tasks are not awaited on shutdown
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:244-286,288-308` |
+| **Severity** | Medium |
+| **Category** | Concurrency / Correctness |
+
+**Problem**
+
+Three background tasks are launched via `tokio::spawn(...)` and their `JoinHandle`s
+are dropped immediately: the admin HTTP server (`main.rs:244-266`), the retention
+worker (`main.rs:273-275`), and the stats sampler (`main.rs:283-285`). Each task
+*internally* watches `shutdown.cancelled()`, but the main flow does not await any
+of them — after `run_scheduler_with_cycle_tracker` returns, `run()` proceeds
+straight to `tracer_provider.shutdown()` and returns, at which point `#[tokio::main]`
+drops the runtime and **aborts** every still-running task abruptly.
+
+Concrete consequences:
+
+1. The admin server's `axum::serve(...).with_graceful_shutdown(...)` begins draining
+   in-flight requests when the cancellation token fires, but the spawned task running
+   it is dropped before the drain can complete. Open admin connections (e.g. an
+   operator retrying a delivery during a deploy) are reset rather than cleanly closed.
+2. The retention worker may be in the middle of `delete_terminal_events` when shutdown
+   fires; aborting that future leaves the in-flight `DELETE ... RETURNING` to be
+   rolled back by Postgres but loses the resulting `info!` log line that the cycle
+   ran at all.
+3. The stats sampler's last gauge write is lost, which is benign but breaks the
+   pattern.
+4. `tracer_provider.shutdown()` runs **before** the other tasks finish, so any spans
+   they emit during their final drain step (the retention worker's "cycle completed"
+   log, an admin handler's error response span) are dropped by the very batch
+   exporter Finding 2 set up to flush them.
+
+**Context** (`crates/bin/src/main.rs:280-308` — task spawns + final shutdown sequence)
+
+```rust
+// Spawn the periodic stats sampler that publishes queue-state gauges.
+{
+    let stats_repo = repo.clone();
+    let poll_interval = Duration::from_secs(config.dispatch.poll_interval_secs);
+    let stats_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        run_stats_sampler(stats_repo, poll_interval, stats_shutdown).await;
+    });
+}
+
+info!("starting scheduler");
+run_scheduler_with_cycle_tracker(/* ... */).await
+    .context("scheduler exited with error")?;
+
+// Flush any buffered spans before the process exits.
+if let Some(provider) = tracer_provider
+    && let Err(e) = provider.shutdown()
+{
+    warn!(error = ?e, "OpenTelemetry tracer shutdown failed");
+}
+
+info!("outbox-dispatcher stopped cleanly");
+```
+
+**Recommended fix**
+
+Collect the join handles into a `JoinSet` (or a `Vec<JoinHandle<()>>`) and await them
+after the scheduler exits but *before* the tracer shutdown:
+
+```rust
+let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+// admin server
+workers.spawn(async move { /* axum::serve(...).await as today */ });
+
+// retention worker (only when enabled)
+if config.retention.enabled {
+    let retention_repo = repo.clone();
+    let retention_cfg = config.retention.clone();
+    let retention_shutdown = shutdown.clone();
+    workers.spawn(async move {
+        run_retention_worker(retention_repo, retention_cfg, retention_shutdown).await;
+    });
+}
+
+// stats sampler
+{
+    let stats_repo = repo.clone();
+    let poll_interval = Duration::from_secs(config.dispatch.poll_interval_secs);
+    let stats_shutdown = shutdown.clone();
+    workers.spawn(async move {
+        run_stats_sampler(stats_repo, poll_interval, stats_shutdown).await;
+    });
+}
+
+info!("starting scheduler");
+run_scheduler_with_cycle_tracker(/* ... */).await
+    .context("scheduler exited with error")?;
+
+// Wait for the admin server, retention worker, and stats sampler to drain.
+while let Some(res) = workers.join_next().await {
+    if let Err(e) = res {
+        warn!(error = ?e, "background worker exited abnormally during shutdown");
+    }
+}
+
+// Now it's safe to flush the tracer.
+if let Some(provider) = tracer_provider
+    && let Err(e) = provider.shutdown()
+{
+    warn!(error = ?e, "OpenTelemetry tracer shutdown failed");
+}
+```
+
+**Why this fix**
+
+Each spawned task already responds to the shutdown signal — wiring the main thread
+to wait for them turns "best-effort cancellation" into "true graceful shutdown",
+which is the explicit contract advertised by `info!("outbox-dispatcher stopped
+cleanly")`. It also restores the intended ordering with Finding 2's tracer flush:
+spans emitted during the workers' final drain step are queued *before* the batch
+exporter is shut down.
+
+---
+
+### Finding 17 — `outbox_invalid_callbacks_total` incremented in a per-row `for` loop
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/scheduler.rs:306-308` |
+| **Severity** | Low |
+| **Category** | Performance / Idiom |
+
+**Problem**
+
+Identical anti-pattern to Finding 7 (which added `_by(count: u64)` helpers for the
+timeout-sweep counters), now in the scheduler's array-level rejection path:
+
+```rust
+for _ in &entries {
+    metrics::inc_invalid_callbacks_total(reason_code.metric_label());
+}
+```
+
+`entries.len()` is bounded above by `max_callbacks_per_event` (≤ 1 000), so the
+performance impact is small in absolute terms — but the pattern is exactly the one
+Finding 7 corrected for the sweeper counters, and `parsed.invalid` higher up uses a
+similar emit-once-per-element loop at `scheduler.rs:328-330`. Adopting the
+`_by(count)` shape keeps the metric helpers consistent.
+
+**Context** (`crates/core/src/scheduler.rs:302-310,326-330`)
+
+```rust
+let entries: Vec<(String, String)> = extract_callback_names(&event.callbacks)
+    .into_iter()
+    .map(|n| (n, reason_msg.clone()))
+    .collect();
+for _ in &entries {
+    metrics::inc_invalid_callbacks_total(reason_code.metric_label());
+}
+// ...
+// Emit invalid_callbacks_total for each structurally invalid callback.
+for (_, reason_code, _) in &parsed.invalid {
+    metrics::inc_invalid_callbacks_total(reason_code.metric_label());
+}
+```
+
+**Recommended fix**
+
+Add `inc_invalid_callbacks_total_by(label, count: u64)` in `metrics.rs` (mirroring
+`inc_external_timeout_resets_total_by` and `inc_completion_cycles_exhausted_total_by`),
+and use it for the array-level path. The per-element parser loop is justified —
+each row has a *different* `reason_code` — but can collapse to a single call when
+all entries share the same label.
+
+```rust
+// metrics.rs
+#[inline]
+pub fn inc_invalid_callbacks_total_by(reason: &str, count: u64) {
+    metrics::counter!(INVALID_CALLBACKS_TOTAL, "reason" => reason.to_owned())
+        .increment(count);
+}
+
+// scheduler.rs (array-level rejection branch)
+metrics::inc_invalid_callbacks_total_by(reason_code.metric_label(), entries.len() as u64);
+```
+
+**Why this fix**
+
+Consistency with Finding 7's resolution; one allocation/macro expansion per batch
+instead of N. Low impact on its own, but worth doing once for symmetry with the
+other `_by` helpers.
+
+---
+
+### Finding 18 — `record_external_pending_seconds` is a snapshot histogram, biased toward long-lived rows
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:528-540`, `crates/core/src/repo.rs:873-896` |
+| **Severity** | Low |
+| **Category** | Correctness / Observability |
+
+**Problem**
+
+The stats sampler calls `repo.sample_external_pending_ages(1000)` every
+`poll_interval`, then records each `(callback_name, age_seconds)` pair as a
+histogram observation. This is the Finding-13 wiring as designed, but it has two
+distortions worth surfacing:
+
+1. **Time-weighted, not row-weighted.** A delivery that sits external-pending for
+   one hour is observed `3600 / poll_interval` times (≈720 observations at the
+   default 5 s interval), with progressively-larger ages. A delivery that completes
+   in 5 s is observed once. The histogram's p50/p99 therefore reflect "time spent
+   pending" not "row pending duration", which is a less useful percentile and is
+   the opposite of what most dashboard authors will assume.
+2. **Selection bias on overflow.** `ORDER BY dispatched_at LIMIT 1000` returns the
+   *oldest* 1 000 external-pending rows; once the backlog exceeds 1 000, the
+   newest rows are never observed, so the histogram's lower buckets become
+   permanently empty until the backlog drains. Operators alerting on
+   `histogram_quantile(0.5, ...) < threshold` will see the gauge stay pegged high
+   even after recent rows complete quickly.
+
+**Context** (`crates/bin/src/main.rs:528-540`)
+
+```rust
+// Populate the outbox_external_pending_seconds histogram with per-row ages
+// for external-mode deliveries currently awaiting completion confirmation.
+match repo.sample_external_pending_ages(1000).await {
+    Ok(samples) => {
+        for (cb, age_secs) in samples {
+            metrics::record_external_pending_seconds(&cb, age_secs);
+        }
+    }
+    Err(e) => {
+        warn!(error = %e, "stats sampler: sample_external_pending_ages failed");
+    }
+}
+```
+
+**Recommended fix**
+
+Two options, pick one based on what the metric is meant to answer:
+
+- **Terminal histogram (recommended).** Record the age *exactly once*, at the moment
+  the row transitions out of external-pending state — either to `processed_at`
+  (admin `/v1/deliveries/{id}/complete`, success callback) or to a sweep reset /
+  dead-letter. This requires the relevant repo methods to also return the
+  `dispatched_at` timestamp (or the elapsed seconds) so the dispatcher / sweeper /
+  admin handler can compute the age. The histogram then represents "how long
+  external completions actually took" — exactly the quantity operators expect.
+- **Document the snapshot semantics.** Rename the constant to
+  `outbox_external_pending_seconds_snapshot` and add a doc comment on
+  `record_external_pending_seconds` explaining that observations are time-weighted
+  and that overflow at 1 000 rows truncates the lower buckets.
+
+If the terminal-histogram path is too invasive for this PR, at minimum drop the
+`LIMIT 1000` cap in `sample_external_pending_ages` (or raise it to the
+configured `payload_size_limit_bytes` / a generous bound) and add a `WARN!` when
+the row count returned equals the limit so operators know the histogram has been
+truncated.
+
+**Why this fix**
+
+A Prometheus histogram with `_bucket{le=...}` series is universally interpreted as
+"distribution of event durations". The current implementation produces a different
+distribution — and silently truncates it — which is more misleading than no metric
+at all.
+
+---
+
+### Finding 19 — `outbox_cycle_duration_seconds` only measures the dispatch step
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/scheduler.rs:196-201` |
+| **Severity** | Low |
+| **Category** | Correctness |
+
+**Problem**
+
+The helper is documented as "full scheduler cycle duration" (and the metric index
+in `metrics.rs:29` lists `outbox_cycle_duration_seconds` as the cycle-duration
+histogram), but the call site brackets only the dispatch step. The
+`schedule_new_deliveries` step (Step 1, including any per-event DB writes) and the
+`sweep_hung_external` step (Step 3, when it fires) are not included in the
+observation.
+
+**Context** (`crates/core/src/scheduler.rs:170-209`)
+
+```rust
+// ── Step 1: discover new events, expand callbacks into deliveries ─────
+match schedule_new_deliveries(repo.as_ref(), &config, cursor).await {
+    Ok(new_cursor) => { /* ... */ }
+    Err(e) => { /* ... backoff + continue ... */ }
+}
+
+// ── Step 2: dispatch due deliveries ───────────────────────────────────
+let cycle_start = std::time::Instant::now();
+if let Err(e) = dispatch_due(repo.as_ref(), callback.as_ref(), &config).await {
+    error!(error = %e, "error fetching due deliveries for dispatch");
+}
+metrics::record_cycle_duration(cycle_start.elapsed().as_secs_f64());
+
+// ── Step 3: external-completion timeout sweep (rate-limited) ─────────
+if last_sweep.elapsed() >= sweep_interval {
+    if let Err(e) = sweep_hung_external(repo.as_ref(), &config).await { /* ... */ }
+    last_sweep = Instant::now();
+}
+```
+
+The dispatch-only timing is also valuable, but it is not what the metric name and
+helper docstring advertise.
+
+**Recommended fix**
+
+Either move `cycle_start` to just after the wake (covering schedule + dispatch +
+sweep), or rename the helper / metric so the name matches the measurement. Moving
+the timer is the smaller diff and matches the docstring:
+
+```rust
+// Start the cycle clock right after the wake select (before Step 1).
+let cycle_start = std::time::Instant::now();
+
+// ── Step 1: schedule_new_deliveries (as today) ──
+// ── Step 2: dispatch_due           (as today) ──
+// ── Step 3: sweep_hung_external    (as today) ──
+
+metrics::record_cycle_duration(cycle_start.elapsed().as_secs_f64());
+```
+
+**Why this fix**
+
+A metric labelled "cycle duration" is the natural anchor for an SLO like "p99
+cycle < 250 ms" or for spotting a slow `fetch_new_events`; measuring only the
+dispatch step hides exactly those regressions.
+
+---
+
+## Updated summary
+
+| # | Title | File:Line | Severity | Category | Status | Notes |
+|---|-------|-----------|----------|----------|--------|-------|
+| 16 | Spawned background tasks not awaited on shutdown | `crates/bin/src/main.rs:244-308` | Medium | Concurrency | TODO | |
+| 17 | `outbox_invalid_callbacks_total` incremented in a per-row `for` loop | `crates/core/src/scheduler.rs:306-308` | Low | Performance / Idiom | TODO | |
+| 18 | `record_external_pending_seconds` is a biased snapshot histogram | `crates/bin/src/main.rs:528-540` + `crates/core/src/repo.rs:873-896` | Low | Correctness / Observability | TODO | |
+| 19 | `outbox_cycle_duration_seconds` only measures the dispatch step | `crates/core/src/scheduler.rs:196-201` | Low | Correctness | TODO | |
+
+> **Instructions for the implementing LLM:** same conventions as the table above —
+> `TODO` → `DONE` once resolved, or `SKIPPED` with a reason. Rows must not be deleted.
+
+---
+
+## PR state (fourth pass — 2026-05-13)
+
+**Status: READY TO MERGE (with follow-ups recommended)**
+
+The original 15 findings remain fully addressed and the workspace builds & tests
+cleanly:
+
+- `cargo fmt --all`, `cargo check --workspace`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace` — all pass on `phase7` (HEAD `fb27ed5`):
+  277 core + 23 admin + 20 http-callback + 9 + 4 integration tests = **333 tests green**.
+
+The four new findings are non-blocking:
+
+- **Finding 16 (Medium)** — graceful-shutdown completeness. The current behaviour
+  is "best-effort cancellation"; existing integration tests still pass because no
+  test exercises a SIGINT-mid-admin-request scenario. Recommend fixing before the
+  next release tag, but not before merging this PR.
+- **Findings 17 / 18 / 19 (Low)** — metric-shape consistency, histogram semantics,
+  and cycle-duration scope. None of them affect correctness of dispatch, retention,
+  or admin paths; they are observability polish that can ship in a follow-up.
+
+If the maintainer prefers to land all 19 findings before merge, the suggested order
+is F16 → F19 → F17 → F18 (F18 is the largest behavioural change).
