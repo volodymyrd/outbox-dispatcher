@@ -127,6 +127,12 @@ pub trait Repo: Send + Sync {
     /// external-mode deliveries currently awaiting completion confirmation.
     /// Used by the stats sampler to populate the
     /// `outbox_external_pending_seconds` histogram.
+    ///
+    /// **Snapshot semantics**: rows are ordered by `dispatched_at ASC` and
+    /// capped at `sample_size`. When the external-pending backlog exceeds
+    /// `sample_size`, the newest rows are omitted, so the histogram's lower
+    /// buckets will be empty until the backlog drains. The caller is
+    /// responsible for detecting and logging this truncation.
     async fn sample_external_pending_ages(&self, sample_size: i64) -> Result<Vec<(String, f64)>>;
 
     // ── Retention ──────────────────────────────────────────────────────────

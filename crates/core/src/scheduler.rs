@@ -168,6 +168,11 @@ pub async fn run_scheduler_with_cycle_tracker(
             // intentionally discarded — we just want to flush the buffer
         }
 
+        // Start the cycle clock before Step 1 so the recorded duration covers
+        // all three steps (schedule_new_deliveries, dispatch_due, sweep_hung_external),
+        // matching the "full scheduler cycle duration" label on the metric.
+        let cycle_start = std::time::Instant::now();
+
         // ── Step 1: discover new events, expand callbacks into deliveries ─────
         match schedule_new_deliveries(repo.as_ref(), &config, cursor).await {
             Ok(new_cursor) => {
@@ -193,12 +198,10 @@ pub async fn run_scheduler_with_cycle_tracker(
         }
 
         // ── Step 2: dispatch due deliveries ───────────────────────────────────
-        let cycle_start = std::time::Instant::now();
         if let Err(e) = dispatch_due(repo.as_ref(), callback.as_ref(), &config).await {
             error!(error = %e, "error fetching due deliveries for dispatch");
             // Non-fatal: individual dispatch failures are handled inside dispatch_due.
         }
-        metrics::record_cycle_duration(cycle_start.elapsed().as_secs_f64());
 
         // ── Step 3: external-completion timeout sweep (rate-limited) ─────────
         if last_sweep.elapsed() >= sweep_interval {
@@ -207,6 +210,8 @@ pub async fn run_scheduler_with_cycle_tracker(
             }
             last_sweep = Instant::now();
         }
+
+        metrics::record_cycle_duration(cycle_start.elapsed().as_secs_f64());
 
         // Reset the poll timer after every cycle so the next timer fire is a full
         // poll_interval away from the last completed cycle.
@@ -303,9 +308,10 @@ pub async fn schedule_new_deliveries(
                     .into_iter()
                     .map(|n| (n, reason_msg.clone()))
                     .collect();
-                for _ in &entries {
-                    metrics::inc_invalid_callbacks_total(reason_code.metric_label());
-                }
+                metrics::inc_invalid_callbacks_total_by(
+                    reason_code.metric_label(),
+                    entries.len() as u64,
+                );
                 repo.create_invalid_deliveries(event.event_id, &entries)
                     .await?;
             } else {

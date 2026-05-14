@@ -1390,10 +1390,10 @@ dispatch step hides exactly those regressions.
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 16 | Spawned background tasks not awaited on shutdown | `crates/bin/src/main.rs:244-308` | Medium | Concurrency | TODO | |
-| 17 | `outbox_invalid_callbacks_total` incremented in a per-row `for` loop | `crates/core/src/scheduler.rs:306-308` | Low | Performance / Idiom | TODO | |
-| 18 | `record_external_pending_seconds` is a biased snapshot histogram | `crates/bin/src/main.rs:528-540` + `crates/core/src/repo.rs:873-896` | Low | Correctness / Observability | TODO | |
-| 19 | `outbox_cycle_duration_seconds` only measures the dispatch step | `crates/core/src/scheduler.rs:196-201` | Low | Correctness | TODO | |
+| 16 | Spawned background tasks not awaited on shutdown | `crates/bin/src/main.rs:244-308` | Medium | Concurrency | DONE | All three background tasks (admin server, retention worker, stats sampler) collected into a `JoinSet`; `join_next` loop drains them after the scheduler exits and before the OTel tracer flush |
+| 17 | `outbox_invalid_callbacks_total` incremented in a per-row `for` loop | `crates/core/src/scheduler.rs:306-308` | Low | Performance / Idiom | DONE | Added `inc_invalid_callbacks_total_by(reason, count)` to `metrics.rs`; array-level rejection path now calls it with `entries.len() as u64` |
+| 18 | `record_external_pending_seconds` is a biased snapshot histogram | `crates/bin/src/main.rs:528-540` + `crates/core/src/repo.rs:873-896` | Low | Correctness / Observability | DONE | Documented snapshot semantics on the trait method; sampler now emits `warn!` with the limit value when `samples.len() == SAMPLE_LIMIT` so operators know the histogram has been truncated |
+| 19 | `outbox_cycle_duration_seconds` only measures the dispatch step | `crates/core/src/scheduler.rs:196-201` | Low | Correctness | DONE | `cycle_start` moved to before Step 1; `record_cycle_duration` called after Step 3 so the observation covers the full schedule + dispatch + sweep cycle |
 
 > **Instructions for the implementing LLM:** same conventions as the table above —
 > `TODO` → `DONE` once resolved, or `SKIPPED` with a reason. Rows must not be deleted.

@@ -227,6 +227,11 @@ async fn run() -> Result<()> {
                 }
             });
 
+            // Collect background task handles so we can await them during graceful
+            // shutdown. Each task watches `shutdown.cancelled()` internally — we just
+            // need to wait for them to drain before flushing the tracer.
+            let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
             // Spawn the admin HTTP server on a separate task.
             let admin_bind = config.admin.bind.clone();
             let admin_token = config.admin.auth_token.clone();
@@ -241,7 +246,7 @@ async fn run() -> Result<()> {
             let admin_router = build_router(admin_state, admin_token);
             let admin_shutdown_signal = shutdown.clone();
             let admin_shutdown_trigger = shutdown.clone();
-            tokio::spawn(async move {
+            workers.spawn(async move {
                 let addr: std::net::SocketAddr = admin_bind
                     .parse()
                     .expect("admin.bind was validated at startup");
@@ -270,7 +275,7 @@ async fn run() -> Result<()> {
                 let retention_repo = repo.clone();
                 let retention_cfg = config.retention.clone();
                 let retention_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                workers.spawn(async move {
                     run_retention_worker(retention_repo, retention_cfg, retention_shutdown).await;
                 });
             }
@@ -280,7 +285,7 @@ async fn run() -> Result<()> {
                 let stats_repo = repo.clone();
                 let poll_interval = Duration::from_secs(config.dispatch.poll_interval_secs);
                 let stats_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                workers.spawn(async move {
                     run_stats_sampler(stats_repo, poll_interval, stats_shutdown).await;
                 });
             }
@@ -297,6 +302,15 @@ async fn run() -> Result<()> {
             )
             .await
             .context("scheduler exited with error")?;
+
+            // Wait for the admin server, retention worker, and stats sampler to drain
+            // before flushing the tracer. This ensures spans emitted during the workers'
+            // final drain step are queued before the batch exporter is shut down.
+            while let Some(res) = workers.join_next().await {
+                if let Err(e) = res {
+                    warn!(error = ?e, "background worker exited abnormally during shutdown");
+                }
+            }
 
             // Flush any buffered spans before the process exits.
             if let Some(provider) = tracer_provider
@@ -527,8 +541,21 @@ async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: Ca
 
         // Populate the outbox_external_pending_seconds histogram with per-row ages
         // for external-mode deliveries currently awaiting completion confirmation.
-        match repo.sample_external_pending_ages(1000).await {
+        //
+        // NOTE: snapshot semantics — rows are ordered oldest-first and capped at
+        // SAMPLE_LIMIT. When the backlog exceeds the limit the histogram's lower
+        // buckets become empty until the backlog drains. A WARN is emitted so
+        // operators know the histogram has been truncated.
+        const SAMPLE_LIMIT: i64 = 1000;
+        match repo.sample_external_pending_ages(SAMPLE_LIMIT).await {
             Ok(samples) => {
+                if samples.len() as i64 == SAMPLE_LIMIT {
+                    warn!(
+                        limit = SAMPLE_LIMIT,
+                        "stats sampler: sample_external_pending_ages hit the row limit; \
+                         the histogram's lower buckets may be empty until the backlog drains"
+                    );
+                }
                 for (cb, age_secs) in samples {
                     metrics::record_external_pending_seconds(&cb, age_secs);
                 }

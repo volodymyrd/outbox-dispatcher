@@ -203,6 +203,12 @@ pub fn inc_invalid_callbacks_total(reason: &str) {
     metrics::counter!(INVALID_CALLBACKS_TOTAL, "reason" => reason.to_owned()).increment(1);
 }
 
+/// Increment `outbox_invalid_callbacks_total{reason}` by `count`.
+#[inline]
+pub fn inc_invalid_callbacks_total_by(reason: &str, count: u64) {
+    metrics::counter!(INVALID_CALLBACKS_TOTAL, "reason" => reason.to_owned()).increment(count);
+}
+
 /// Increment `outbox_payload_size_rejections_total{kind}`.
 #[inline]
 pub fn inc_payload_size_rejections_total(kind: &str) {
@@ -322,6 +328,11 @@ mod tests {
     #[test]
     fn inc_invalid_callbacks_total_does_not_panic() {
         inc_invalid_callbacks_total("missing_url");
+    }
+
+    #[test]
+    fn inc_invalid_callbacks_total_by_does_not_panic() {
+        inc_invalid_callbacks_total_by("too_many_callbacks", 5);
     }
 
     #[test]
