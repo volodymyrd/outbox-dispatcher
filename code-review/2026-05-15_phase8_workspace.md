@@ -1,6 +1,6 @@
 # Code Review — Phase 8 (PR #7)
 
-**Date:** 2026-05-15T17:07:47Z (initial), 2026-05-15T20:45:36Z (follow-up: findings 9–10), 2026-05-15T21:18:00Z (follow-up: findings 12–15)
+**Date:** 2026-05-15T17:07:47Z (initial), 2026-05-15T20:45:36Z (follow-up: findings 9–10), 2026-05-15T21:18:00Z (follow-up: findings 12–15), 2026-05-15T21:42:51Z (follow-up: verify F1–F15, findings 16–19)
 **Branch:** phase8
 **Reviewed by:** Claude (review command)
 **Scope:** PR #7 — Dockerfile, GitHub Actions CI/CD, example configs, deployment/ops/protocol docs
@@ -1146,6 +1146,263 @@ The example is the first thing operators run. A copy-pasteable command that fail
 
 ---
 
+### Finding 16 — `docs/operations.md` still tells operators to send SIGHUP after Finding 13's fix
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docs/operations.md:179`, `docs/operations.md:194` |
+| **Severity** | High |
+| **Category** | Documentation / Correctness |
+
+**Problem**
+
+Finding 13 removed the dedicated "SIGHUP (hot reload)" section and replaced it with a §Config changes section that correctly states "Config changes require a restart. There is no hot-reload mechanism." However, two cross-references to SIGHUP remained in the file and were not updated. Both are still active operator-facing instructions:
+
+- §Dead letters appearing for a callback → step 2: "the key is missing from `[signing_keys]`. Add it and send a SIGHUP or restart."
+- §Signing key rotation → step 3: "Send SIGHUP or restart the dispatcher. The new key takes effect on the next delivery attempt."
+
+As established in Finding 13, the binary has no SIGHUP handler — the default Linux disposition for SIGHUP on a handler-less process is **terminate**. An operator rotating a key by following step 3 literally will kill the dispatcher mid-flight. The container's `restart: unless-stopped` policy means the supervisor will restart it, so the end-state is "a brutal restart" — but the runbook explicitly frames SIGHUP as an alternative to a restart, which is the opposite of what actually happens. This contradicts the §Config changes section in the same file.
+
+**Context** (surrounding code as it exists today)
+
+```markdown
+<!-- docs/operations.md line 179 (inside §Dead letters appearing) -->
+   - `signing_key_id 'foo' not registered` — the key is missing from `[signing_keys]`. Add it and send a SIGHUP or restart.
+```
+
+```markdown
+<!-- docs/operations.md lines 190-198 -->
+### Signing key rotation
+
+1. Generate a new secret and update the env var (or Kubernetes secret).
+2. Add the new key id to `[signing_keys]` in config (or update the existing entry to point to the new env var).
+3. Send SIGHUP or restart the dispatcher. The new key takes effect on the next delivery attempt.
+4. Publishers can start writing the new key id immediately after the dispatcher config is updated.
+5. Keep the old key id in `[signing_keys]` (pointing to the old secret) until all in-flight deliveries using it have completed.
+```
+
+**Recommended fix**
+
+Drop "SIGHUP or" from both locations so they match the §Config changes guidance:
+
+```markdown
+<!-- docs/operations.md line 179 -->
+   - `signing_key_id 'foo' not registered` — the key is missing from `[signing_keys]`. Add it and restart the dispatcher.
+```
+
+```markdown
+<!-- docs/operations.md lines 190-198 -->
+### Signing key rotation
+
+1. Generate a new secret and update the env var (or Kubernetes secret).
+2. Add the new key id to `[signing_keys]` in config (or update the existing entry to point to the new env var).
+3. Restart the dispatcher. The new key takes effect on the next delivery attempt.
+4. Publishers can start writing the new key id immediately after the dispatcher config is updated.
+5. Keep the old key id in `[signing_keys]` (pointing to the old secret) until all in-flight deliveries using it have completed.
+```
+
+**Why this fix**
+
+The runbook must be internally consistent. The §Config changes section says config requires a restart; these two earlier sections must not contradict it by suggesting SIGHUP as a parallel path that does not exist in the binary. Finding 13's fix is incomplete until these cross-references are also corrected.
+
+---
+
+### Finding 17 — Quick-start bind-mount path mismatch silently nullifies the prod config overlay
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docs/deployment.md:12-22`, `examples/docker-compose.with-postgres.yml:51`, `docker/docker-compose.example.yml:46` |
+| **Severity** | High |
+| **Category** | Correctness / Documentation |
+
+**Problem**
+
+Both `docs/deployment.md` and `README.md` walk first-time users through this quick-start:
+
+```bash
+# from the workspace root
+cp examples/config.production.toml config.prod.toml
+docker compose -f examples/docker-compose.with-postgres.yml up -d
+```
+
+The compose file at `examples/docker-compose.with-postgres.yml` declares the bind mount as:
+
+```yaml
+- ./config.prod.toml:/app/envs/app_config_prod.toml:ro
+```
+
+Per Compose Spec, **relative source paths in `volumes` resolve relative to the Compose file's own directory**, not the current working directory. Compose therefore looks for `examples/config.prod.toml`, but the `cp` command put the file at the workspace root `./config.prod.toml`. The host path the bind mount resolves to does not exist. With the default Docker daemon behavior, this either fails the `up` command (`bind source path does not exist`) or — depending on the daemon — silently creates an empty directory at the host path and mounts it. Either way, the dispatcher runs without the prod overlay the user thought they were providing.
+
+The same path-resolution rule applies to `docker/docker-compose.example.yml:46` (`./config.prod.toml` resolves to `docker/config.prod.toml`), which has no `cp` instruction at all — so users following its top-of-file usage block are also pointed at a host path that does not exist.
+
+**Context** (surrounding code as it exists today)
+
+```markdown
+<!-- docs/deployment.md lines 12-26 -->
+## Quick start with Docker Compose
+
+```bash
+# Generate secrets
+export ADMIN_TOKEN="$(openssl rand -hex 32)"
+export MY_HMAC_SECRET="$(openssl rand -base64 48)"
+
+# Copy and edit the production config
+cp examples/config.production.toml config.prod.toml
+# Edit config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
+
+# Start Postgres + dispatcher
+docker compose -f examples/docker-compose.with-postgres.yml up -d
+```
+```
+
+```yaml
+# examples/docker-compose.with-postgres.yml lines 48-51
+    volumes:
+      # Production config overlay — overrides baked-in defaults.
+      # The file must exist; copy and edit examples/config.production.toml.
+      - ./config.prod.toml:/app/envs/app_config_prod.toml:ro
+```
+
+**Recommended fix**
+
+Pick one of these two approaches and apply consistently.
+
+Option A — fix the `cp` destination so it lands next to the compose file:
+
+```markdown
+<!-- docs/deployment.md and README.md quick-start -->
+# Copy and edit the production config (must live next to the compose file).
+cp examples/config.production.toml examples/config.prod.toml
+# Edit examples/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
+
+docker compose -f examples/docker-compose.with-postgres.yml up -d
+```
+
+And update `docker/docker-compose.example.yml`'s usage comment to instruct copying to `docker/config.prod.toml`.
+
+Option B — anchor the bind mount to the working directory using an env var so it does not depend on the compose file's location:
+
+```yaml
+# examples/docker-compose.with-postgres.yml
+    volumes:
+      - ${OUTBOX_CONFIG:-./config.prod.toml}:/app/envs/app_config_prod.toml:ro
+```
+
+…and document `export OUTBOX_CONFIG="$(pwd)/config.prod.toml"` in the quick-start.
+
+Option A is the smaller change and keeps the example self-contained.
+
+**Why this fix**
+
+The "happy path" quick-start in the README is the first thing a new user runs. It must work as written. Today it silently drops the prod overlay (or fails outright), which is the worst-of-both-worlds: the user thinks they configured signing keys and dispatch settings, but the running container is using only baked-in defaults.
+
+---
+
+### Finding 18 — Alerting rule uses non-literal range selector, which is invalid PromQL
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docs/operations.md:165` |
+| **Severity** | Low |
+| **Category** | Documentation |
+
+**Problem**
+
+The §Alerting recommendations table includes:
+
+```
+| Scheduler stalled | `rate(outbox_cycle_duration_seconds_count[2 * poll_interval]) == 0` | Critical |
+```
+
+PromQL's range-vector selector `[…]` only accepts a **literal duration** (`30s`, `5m`, `1h`). Expressions like `2 * poll_interval` are a parse error — Prometheus will reject the rule. Operators copy-pasting this row into an Alertmanager config or a Grafana panel will hit `1:36: parse error: unexpected character inside braces: ' '`. The intent (use 2× the configured poll interval) is clear in prose, but the alert as written cannot be evaluated.
+
+**Context** (surrounding code as it exists today)
+
+```markdown
+<!-- docs/operations.md lines 160-167 -->
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| Dead letters accumulating | `rate(outbox_dead_letters_total[5m]) > 0` | Warning |
+| High dispatch lag | `outbox_lag_seconds > 300` | Warning |
+| Listener down | `outbox_listener_connection_status == 0 for 2m` | Critical |
+| Scheduler stalled | `rate(outbox_cycle_duration_seconds_count[2 * poll_interval]) == 0` | Critical |
+| Signing key drift | `rate(outbox_signing_key_resolution_failures_total[5m]) > 0` | Warning |
+| Corrupted rows | `rate(outbox_corrupted_rows_total[5m]) > 0` | Warning |
+```
+
+**Recommended fix**
+
+Either give a concrete duration (matching the default `poll_interval_secs = 5` ⇒ `10s` lower bound, but a larger window smooths short-lived stalls) or rephrase to show the formula outside the code block:
+
+```markdown
+| Scheduler stalled | `rate(outbox_cycle_duration_seconds_count[1m]) == 0` (set window ≥ 2 × `poll_interval_secs`) | Critical |
+```
+
+Same comment applies to "Listener down": the operator-facing trailing `for 2m` belongs in the alert rule's `for:` field, not in the PromQL expression — though Prometheus will treat the trailing word as part of the expression body and reject it too. Suggest:
+
+```markdown
+| Listener down | `outbox_listener_connection_status == 0` (with `for: 2m` in the rule) | Critical |
+```
+
+**Why this fix**
+
+An alerting table in a runbook is implicitly a copy-paste source. Rules that are syntactically invalid waste operator time during the on-call onboarding moment when the value should be highest.
+
+---
+
+### Finding 19 — README quick-start "from source" missing `DATABASE_URL`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `README.md:70-76` |
+| **Severity** | Low |
+| **Category** | Documentation |
+
+**Problem**
+
+The "To run from source" snippet in the README is:
+
+```bash
+docker compose up -d    # local Postgres on :5434
+cargo run -- migrate    # apply schema
+cargo run               # start the dispatcher
+```
+
+Both `cargo run` invocations require `database.url` to be set. In the project's local-dev layout, `.env.toml` is gitignored and not present after a fresh clone — so on a clean checkout `cargo run -- migrate` exits with a configuration error about a missing database URL. The CLAUDE.md project notes consistently prefix every example with `DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher`; the README should match.
+
+**Context** (surrounding code as it exists today)
+
+```markdown
+<!-- README.md lines 70-76 -->
+To run from source:
+
+```bash
+docker compose up -d    # local Postgres on :5434
+cargo run -- migrate    # apply schema
+cargo run               # start the dispatcher
+```
+```
+
+**Recommended fix**
+
+```markdown
+To run from source:
+
+```bash
+docker compose up -d                               # local Postgres on :5434
+export DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher
+export ADMIN_TOKEN="$(openssl rand -hex 32)"
+cargo run -- migrate                               # apply schema
+cargo run                                          # start the dispatcher
+```
+```
+
+**Why this fix**
+
+A first-time contributor copying these three lines hits a config error within seconds. Adding the two missing exports makes the snippet self-contained and matches the conventions used everywhere else in the project's docs.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
@@ -1165,12 +1422,25 @@ The example is the first thing operators run. A copy-pasteable command that fail
 | 13 | Operations runbook documents SIGHUP hot-reload, but the binary has no SIGHUP handler — sending SIGHUP terminates the process | `docs/operations.md:254-269` | High | Documentation | DONE | Replaced SIGHUP section with "Config changes require a restart" guidance |
 | 14 | Dockerfile dependency-warmup layer compiles only the empty stubs — no third-party crates are precompiled, so the layer cache provides no benefit | `docker/Dockerfile:19-31` | Medium | Performance | DONE | Replaced stub-based warmup with `cargo-chef` (planner + cook stages) |
 | 15 | `docker/docker-compose.example.yml` tells operators to `cp .env.example .env`, but `.env.example` does not exist | `docker/docker-compose.example.yml:4-6` | Low | Documentation | DONE | Added `.env.example` at repo root with required variables; updated compose comment to reference it |
+| 16 | SIGHUP references still present in operations.md (Dead letters §, Signing key rotation §) after Finding 13's fix — runbook still suggests an action that kills the process | `docs/operations.md:179, 194` | High | Documentation | TODO | F13 removed the dedicated §SIGHUP section but left two cross-references that contradict §Config changes; both should be changed to "restart" |
+| 17 | Quick-start `cp examples/config.production.toml config.prod.toml` puts the file at the workspace root, but the compose bind mount `./config.prod.toml` resolves relative to the compose file (`examples/`) — the prod overlay is silently absent | `docs/deployment.md:18`, `examples/docker-compose.with-postgres.yml:51`, `docker/docker-compose.example.yml:46` | High | Correctness | TODO | Either change `cp` destination to `examples/config.prod.toml` (and `docker/config.prod.toml` for the other example) or anchor the mount to `$OUTBOX_CONFIG` |
+| 18 | Alerting table uses non-literal PromQL range selector (`[2 * poll_interval]`) and `for 2m` inside the expression — invalid PromQL | `docs/operations.md:164-165` | Low | Documentation | TODO | Use a literal duration in `[...]` and document the `for:` clause outside the expression |
+| 19 | README "run from source" quick-start omits `DATABASE_URL` / `ADMIN_TOKEN` — both `cargo run` invocations will fail on a fresh clone | `README.md:70-76` | Low | Documentation | TODO | Add `export DATABASE_URL=...` and `export ADMIN_TOKEN=...` before the `cargo run` commands |
 
 ## Merge readiness
 
-**Status: READY TO MERGE.**
+**Status: NOT READY TO MERGE.**
 
-All 15 findings have been addressed.
+Findings 1–15 from prior review rounds are all confirmed DONE — Dockerfile, CI/CD, healthchecks, `.dockerignore`, `.env.example`, metrics doc, README, and the workflow_call gate are all correctly implemented. The follow-up review found four new issues:
+
+- **Blocking (must fix before merge):**
+  - F16 — SIGHUP cross-references in `docs/operations.md` remain after F13's fix; the runbook still tells operators to send a signal that kills the process during key rotation.
+  - F17 — The headline quick-start in both `README.md` and `docs/deployment.md` silently breaks (or silently runs without the prod overlay) due to a Compose bind-mount path-resolution mismatch.
+- **Non-blocking but should fix soon:**
+  - F18 — Alert rule in `docs/operations.md` is syntactically invalid PromQL.
+  - F19 — README "run from source" snippet missing required env vars.
+
+Once F16 and F17 are addressed, the PR is ready to merge; F18 and F19 can be folded into the same fix-up commit or deferred to a follow-up doc PR at the maintainer's discretion.
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
