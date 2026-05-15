@@ -27,6 +27,7 @@ use crate::callbacks::{parse_callbacks, payload_too_large_error};
 use crate::config::DispatchConfig;
 use crate::dispatch::{Callback, dispatch_due};
 use crate::error::Result;
+use crate::metrics;
 use crate::repo::Repo;
 use crate::timeout_sweep::sweep_hung_external;
 use sqlx::postgres::PgListener;
@@ -102,6 +103,7 @@ pub async fn run_scheduler_with_cycle_tracker(
         })?;
 
     listener_status.store(true, Ordering::Release);
+    metrics::set_listener_connection_status(true);
     info!(channel = %config.notify_channel, "LISTEN connection established");
 
     // Recover the event cursor so we don't re-process already-scheduled events.
@@ -127,6 +129,7 @@ pub async fn run_scheduler_with_cycle_tracker(
             _ = shutdown.cancelled() => {
                 info!("scheduler received shutdown signal, stopping");
                 listener_status.store(false, Ordering::Release);
+                metrics::set_listener_connection_status(false);
                 return Ok(());
             }
 
@@ -140,12 +143,14 @@ pub async fn run_scheduler_with_cycle_tracker(
                             "received NOTIFY",
                         );
                         listener_status.store(true, Ordering::Release);
+                        metrics::set_listener_connection_status(true);
                     }
                     Err(e) => {
                         // sqlx PgListener reconnects automatically; we update the status
                         // gauge and let the poll-timer keep us functional.
                         warn!(error = %e, "LISTEN connection lost; will rely on poll-timer until reconnected");
                         listener_status.store(false, Ordering::Release);
+                        metrics::set_listener_connection_status(false);
                     }
                 }
             }
@@ -162,6 +167,11 @@ pub async fn run_scheduler_with_cycle_tracker(
         while let Ok(Some(_)) = listener.try_recv().await {
             // intentionally discarded — we just want to flush the buffer
         }
+
+        // Start the cycle clock before Step 1 so the recorded duration covers
+        // all three steps (schedule_new_deliveries, dispatch_due, sweep_hung_external),
+        // matching the "full scheduler cycle duration" label on the metric.
+        let cycle_start = std::time::Instant::now();
 
         // ── Step 1: discover new events, expand callbacks into deliveries ─────
         match schedule_new_deliveries(repo.as_ref(), &config, cursor).await {
@@ -200,6 +210,8 @@ pub async fn run_scheduler_with_cycle_tracker(
             }
             last_sweep = Instant::now();
         }
+
+        metrics::record_cycle_duration(cycle_start.elapsed().as_secs_f64());
 
         // Reset the poll timer after every cycle so the next timer fire is a full
         // poll_interval away from the last completed cycle.
@@ -252,6 +264,7 @@ pub async fn schedule_new_deliveries(
                 limit_bytes = config.payload_size_limit_bytes,
                 "payload too large — dead-lettering all callbacks"
             );
+            metrics::inc_payload_size_rejections_total(&event.kind);
             let names = extract_callback_names(&event.callbacks);
             let entries: Vec<(String, String)> =
                 names.into_iter().map(|n| (n, reason.clone())).collect();
@@ -279,21 +292,26 @@ pub async fn schedule_new_deliveries(
         //   (b) Valid array that fails an array-level check (e.g. too many callbacks).
         //       Dead-letter every named entry so the rejection is visible to operators
         //       via the admin dead-letter list.
-        if parsed.valid.is_empty() && parsed.invalid.iter().all(|(n, _)| n == "<root>") {
+        if parsed.valid.is_empty() && parsed.invalid.iter().all(|(n, _, _)| n == "<root>") {
             if event.callbacks.is_array() {
                 // Array exists but failed an array-level check (e.g. too many callbacks).
                 // Dead-letter every entry so the rejection is visible in the dead-letter list.
-                let reason = parsed
+                let (reason_code, reason_msg) = parsed
                     .invalid
                     .first()
-                    .map(|(_, r)| r.clone())
-                    .unwrap_or_else(|| {
-                        "invalid_callback: unspecified array-level rejection".to_string()
-                    });
+                    .map(|(_, code, msg)| (*code, msg.clone()))
+                    .unwrap_or((
+                        crate::callbacks::InvalidReason::Other,
+                        "invalid_callback: unspecified array-level rejection".to_string(),
+                    ));
                 let entries: Vec<(String, String)> = extract_callback_names(&event.callbacks)
                     .into_iter()
-                    .map(|n| (n, reason.clone()))
+                    .map(|n| (n, reason_msg.clone()))
                     .collect();
+                metrics::inc_invalid_callbacks_total_by(
+                    reason_code.metric_label(),
+                    entries.len() as u64,
+                );
                 repo.create_invalid_deliveries(event.event_id, &entries)
                     .await?;
             } else {
@@ -303,9 +321,18 @@ pub async fn schedule_new_deliveries(
                     callbacks_json = %event.callbacks,
                     "callbacks JSONB is structurally corrupt — skipping event (poison pill)"
                 );
+                metrics::inc_corrupted_rows_total(metrics::stage::SCHEDULE);
             }
             new_cursor = event.id;
             continue;
+        }
+
+        // Emit events_total once per successfully-parsed event.
+        metrics::inc_events_total(&event.kind);
+
+        // Emit invalid_callbacks_total for each structurally invalid callback.
+        for (_, reason_code, _) in &parsed.invalid {
+            metrics::inc_invalid_callbacks_total(reason_code.metric_label());
         }
 
         // Schedule valid callbacks. Propagate DB errors so the cursor stays at the last
@@ -317,7 +344,12 @@ pub async fn schedule_new_deliveries(
 
         // Dead-letter structurally invalid callbacks. Same rule: propagate DB errors.
         if !parsed.invalid.is_empty() {
-            repo.create_invalid_deliveries(event.event_id, &parsed.invalid)
+            let invalid_entries: Vec<(String, String)> = parsed
+                .invalid
+                .iter()
+                .map(|(name, _, msg)| (name.clone(), msg.clone()))
+                .collect();
+            repo.create_invalid_deliveries(event.event_id, &invalid_entries)
                 .await?;
         }
 
@@ -635,6 +667,30 @@ mod tests {
                 oldest_pending_age_seconds: None,
                 callbacks: std::collections::HashMap::new(),
             })
+        }
+
+        async fn sample_external_pending_ages(
+            &self,
+            _sample_size: i64,
+        ) -> crate::error::Result<Vec<(String, f64)>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_terminal_events(
+            &self,
+            _dead_letter_cutoff: chrono::DateTime<Utc>,
+            _processed_cutoff: chrono::DateTime<Utc>,
+            _batch_limit: i64,
+        ) -> crate::error::Result<crate::schema::RetentionDeleted> {
+            Ok(crate::schema::RetentionDeleted::default())
+        }
+
+        async fn oldest_terminal_event_age_seconds(
+            &self,
+            _dead_letter_cutoff: chrono::DateTime<Utc>,
+            _processed_cutoff: chrono::DateTime<Utc>,
+        ) -> crate::error::Result<Option<f64>> {
+            Ok(None)
         }
     }
 

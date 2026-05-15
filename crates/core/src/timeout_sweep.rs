@@ -14,12 +14,14 @@ use tracing::{info, warn};
 
 use crate::config::DispatchConfig;
 use crate::error::Result;
+use crate::metrics;
 use crate::repo::Repo;
 
 /// Run one sweep cycle: reset hung external-mode rows and/or dead-letter exhausted ones.
 ///
-/// Logs outcomes and returns the `SweepReport` for metrics (Phase 7). Errors from
-/// the repo are returned to the caller so the main loop can decide how to handle them.
+/// Emits `outbox_external_timeout_resets_total` and `outbox_completion_cycles_exhausted_total`
+/// metrics. Errors from the repo are returned to the caller so the main loop can decide
+/// how to handle them.
 pub async fn sweep_hung_external(repo: &dyn Repo, config: &DispatchConfig) -> Result<()> {
     let report = repo
         .reset_hung_external(Utc::now(), config.max_completion_cycles as i32)
@@ -30,12 +32,15 @@ pub async fn sweep_hung_external(repo: &dyn Repo, config: &DispatchConfig) -> Re
             reset = report.reset,
             "external timeout sweep reset deliveries for redelivery"
         );
+        // We don't have per-callback counts from the sweeper, so use "_all" as label.
+        metrics::inc_external_timeout_resets_total_by("_all", report.reset);
     }
     if report.exhausted > 0 {
         warn!(
             exhausted = report.exhausted,
             "external timeout sweep dead-lettered rows after max_completion_cycles"
         );
+        metrics::inc_completion_cycles_exhausted_total_by("_all", report.exhausted);
     }
     Ok(())
 }
@@ -177,8 +182,32 @@ mod tests {
             })
         }
 
+        async fn sample_external_pending_ages(
+            &self,
+            _sample_size: i64,
+        ) -> CoreResult<Vec<(String, f64)>> {
+            Ok(Vec::new())
+        }
+
         async fn ping(&self) -> CoreResult<()> {
             Ok(())
+        }
+
+        async fn delete_terminal_events(
+            &self,
+            _dead_letter_cutoff: DateTime<chrono::Utc>,
+            _processed_cutoff: DateTime<chrono::Utc>,
+            _batch_limit: i64,
+        ) -> CoreResult<crate::schema::RetentionDeleted> {
+            Ok(crate::schema::RetentionDeleted::default())
+        }
+
+        async fn oldest_terminal_event_age_seconds(
+            &self,
+            _dead_letter_cutoff: DateTime<chrono::Utc>,
+            _processed_cutoff: DateTime<chrono::Utc>,
+        ) -> CoreResult<Option<f64>> {
+            Ok(None)
         }
     }
 

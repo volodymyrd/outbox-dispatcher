@@ -9,8 +9,8 @@ use crate::config::DispatchConfig;
 use crate::error::Result;
 use crate::schema::{
     CallbackStats, CallbackTarget, DeadLetterRow, DeliveryRow, DueDelivery, EventWithDeliveries,
-    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, RetryOutcome, Stats, StatsRow,
-    SweepReport,
+    ExternalPendingRow, PageParams, RawEvent, RawEventSerializable, RetentionDeleted, RetryOutcome,
+    Stats, StatsRow, SweepReport,
 };
 
 #[async_trait]
@@ -122,6 +122,43 @@ pub trait Repo: Send + Sync {
 
     /// Returns aggregate delivery counts for the stats endpoint.
     async fn fetch_stats(&self) -> Result<Stats>;
+
+    /// Returns up to `sample_size` `(callback_name, age_seconds)` pairs for
+    /// external-mode deliveries currently awaiting completion confirmation.
+    /// Used by the stats sampler to populate the
+    /// `outbox_external_pending_seconds` histogram.
+    ///
+    /// **Snapshot semantics**: rows are ordered by `dispatched_at ASC` and
+    /// capped at `sample_size`. When the external-pending backlog exceeds
+    /// `sample_size`, the newest rows are omitted, so the histogram's lower
+    /// buckets will be empty until the backlog drains. The caller is
+    /// responsible for detecting and logging this truncation.
+    async fn sample_external_pending_ages(&self, sample_size: i64) -> Result<Vec<(String, f64)>>;
+
+    // ── Retention ──────────────────────────────────────────────────────────
+
+    /// Deletes up to `batch_limit` fully-terminal events whose age exceeds the
+    /// relevant retention window. Returns per-reason deletion counts
+    /// (`RetentionDeleted.processed` + `RetentionDeleted.dead_letter`; deliveries
+    /// are removed via `ON DELETE CASCADE`).
+    ///
+    /// `dead_letter_cutoff` = now() − dead_letter_retention_days  
+    /// `processed_cutoff`   = now() − processed_retention_days
+    async fn delete_terminal_events(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+        batch_limit: i64,
+    ) -> Result<RetentionDeleted>;
+
+    /// Returns the age in seconds of the oldest retention-eligible event still
+    /// present (i.e. all deliveries terminal, older than the shortest retention
+    /// window). Returns `None` when no eligible events exist or retention is off.
+    async fn oldest_terminal_event_age_seconds(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+    ) -> Result<Option<f64>>;
 }
 
 // ── Postgres implementation ────────────────────────────────────────────────────
@@ -757,27 +794,28 @@ impl Repo for PgRepo {
             r#"
             SELECT
                 COUNT(*) FILTER (
-                    WHERE dispatched_at IS NULL
-                      AND processed_at  IS NULL
-                      AND dead_letter   = FALSE
+                    WHERE d.dispatched_at IS NULL
+                      AND d.processed_at  IS NULL
+                      AND d.dead_letter   = FALSE
                 ) AS "pending!: i64",
                 COUNT(*) FILTER (
-                    WHERE completion_mode = 'external'
-                      AND dispatched_at   IS NOT NULL
-                      AND processed_at    IS NULL
-                      AND dead_letter     = FALSE
+                    WHERE d.completion_mode = 'external'
+                      AND d.dispatched_at   IS NOT NULL
+                      AND d.processed_at    IS NULL
+                      AND d.dead_letter     = FALSE
                 ) AS "external_pending!: i64",
                 COUNT(*) FILTER (
-                    WHERE dead_letter = TRUE
+                    WHERE d.dead_letter = TRUE
                 ) AS "dead_lettered!: i64",
                 EXTRACT(EPOCH FROM (
-                    now() - MIN(available_at) FILTER (
-                        WHERE dispatched_at IS NULL
-                          AND processed_at  IS NULL
-                          AND dead_letter   = FALSE
+                    now() - MIN(e.created_at) FILTER (
+                        WHERE d.dispatched_at IS NULL
+                          AND d.processed_at  IS NULL
+                          AND d.dead_letter   = FALSE
                     )
                 ))::float8 AS oldest_pending_age_seconds
-            FROM outbox_deliveries
+            FROM outbox_deliveries d
+            JOIN outbox_events e ON e.event_id = d.event_id
             "#
         )
         .fetch_one(&self.pool)
@@ -789,10 +827,17 @@ impl Repo for PgRepo {
             SELECT
                 callback_name,
                 COUNT(*) FILTER (
-                    WHERE dispatched_at IS NULL
+                    WHERE completion_mode = 'managed'
+                      AND dispatched_at IS NULL
                       AND processed_at  IS NULL
                       AND dead_letter   = FALSE
-                ) AS "pending!",
+                ) AS "pending_managed!",
+                COUNT(*) FILTER (
+                    WHERE completion_mode = 'external'
+                      AND dispatched_at IS NULL
+                      AND processed_at  IS NULL
+                      AND dead_letter   = FALSE
+                ) AS "pending_external!",
                 COUNT(*) FILTER (
                     WHERE completion_mode = 'external'
                       AND dispatched_at   IS NOT NULL
@@ -814,7 +859,8 @@ impl Repo for PgRepo {
             callbacks.insert(
                 row.callback_name,
                 CallbackStats {
-                    pending: row.pending,
+                    pending_managed: row.pending_managed,
+                    pending_external: row.pending_external,
                     external_pending: row.external_pending,
                     dead_lettered: row.dead_lettered,
                 },
@@ -829,6 +875,134 @@ impl Repo for PgRepo {
             oldest_pending_age_seconds: totals.oldest_pending_age_seconds,
             callbacks,
         })
+    }
+
+    async fn sample_external_pending_ages(&self, sample_size: i64) -> Result<Vec<(String, f64)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                callback_name,
+                EXTRACT(EPOCH FROM (now() - dispatched_at))::float8 AS "age_seconds!"
+            FROM outbox_deliveries
+            WHERE completion_mode = 'external'
+              AND dispatched_at   IS NOT NULL
+              AND processed_at    IS NULL
+              AND dead_letter     = FALSE
+            ORDER BY dispatched_at
+            LIMIT $1
+            "#,
+            sample_size
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.callback_name, r.age_seconds))
+            .collect())
+    }
+
+    async fn delete_terminal_events(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+        batch_limit: i64,
+    ) -> Result<RetentionDeleted> {
+        // Delete up to `batch_limit` fully-terminal events past their retention window.
+        // Foreign key `ON DELETE CASCADE` removes the delivery rows automatically.
+        //
+        // An event is terminal when no delivery is still in-flight:
+        //   processed_at IS NOT NULL  OR  dead_letter = TRUE
+        // (external rows awaiting completion are NOT terminal — dispatched_at IS NOT NULL
+        //  AND processed_at IS NULL AND dead_letter = FALSE)
+        //
+        // The longer window (dead_letter) applies when any delivery is dead-lettered.
+        // We return a `reason` column so callers can emit per-bucket metrics.
+        let rows = sqlx::query!(
+            r#"
+            WITH candidates AS (
+                SELECT e.id,
+                       CASE WHEN EXISTS (
+                           SELECT 1 FROM outbox_deliveries d
+                           WHERE d.event_id = e.event_id
+                             AND d.dead_letter = TRUE
+                       ) THEN 'dead_letter' ELSE 'processed' END AS reason
+                FROM outbox_events e
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM outbox_deliveries d
+                    WHERE d.event_id = e.event_id
+                      AND d.processed_at IS NULL
+                      AND d.dead_letter   = FALSE
+                )
+                AND e.created_at < CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM outbox_deliveries d
+                        WHERE d.event_id = e.event_id
+                          AND d.dead_letter = TRUE
+                    ) THEN $1::timestamptz
+                    ELSE $2::timestamptz
+                END
+                ORDER BY e.id
+                LIMIT $3
+            ),
+            deleted AS (
+                DELETE FROM outbox_events
+                WHERE id IN (SELECT id FROM candidates)
+                RETURNING id
+            )
+            SELECT c.reason
+            FROM candidates c
+            WHERE c.id IN (SELECT id FROM deleted)
+            "#,
+            dead_letter_cutoff,
+            processed_cutoff,
+            batch_limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut result = RetentionDeleted::default();
+        for row in rows {
+            match row.reason.as_deref() {
+                Some("dead_letter") => result.dead_letter += 1,
+                _ => result.processed += 1,
+            }
+        }
+        Ok(result)
+    }
+
+    async fn oldest_terminal_event_age_seconds(
+        &self,
+        dead_letter_cutoff: DateTime<Utc>,
+        processed_cutoff: DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        let age: Option<f64> = sqlx::query_scalar!(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (now() - MIN(e.created_at)))::float8
+            FROM outbox_events e
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM outbox_deliveries d
+                WHERE d.event_id = e.event_id
+                  AND d.processed_at IS NULL
+                  AND d.dead_letter   = FALSE
+            )
+            AND e.created_at < CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM outbox_deliveries d
+                    WHERE d.event_id = e.event_id
+                      AND d.dead_letter = TRUE
+                ) THEN $1::timestamptz
+                ELSE $2::timestamptz
+            END
+            "#,
+            dead_letter_cutoff,
+            processed_cutoff,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(age)
     }
 }
 

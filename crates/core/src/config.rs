@@ -345,6 +345,42 @@ impl Default for RetentionConfig {
     }
 }
 
+// ── Observability ─────────────────────────────────────────────────────────────
+
+fn default_metrics_bind() -> String {
+    "0.0.0.0:9091".to_string()
+}
+
+fn default_stats_sample_interval_secs() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// Socket address to expose the Prometheus `/metrics` scrape endpoint.
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: String,
+    /// OTLP gRPC endpoint for OpenTelemetry traces. If empty, tracing is disabled.
+    #[serde(default)]
+    pub otel_endpoint: String,
+    /// How often the stats sampler runs heavy aggregate queries against the DB,
+    /// in seconds. Defaults to 30 s to align with typical Prometheus scrape cadence
+    /// and avoid sustained DB pressure on large deployments.
+    #[serde(default = "default_stats_sample_interval_secs")]
+    pub stats_sample_interval_secs: u64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            metrics_bind: default_metrics_bind(),
+            otel_endpoint: String::new(),
+            stats_sample_interval_secs: default_stats_sample_interval_secs(),
+        }
+    }
+}
+
 // ── AppConfig ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -362,6 +398,8 @@ pub struct AppConfig {
     pub http_client: HttpClientConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 // ── Validation bounds (centralised so conditions and error messages stay in sync) ──
@@ -371,6 +409,7 @@ const MAX_PAYLOAD_SIZE_BYTES: i64 = 100 * 1_024 * 1_024;
 const MIN_SWEEP_INTERVAL_SECS: u64 = 10;
 const MIN_RETENTION_CLEANUP_SECS: u64 = 60;
 const MAX_RETENTION_BATCH: u64 = 10_000;
+const MIN_STATS_SAMPLE_INTERVAL_SECS: u64 = 10;
 
 impl AppConfig {
     /// Load config by layering (later sources override earlier ones):
@@ -568,6 +607,24 @@ impl AppConfig {
                     "retention.batch_limit must be between 1 and {MAX_RETENTION_BATCH}"
                 ));
             }
+        }
+        if self
+            .observability
+            .metrics_bind
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
+            errors.push(format!(
+                "observability.metrics_bind '{}' is not a valid socket address \
+                 (expected IP:port, e.g. 0.0.0.0:9091 or [::]:9091)",
+                self.observability.metrics_bind
+            ));
+        }
+        if self.observability.stats_sample_interval_secs < MIN_STATS_SAMPLE_INTERVAL_SECS {
+            errors.push(format!(
+                "observability.stats_sample_interval_secs must be >= {MIN_STATS_SAMPLE_INTERVAL_SECS} \
+                 (sub-10s sampling re-introduces sustained DB load — see review F20)"
+            ));
         }
 
         if errors.is_empty() {
@@ -1615,5 +1672,72 @@ filter = "info"
         }
 
         assert_eq!(cfg.database.url, "postgres://from-env/db");
+    }
+
+    // ── ObservabilityConfig ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_observability_config_from_toml() {
+        let toml = format!(
+            "{}\n\n[observability]\nmetrics_bind = \"127.0.0.1:9091\"\notel_endpoint = \"http://localhost:4317\"",
+            full_toml()
+        );
+        let cfg = build_config(&toml);
+        assert_eq!(cfg.observability.metrics_bind, "127.0.0.1:9091");
+        assert_eq!(cfg.observability.otel_endpoint, "http://localhost:4317");
+    }
+
+    #[test]
+    fn test_validate_observability_metrics_bind_invalid() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.metrics_bind = "not-an-addr".to_string();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.0.iter().any(|e| e.contains("metrics_bind")));
+    }
+
+    #[test]
+    fn test_validate_observability_metrics_bind_valid() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.metrics_bind = "0.0.0.0:9091".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_observability_stats_sample_interval_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.stats_sample_interval_secs = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("stats_sample_interval_secs"))
+        );
+    }
+
+    #[test]
+    fn test_validate_observability_stats_sample_interval_below_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.stats_sample_interval_secs = 5;
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("stats_sample_interval_secs"))
+        );
+    }
+
+    #[test]
+    fn test_validate_observability_stats_sample_interval_at_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.stats_sample_interval_secs = 10;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_observability_defaults_when_absent() {
+        let cfg = build_config(full_toml());
+        assert_eq!(cfg.observability.stats_sample_interval_secs, 30);
+        assert_eq!(cfg.observability.metrics_bind, "0.0.0.0:9091");
+        assert!(cfg.observability.otel_endpoint.is_empty());
     }
 }

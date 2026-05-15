@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                callback_name,\n                EXTRACT(EPOCH FROM (now() - dispatched_at))::float8 AS \"age_seconds!\"\n            FROM outbox_deliveries\n            WHERE completion_mode = 'external'\n              AND dispatched_at   IS NOT NULL\n              AND processed_at    IS NULL\n              AND dead_letter     = FALSE\n            ORDER BY dispatched_at\n            LIMIT $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "callback_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "age_seconds!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "01b3cbd05df9f0ffef891e7cda82b2cd026e1b0b87ea19f628469edd046dd0ca"
+}

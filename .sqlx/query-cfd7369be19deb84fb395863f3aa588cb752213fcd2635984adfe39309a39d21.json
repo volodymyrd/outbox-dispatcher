@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH candidates AS (\n                SELECT e.id,\n                       CASE WHEN EXISTS (\n                           SELECT 1 FROM outbox_deliveries d\n                           WHERE d.event_id = e.event_id\n                             AND d.dead_letter = TRUE\n                       ) THEN 'dead_letter' ELSE 'processed' END AS reason\n                FROM outbox_events e\n                WHERE NOT EXISTS (\n                    SELECT 1\n                    FROM outbox_deliveries d\n                    WHERE d.event_id = e.event_id\n                      AND d.processed_at IS NULL\n                      AND d.dead_letter   = FALSE\n                )\n                AND e.created_at < CASE\n                    WHEN EXISTS (\n                        SELECT 1 FROM outbox_deliveries d\n                        WHERE d.event_id = e.event_id\n                          AND d.dead_letter = TRUE\n                    ) THEN $1::timestamptz\n                    ELSE $2::timestamptz\n                END\n                ORDER BY e.id\n                LIMIT $3\n            ),\n            deleted AS (\n                DELETE FROM outbox_events\n                WHERE id IN (SELECT id FROM candidates)\n                RETURNING id\n            )\n            SELECT c.reason\n            FROM candidates c\n            WHERE c.id IN (SELECT id FROM deleted)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reason",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "cfd7369be19deb84fb395863f3aa588cb752213fcd2635984adfe39309a39d21"
+}
