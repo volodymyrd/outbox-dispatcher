@@ -251,19 +251,11 @@ The worker deletes `outbox_events` rows whose deliveries are all in a terminal s
 
 Monitor via `outbox_retention_deletions_total{reason}` and `outbox_retention_oldest_event_age_seconds`.
 
-## SIGHUP (hot reload)
+## Config changes
 
-Send SIGHUP to reload config without a restart:
+Config changes require a restart. There is no hot-reload mechanism; rolling the
+dispatcher one replica at a time is the safe path for multi-replica deployments.
+`[signing_keys]`, `[dispatch]`, and `[observability]` settings all take effect
+after the restart.
 
-```bash
-kill -HUP <dispatcher_pid>
-# or with Docker:
-docker kill --signal=SIGHUP outbox-dispatcher
-```
-
-The following settings take effect immediately:
-- `[signing_keys]` keyring
-- `[dispatch]` defaults (poll interval, batch size, backoff, timeouts, etc.)
-- `[observability]` settings
-
-Database connection settings require a restart.
+For signing-key rotation specifics, see §Signing key rotation above.

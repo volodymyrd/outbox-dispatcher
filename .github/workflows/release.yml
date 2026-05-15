@@ -20,6 +20,8 @@ jobs:
   ci:
     name: Verify CI on tagged commit
     uses: ./.github/workflows/ci.yml
+    with:
+      skip_release_build: true
 
   # ── Build binaries for each target platform ───────────────────────────────
   build-binaries:

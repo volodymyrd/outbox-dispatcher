@@ -1,51 +1,36 @@
 # syntax=docker/dockerfile:1
 
-# ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM rust:1.87-bookworm AS builder
-
+# ── Stage 1: install cargo-chef ───────────────────────────────────────────────
+FROM rust:1.87-bookworm AS chef
+RUN cargo install --locked cargo-chef --version 0.1.68
 WORKDIR /build
 
-# Accept build-time sqlx offline mode (no live DB needed during Docker build).
-ENV SQLX_OFFLINE=true
-
-# Cache dependency compilation separately from source compilation.
-# Copy manifests first so the layer is reused when only source changes.
+# ── Stage 2: compute dependency recipe ───────────────────────────────────────
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
-COPY crates/core/Cargo.toml           crates/core/Cargo.toml
-COPY crates/http-callback/Cargo.toml  crates/http-callback/Cargo.toml
-COPY crates/admin-api/Cargo.toml      crates/admin-api/Cargo.toml
-COPY crates/bin/Cargo.toml            crates/bin/Cargo.toml
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Create stub lib/main files so Cargo can resolve the workspace and compile deps.
-RUN mkdir -p crates/core/src \
-             crates/http-callback/src \
-             crates/admin-api/src \
-             crates/bin/src && \
-    echo "pub fn _stub() {}" > crates/core/src/lib.rs && \
-    echo "pub fn _stub() {}" > crates/http-callback/src/lib.rs && \
-    echo "pub fn _stub() {}" > crates/admin-api/src/lib.rs && \
-    echo "fn main() {}"      > crates/bin/src/main.rs
+# ── Stage 3: compile dependencies only ───────────────────────────────────────
+FROM chef AS builder
+ENV SQLX_OFFLINE=true
+COPY --from=planner /build/recipe.json recipe.json
+# This layer is cached as long as Cargo.toml / Cargo.lock are unchanged.
+RUN cargo chef cook --release --recipe-path recipe.json
 
-RUN cargo fetch --locked && \
-    cargo build --release --bin outbox-dispatcher || \
-    (echo "warm-up build failed — check Cargo.toml / toolchain before relying on layer cache" && exit 1)
-
-# Now copy the real source, sqlx offline cache, config, and migrations.
-COPY crates/              crates/
-COPY migrations/          migrations/
-COPY envs/                envs/
-COPY .sqlx/               .sqlx/
-
-# Touch source files to force recompilation (stubs were built above).
-RUN find crates -name "*.rs" | xargs touch
-
+# Copy real sources and compile the binary.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/        crates/
+COPY migrations/    migrations/
+COPY envs/          envs/
+COPY .sqlx/         .sqlx/
 RUN cargo build --release --bin outbox-dispatcher
 
-# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+# ── Stage 4: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
 # Install TLS certificates (needed by reqwest's rustls backend to verify
-# receiver TLS certificates) and a minimal set of runtime libs.
+# receiver TLS certificates) and wget for the healthcheck.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates wget && \
     rm -rf /var/lib/apt/lists/*

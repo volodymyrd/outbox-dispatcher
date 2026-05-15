@@ -2,7 +2,7 @@
 # This is a minimal reference — copy and adjust for your environment.
 #
 # Usage:
-#   cp .env.example .env          # fill in secrets
+#   cp .env.example .env          # fill in required secrets (see .env.example)
 #   docker compose -f docker/docker-compose.example.yml up -d
 
 services:
