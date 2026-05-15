@@ -1,6 +1,6 @@
 # Code Review — Phase 8 (PR #7)
 
-**Date:** 2026-05-15T17:07:47Z (initial), 2026-05-15T20:45:36Z (follow-up: findings 9–10)
+**Date:** 2026-05-15T17:07:47Z (initial), 2026-05-15T20:45:36Z (follow-up: findings 9–10), 2026-05-15T21:18:00Z (follow-up: findings 12–15)
 **Branch:** phase8
 **Reviewed by:** Claude (review command)
 **Scope:** PR #7 — Dockerfile, GitHub Actions CI/CD, example configs, deployment/ops/protocol docs
@@ -852,6 +852,300 @@ Reusable workflows share the artifact namespace with the caller, and `upload-art
 
 ---
 
+### Finding 12 — `ci.yml` guard `github.event_name != 'workflow_call'` does not skip the build job during a release
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `.github/workflows/ci.yml:81-103`, `.github/workflows/release.yml:20-22` |
+| **Severity** | High |
+| **Category** | Correctness |
+
+**Problem**
+
+The fix for prior Finding 11 added `if: github.event_name != 'workflow_call'` to the `build` job in `ci.yml`, intending to skip the redundant release-binary upload when `ci.yml` is invoked via `workflow_call` from `release.yml`. However, in a reusable workflow `github.event_name` is **the caller's event** — i.e. `push` for a tag push from `release.yml`, never the literal string `workflow_call`. The guard therefore evaluates `'push' != 'workflow_call'` → `true`, the build job runs anyway, and `actions/upload-artifact@v4` will fail the second upload with HTTP 409 (`an artifact with this name already exists on the workflow run`). Net effect: the duplicate-artifact bug Finding 11 was meant to eliminate is still present on every tag push.
+
+**Context** (surrounding code as it exists today)
+
+```yaml
+# .github/workflows/ci.yml lines 78-83
+  # Skip when invoked via workflow_call from release.yml — the release workflow
+  # builds its own per-platform binaries and uploading an artifact with the same
+  # name would cause an HTTP 409 conflict with upload-artifact@v4.
+  build:
+    name: Build Release Binary
+    if: github.event_name != 'workflow_call'      # ❌ never false in practice
+```
+
+```yaml
+# .github/workflows/release.yml lines 20-22
+  ci:
+    name: Verify CI on tagged commit
+    uses: ./.github/workflows/ci.yml
+```
+
+**Recommended fix**
+
+Pass an explicit `inputs` flag through `workflow_call` and gate on `inputs.<name>` — the `inputs` context is the only reliable signal that a workflow is being run as a callee:
+
+```yaml
+# .github/workflows/ci.yml — replace the existing on: + build job header
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+    inputs:
+      skip_release_build:
+        description: "Skip the build/upload step (release.yml builds its own binaries)"
+        type: boolean
+        default: false
+
+# …
+
+  build:
+    name: Build Release Binary
+    if: ${{ !inputs.skip_release_build }}
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration]
+    # … existing steps …
+```
+
+```yaml
+# .github/workflows/release.yml — pass the flag from the caller
+  ci:
+    name: Verify CI on tagged commit
+    uses: ./.github/workflows/ci.yml
+    with:
+      skip_release_build: true
+```
+
+**Why this fix**
+
+GitHub explicitly documents that contexts in a reusable workflow reflect the caller's run, so `github.event_name` will never be `'workflow_call'`. The `inputs` context, on the other hand, is unique to callees and unambiguous — and the explicit flag also self-documents the intent in `release.yml`.
+
+---
+
+### Finding 13 — Operations runbook documents SIGHUP hot-reload, but no SIGHUP handler exists in the binary
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docs/operations.md:254-269` |
+| **Severity** | High |
+| **Category** | Documentation / Correctness |
+
+**Problem**
+
+`docs/operations.md` contains an entire "SIGHUP (hot reload)" section instructing operators to `kill -HUP <dispatcher_pid>` (or `docker kill --signal=SIGHUP outbox-dispatcher`) to reload `[signing_keys]`, `[dispatch]`, and `[observability]` settings without a restart. The binary, however, only installs handlers for `tokio::signal::ctrl_c()` (`SIGINT`/`SIGTERM`) — there is no `SIGHUP` handler anywhere in `crates/bin/src/main.rs`. The Linux default disposition for `SIGHUP` on a process with no handler is **terminate** — so an operator who follows the runbook to rotate a signing key will instead **kill the dispatcher** mid-flight. This is operationally dangerous and contradicts the runbook's "without a restart" claim.
+
+**Context** (surrounding code as it exists today)
+
+```markdown
+<!-- docs/operations.md lines 254-269 -->
+## SIGHUP (hot reload)
+
+Send SIGHUP to reload config without a restart:
+
+```bash
+kill -HUP <dispatcher_pid>
+# or with Docker:
+docker kill --signal=SIGHUP outbox-dispatcher
+```
+
+The following settings take effect immediately:
+- `[signing_keys]` keyring
+- `[dispatch]` defaults (poll interval, batch size, backoff, timeouts, etc.)
+- `[observability]` settings
+
+Database connection settings require a restart.
+```
+
+```rust
+// crates/bin/src/main.rs lines 228-238 — the only signal handling that exists
+tokio::spawn(async move {
+    tokio::select! {
+        _ = signal_token.cancelled() => {}
+        _ = tokio::signal::ctrl_c() => {
+            info!("received SIGINT/SIGTERM, requesting shutdown");
+            signal_token.cancel();
+        }
+    }
+});
+```
+
+**Recommended fix**
+
+Pick one of two options — both are acceptable, but the runbook must match the binary:
+
+Option A — remove the SIGHUP section from the runbook (preferred until hot-reload is actually implemented):
+
+```markdown
+<!-- docs/operations.md — replace the SIGHUP section -->
+## Config changes
+
+Config changes require a restart. There is currently no hot-reload mechanism;
+rolling the dispatcher (one replica at a time on multi-replica deployments) is
+the safe path. `[signing_keys]`, `[dispatch]`, and `[observability]` settings
+all take effect after the restart.
+
+For signing-key rotation specifics, see §Signing key rotation above.
+```
+
+Option B — implement SIGHUP reload in the binary (more work). Sketch:
+
+```rust
+// crates/bin/src/main.rs — add alongside the SIGINT handler
+use tokio::signal::unix::{signal, SignalKind};
+
+let reload_tx = reload_tx.clone();
+tokio::spawn(async move {
+    let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+    while sighup.recv().await.is_some() {
+        info!("received SIGHUP, reloading config");
+        if let Err(e) = reload_tx.send(()).await {
+            warn!(error = %e, "config reload channel closed");
+        }
+    }
+});
+```
+
+The reload path then has to re-read `AppConfig`, swap the keyring atomically, and republish the dispatch/observability settings — non-trivial; pick Option A unless the work is in scope.
+
+**Why this fix**
+
+The runbook is the operator's source of truth. A documented procedure that actually terminates the process is worse than no documentation at all — it actively misleads someone who is already in an incident-adjacent situation (rotating a key, tuning backoff). Either implement the behaviour or remove the claim.
+
+---
+
+### Finding 14 — Dockerfile dependency-warmup layer compiles nothing useful (cache benefit is illusory)
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docker/Dockerfile:19-31` |
+| **Severity** | Medium |
+| **Category** | Performance |
+
+**Problem**
+
+The dependency-warmup stage is meant to precompile all third-party crates in an early layer so source-only edits hit a warm cache on subsequent builds. The current implementation creates stub source files containing only `pub fn _stub() {}` / `fn main() {}` — none of which import any external crate. As a result, `cargo build --release --bin outbox-dispatcher` against the stubs compiles only the four empty workspace crates and **does not compile any of the heavy dependencies** (`sqlx`, `axum`, `reqwest`, `tokio`, OpenTelemetry, `opentelemetry-otlp`, etc.). `cargo fetch --locked` downloads sources to the registry but does not produce build artefacts. On every full image build (cache miss), every dependency is recompiled from scratch in the second `cargo build` step, undoing the entire point of the split.
+
+**Context** (surrounding code as it exists today)
+
+```dockerfile
+# docker/Dockerfile lines 19-31
+RUN mkdir -p crates/core/src \
+             crates/http-callback/src \
+             crates/admin-api/src \
+             crates/bin/src && \
+    echo "pub fn _stub() {}" > crates/core/src/lib.rs && \
+    echo "pub fn _stub() {}" > crates/http-callback/src/lib.rs && \
+    echo "pub fn _stub() {}" > crates/admin-api/src/lib.rs && \
+    echo "fn main() {}"      > crates/bin/src/main.rs
+
+RUN cargo fetch --locked && \
+    cargo build --release --bin outbox-dispatcher || \
+    (echo "warm-up build failed — check Cargo.toml / toolchain before relying on layer cache" && exit 1)
+```
+
+**Recommended fix**
+
+Switch to `cargo-chef`, which is the standard idiom for this problem in Rust Docker builds. It computes a JSON recipe from the manifests + lockfile and compiles only the dependency graph, with no stubs to maintain:
+
+```dockerfile
+# docker/Dockerfile — replace the builder stage
+FROM rust:1.87-bookworm AS chef
+RUN cargo install --locked cargo-chef --version 0.1.68
+WORKDIR /build
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+ENV SQLX_OFFLINE=true
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY crates/        crates/
+COPY migrations/    migrations/
+COPY envs/          envs/
+COPY .sqlx/         .sqlx/
+RUN cargo build --release --bin outbox-dispatcher
+```
+
+If `cargo-chef` is not desirable, a less elegant alternative is to make each stub `lib.rs`/`main.rs` actually `use` the crate's external deps so that `cargo build` is forced to compile them. That requires keeping the stub list in sync with `Cargo.toml` for every dep change, which is exactly the maintenance trap `cargo-chef` eliminates.
+
+**Why this fix**
+
+`cargo-chef` is the canonical Rust-on-Docker layering pattern and the only one that actually achieves the layer-cache goal that the current Dockerfile attempts. Without it, the "split deps from source" structure is paying complexity for zero benefit — every CI release build (a cache miss on `cache-from: type=gha` whenever any source changes) recompiles the entire dependency tree.
+
+---
+
+### Finding 15 — `docker/docker-compose.example.yml` instructs operators to copy a non-existent `.env.example`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docker/docker-compose.example.yml:4-6` |
+| **Severity** | Low |
+| **Category** | Documentation |
+
+**Problem**
+
+The usage comment block at the top of `docker/docker-compose.example.yml` reads:
+
+```yaml
+# Usage:
+#   cp .env.example .env          # fill in secrets
+#   docker compose -f docker/docker-compose.example.yml up -d
+```
+
+`.env.example` does not exist in the repository (only `.env.toml` does, and that file is gitignored, not a template). Operators following the comment will hit `cp: .env.example: No such file or directory` on first run and have to reverse-engineer which env vars the compose file actually consumes (`POSTGRES_PASSWORD`, `ADMIN_TOKEN`, the per-signing-key vars). The very next finding ("usability footgun") is that the dispatcher service references `./config.prod.toml` as a bind-mount which also has no template; one-stop documentation would help.
+
+**Context** (surrounding code as it exists today)
+
+```yaml
+# docker/docker-compose.example.yml lines 1-6
+# Example: run outbox-dispatcher alongside a standalone Postgres instance.
+# This is a minimal reference — copy and adjust for your environment.
+#
+# Usage:
+#   cp .env.example .env          # fill in secrets
+#   docker compose -f docker/docker-compose.example.yml up -d
+```
+
+**Recommended fix**
+
+Ship a small `.env.example` at the repo root listing the variables the compose example expects, and keep the comment accurate:
+
+```ini
+# .env.example — copy to .env (gitignored) and fill in values before `docker compose up`.
+
+# Postgres bootstrap
+POSTGRES_PASSWORD=change-me
+
+# Admin API bearer token — generate with: openssl rand -hex 32
+ADMIN_TOKEN=change-me
+
+# Per-signing-key secrets (one var per [signing_keys] entry). Examples:
+# PAYMENTS_HMAC_SECRET=change-me
+# NOTIFICATIONS_HMAC_SECRET=change-me
+```
+
+Then update the comment to point at it. If you'd rather not add the file, drop the `cp` line and instead inline the required exports:
+
+```yaml
+# Usage:
+#   export POSTGRES_PASSWORD=...  ADMIN_TOKEN=$(openssl rand -hex 32)
+#   docker compose -f docker/docker-compose.example.yml up -d
+```
+
+**Why this fix**
+
+The example is the first thing operators run. A copy-pasteable command that fails on step one undermines confidence in the rest of the deployment docs. Either form (template file or inline exports) gets the user to a green compose run on the first try.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
@@ -866,7 +1160,29 @@ Reusable workflows share the artifact namespace with the caller, and `upload-art
 | 8 | Dockerfile declares no `HEALTHCHECK` | `docker/Dockerfile:42-69` | Low | Config | DONE | Added `HEALTHCHECK` instruction using `wget` (now present in image) |
 | 9 | Operations runbook lists Prometheus metrics that do not exist in code | `docs/operations.md:138-153, 160, 247` | High | Documentation | DONE | Rewrote §Key metrics table and §Alerting to match `crates/core/src/metrics.rs`; fixed retention monitoring line |
 | 10 | `README.md` is a two-line stub with no project overview | `README.md:1-3` | High | Documentation | DONE | Replaced stub with full README: pitch, features, architecture diagram, quick-start, config, webhook protocol, operations links, dev commands |
-| 11 | Release workflow uploads duplicate artifact name `outbox-dispatcher-linux-x86_64` | `.github/workflows/ci.yml:96-99`, `.github/workflows/release.yml:78-82` | Medium | Correctness | DONE | Added `if: github.event_name != 'workflow_call'` guard to `build` job in `ci.yml` (Option A) |
+| 11 | Release workflow uploads duplicate artifact name `outbox-dispatcher-linux-x86_64` | `.github/workflows/ci.yml:96-99`, `.github/workflows/release.yml:78-82` | Medium | Correctness | REOPENED | Guard added (`if: github.event_name != 'workflow_call'`) but does not skip the job — see Finding 12 |
+| 12 | `ci.yml` build-job guard `github.event_name != 'workflow_call'` never evaluates to false | `.github/workflows/ci.yml:81-83`, `.github/workflows/release.yml:20-22` | High | Correctness | TODO | In a reusable workflow, `github.event_name` reflects the caller's event (`push`), never `'workflow_call'`. Use an `inputs.skip_release_build` flag instead |
+| 13 | Operations runbook documents SIGHUP hot-reload, but the binary has no SIGHUP handler — sending SIGHUP terminates the process | `docs/operations.md:254-269` | High | Documentation | TODO | Either remove the SIGHUP section or implement a SIGHUP reload path (`tokio::signal::unix::signal(SignalKind::hangup())`) |
+| 14 | Dockerfile dependency-warmup layer compiles only the empty stubs — no third-party crates are precompiled, so the layer cache provides no benefit | `docker/Dockerfile:19-31` | Medium | Performance | TODO | Switch to `cargo-chef`, or make the stubs `use` each external dep so cargo actually compiles them |
+| 15 | `docker/docker-compose.example.yml` tells operators to `cp .env.example .env`, but `.env.example` does not exist | `docker/docker-compose.example.yml:4-6` | Low | Documentation | TODO | Ship a tracked `.env.example` template at repo root, or replace the `cp` line with inline `export` commands |
+
+## Merge readiness
+
+**Status: NOT READY TO MERGE.**
+
+All 11 prior findings have working fixes in the tree **except** Finding 11, whose `if: github.event_name != 'workflow_call'` guard is itself broken (new Finding 12) — meaning the duplicate-artifact failure on every tag push is still live. New Finding 13 is also blocking: the operations runbook documents a hot-reload path that terminates the dispatcher when followed literally.
+
+Blockers (must fix before merge):
+
+- **Finding 12** — fix the workflow_call gate using `inputs.skip_release_build` so release builds don't fail with HTTP 409 on duplicate artifact names.
+- **Finding 13** — either remove the SIGHUP section from `docs/operations.md` or implement an actual SIGHUP handler. The current state will mislead operators into killing the service mid-incident.
+
+Non-blocking polish (can ship later, but worth doing soon):
+
+- **Finding 14** — the Docker dep-warmup is performance dead weight; replace with `cargo-chef` to recover the layer-cache benefit Phase 8 was advertising.
+- **Finding 15** — minor doc fix to make the example compose file work out of the box.
+
+Re-review after Findings 12 and 13 are addressed; the remaining two are not regressions, just optimisations.
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
