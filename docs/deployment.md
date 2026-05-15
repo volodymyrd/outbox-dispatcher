@@ -14,9 +14,9 @@ This guide covers running `outbox-dispatcher` in production.
 export ADMIN_TOKEN="$(openssl rand -hex 32)"
 export MY_HMAC_SECRET="$(openssl rand -base64 48)"
 
-# Copy and edit the production config
-cp examples/config.production.toml config.prod.toml
-# Edit config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
+# Copy and edit the production config (must live next to the compose file)
+cp examples/config.production.toml examples/config.prod.toml
+# Edit examples/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
 
 # Start Postgres + dispatcher
 docker compose -f examples/docker-compose.with-postgres.yml up -d

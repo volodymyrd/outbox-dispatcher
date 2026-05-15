@@ -161,8 +161,8 @@ Scrape endpoint: `http://dispatcher:9091/metrics` (no auth)
 |-------|-----------|----------|
 | Dead letters accumulating | `rate(outbox_dead_letters_total[5m]) > 0` | Warning |
 | High dispatch lag | `outbox_lag_seconds > 300` | Warning |
-| Listener down | `outbox_listener_connection_status == 0 for 2m` | Critical |
-| Scheduler stalled | `rate(outbox_cycle_duration_seconds_count[2 * poll_interval]) == 0` | Critical |
+| Listener down | `outbox_listener_connection_status == 0` (with `for: 2m` in the rule) | Critical |
+| Scheduler stalled | `rate(outbox_cycle_duration_seconds_count[1m]) == 0` (set window ≥ 2 × `poll_interval_secs`) | Critical |
 | Signing key drift | `rate(outbox_signing_key_resolution_failures_total[5m]) > 0` | Warning |
 | Corrupted rows | `rate(outbox_corrupted_rows_total[5m]) > 0` | Warning |
 
@@ -176,7 +176,7 @@ Scrape endpoint: `http://dispatcher:9091/metrics` (no auth)
         "http://dispatcher:9090/v1/dead-letters?callback_name=my_callback"
    ```
 2. Common errors:
-   - `signing_key_id 'foo' not registered` — the key is missing from `[signing_keys]`. Add it and send a SIGHUP or restart.
+   - `signing_key_id 'foo' not registered` — the key is missing from `[signing_keys]`. Add it and restart the dispatcher.
    - `HTTP 5xx …` — the receiver is returning errors. Check receiver logs.
    - `callback timeout` — the receiver is too slow. Increase `timeout_seconds` in the callback definition or optimize the receiver.
    - `invalid_callback: …` — the callback JSON in `outbox_events.callbacks` failed structural validation. Fix the publisher.
@@ -191,7 +191,7 @@ Scrape endpoint: `http://dispatcher:9091/metrics` (no auth)
 
 1. Generate a new secret and update the env var (or Kubernetes secret).
 2. Add the new key id to `[signing_keys]` in config (or update the existing entry to point to the new env var).
-3. Send SIGHUP or restart the dispatcher. The new key takes effect on the next delivery attempt.
+3. Restart the dispatcher. The new key takes effect on the next delivery attempt.
 4. Publishers can start writing the new key id immediately after the dispatcher config is updated.
 5. Keep the old key id in `[signing_keys]` (pointing to the old secret) until all in-flight deliveries using it have completed.
 

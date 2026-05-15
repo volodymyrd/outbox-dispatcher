@@ -1422,25 +1422,16 @@ A first-time contributor copying these three lines hits a config error within se
 | 13 | Operations runbook documents SIGHUP hot-reload, but the binary has no SIGHUP handler — sending SIGHUP terminates the process | `docs/operations.md:254-269` | High | Documentation | DONE | Replaced SIGHUP section with "Config changes require a restart" guidance |
 | 14 | Dockerfile dependency-warmup layer compiles only the empty stubs — no third-party crates are precompiled, so the layer cache provides no benefit | `docker/Dockerfile:19-31` | Medium | Performance | DONE | Replaced stub-based warmup with `cargo-chef` (planner + cook stages) |
 | 15 | `docker/docker-compose.example.yml` tells operators to `cp .env.example .env`, but `.env.example` does not exist | `docker/docker-compose.example.yml:4-6` | Low | Documentation | DONE | Added `.env.example` at repo root with required variables; updated compose comment to reference it |
-| 16 | SIGHUP references still present in operations.md (Dead letters §, Signing key rotation §) after Finding 13's fix — runbook still suggests an action that kills the process | `docs/operations.md:179, 194` | High | Documentation | TODO | F13 removed the dedicated §SIGHUP section but left two cross-references that contradict §Config changes; both should be changed to "restart" |
-| 17 | Quick-start `cp examples/config.production.toml config.prod.toml` puts the file at the workspace root, but the compose bind mount `./config.prod.toml` resolves relative to the compose file (`examples/`) — the prod overlay is silently absent | `docs/deployment.md:18`, `examples/docker-compose.with-postgres.yml:51`, `docker/docker-compose.example.yml:46` | High | Correctness | TODO | Either change `cp` destination to `examples/config.prod.toml` (and `docker/config.prod.toml` for the other example) or anchor the mount to `$OUTBOX_CONFIG` |
-| 18 | Alerting table uses non-literal PromQL range selector (`[2 * poll_interval]`) and `for 2m` inside the expression — invalid PromQL | `docs/operations.md:164-165` | Low | Documentation | TODO | Use a literal duration in `[...]` and document the `for:` clause outside the expression |
-| 19 | README "run from source" quick-start omits `DATABASE_URL` / `ADMIN_TOKEN` — both `cargo run` invocations will fail on a fresh clone | `README.md:70-76` | Low | Documentation | TODO | Add `export DATABASE_URL=...` and `export ADMIN_TOKEN=...` before the `cargo run` commands |
+| 16 | SIGHUP references still present in operations.md (Dead letters §, Signing key rotation §) after Finding 13's fix — runbook still suggests an action that kills the process | `docs/operations.md:179, 194` | High | Documentation | DONE | Removed "send a SIGHUP or" from both locations; both now say "restart the dispatcher" |
+| 17 | Quick-start `cp examples/config.production.toml config.prod.toml` puts the file at the workspace root, but the compose bind mount `./config.prod.toml` resolves relative to the compose file (`examples/`) — the prod overlay is silently absent | `docs/deployment.md:18`, `examples/docker-compose.with-postgres.yml:51`, `docker/docker-compose.example.yml:46` | High | Correctness | DONE | Changed `cp` destination to `examples/config.prod.toml` in docs/deployment.md and README.md; updated volume comment in examples/docker-compose.with-postgres.yml; updated docker/docker-compose.example.yml usage comment and volume comment to instruct `docker/config.prod.toml` |
+| 18 | Alerting table uses non-literal PromQL range selector (`[2 * poll_interval]`) and `for 2m` inside the expression — invalid PromQL | `docs/operations.md:164-165` | Low | Documentation | DONE | Fixed `[2 * poll_interval]` → `[1m]` with explanatory note; moved `for 2m` out of the PromQL expression into a prose annotation |
+| 19 | README "run from source" quick-start omits `DATABASE_URL` / `ADMIN_TOKEN` — both `cargo run` invocations will fail on a fresh clone | `README.md:70-76` | Low | Documentation | DONE | Added `export DATABASE_URL=...` and `export ADMIN_TOKEN=...` before the `cargo run` commands |
 
 ## Merge readiness
 
-**Status: NOT READY TO MERGE.**
+**Status: READY TO MERGE.**
 
-Findings 1–15 from prior review rounds are all confirmed DONE — Dockerfile, CI/CD, healthchecks, `.dockerignore`, `.env.example`, metrics doc, README, and the workflow_call gate are all correctly implemented. The follow-up review found four new issues:
-
-- **Blocking (must fix before merge):**
-  - F16 — SIGHUP cross-references in `docs/operations.md` remain after F13's fix; the runbook still tells operators to send a signal that kills the process during key rotation.
-  - F17 — The headline quick-start in both `README.md` and `docs/deployment.md` silently breaks (or silently runs without the prod overlay) due to a Compose bind-mount path-resolution mismatch.
-- **Non-blocking but should fix soon:**
-  - F18 — Alert rule in `docs/operations.md` is syntactically invalid PromQL.
-  - F19 — README "run from source" snippet missing required env vars.
-
-Once F16 and F17 are addressed, the PR is ready to merge; F18 and F19 can be folded into the same fix-up commit or deferred to a follow-up doc PR at the maintainer's discretion.
+All findings (F1–F19) are confirmed DONE. The blocking issues (F16, F17) and the non-blocking issues (F18, F19) have all been addressed.
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

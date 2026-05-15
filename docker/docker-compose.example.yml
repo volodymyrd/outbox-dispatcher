@@ -3,6 +3,8 @@
 #
 # Usage:
 #   cp .env.example .env          # fill in required secrets (see .env.example)
+#   cp examples/config.production.toml docker/config.prod.toml
+#   # Edit docker/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
 #   docker compose -f docker/docker-compose.example.yml up -d
 
 services:
@@ -42,6 +44,8 @@ services:
       - "9091:9091"   # Prometheus metrics
     volumes:
       # Mount your production config (see examples/config.production.toml).
+      # Path resolves relative to this file (docker/). Copy and edit:
+      #   cp examples/config.production.toml docker/config.prod.toml
       # The base envs/ baked into the image are used as fallback defaults.
       - ./config.prod.toml:/app/envs/app_config_prod.toml:ro
     healthcheck:

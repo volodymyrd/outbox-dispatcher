@@ -61,6 +61,8 @@ single binary so publishing services only need to `INSERT` into one table.
 ```bash
 # 1. Start Postgres + dispatcher with a single compose command
 export ADMIN_TOKEN="$(openssl rand -hex 32)"
+cp examples/config.production.toml examples/config.prod.toml
+# Edit examples/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
 docker compose -f examples/docker-compose.with-postgres.yml up -d
 
 # 2. Verify
@@ -70,9 +72,11 @@ curl http://localhost:9090/ready
 To run from source:
 
 ```bash
-docker compose up -d    # local Postgres on :5434
-cargo run -- migrate    # apply schema
-cargo run               # start the dispatcher
+docker compose up -d                               # local Postgres on :5434
+export DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher
+export ADMIN_TOKEN="$(openssl rand -hex 32)"
+cargo run -- migrate                               # apply schema
+cargo run                                          # start the dispatcher
 ```
 
 ## Configuration
