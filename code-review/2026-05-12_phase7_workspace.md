@@ -1835,3 +1835,259 @@ The five new findings are **non-blocking**:
 If the maintainer prefers to land all 24 findings before merge, suggested order is
 F22 → F20 → F21 → F23 → F24 (F22 changes a metric's semantic; do it first so any
 follow-up alert tuning is built on the final shape).
+
+---
+
+## Sixth-pass review (2026-05-15T15:48:18Z)
+
+Findings 1–24 verified as DONE on a fresh re-read of `phase7` (HEAD `3c2628d`,
+PR #6). The fifth-pass items have concrete, working implementations:
+
+- **F20** — `observability.stats_sample_interval_secs` (default `30`) wired into
+  `run_stats_sampler`; validation rejects `0` (`config.rs:622-624`).
+- **F21** — `init_metrics` configures buckets via
+  `Matcher::Suffix("_duration_seconds")` and
+  `Matcher::Full(EXTERNAL_PENDING_SECONDS)` (`main.rs:501-519`).
+- **F22** — `fetch_stats` SQL now joins `outbox_events` and uses
+  `MIN(e.created_at)` (`repo.rs:810-818`).
+- **F23** — Retention worker's `next_sleep` is initialised to `[0, interval)`
+  jitter and reset to `interval` after the first cycle, watched by the same
+  `tokio::select!` as shutdown (`retention.rs:71-92`).
+- **F24** — Signal handler joined into the `workers` `JoinSet` with a
+  `select!` against `ctrl_c()` and the cancellation token (`main.rs:228-244`).
+
+Build/test status on `phase7` HEAD `3c2628d`:
+
+- `cargo check --workspace` — clean
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo sort --workspace --check` — clean
+- `cargo test --workspace` — **335 tests green** (279 core + 23 admin +
+  20 http-callback + 9 + 4 integration)
+- `cargo fmt --all -- --check` — **FAILS** (see Finding 25)
+
+Three new findings emerged on this pass — one High (CI gate), two Low.
+
+### Finding 25 — `cargo fmt --all --check` fails on seven test assertions in `config.rs`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/config.rs:1034-1042, 1052-1060, 1225-1233, 1237-1245, 1368-1376, 1433-1441, 1696-1704` |
+| **Severity** | High |
+| **Category** | Idiom / CI |
+
+**Problem**
+
+CLAUDE.md mandates `cargo fmt --all` after every code change, and the project
+has no exclusions. On the current HEAD, `cargo fmt --all -- --check` exits
+non-zero with seven diffs in `crates/core/src/config.rs`: chained-assert blocks
+that the formatter wants wrapped across multiple `assert!` arg lines. None of
+these are new code — they're tests that were touched mid-PR — but the file
+ships unformatted, which will fail any CI step that runs the mandated
+`cargo fmt --all -- --check`.
+
+**Context** (`crates/core/src/config.rs:1696-1704` — one of seven identical
+patterns)
+
+```rust
+#[test]
+fn test_validate_observability_stats_sample_interval_zero() {
+    let mut cfg = build_config(full_toml());
+    cfg.observability.stats_sample_interval_secs = 0;
+    let errs = cfg.validate().unwrap_err();
+    assert!(errs
+        .0
+        .iter()
+        .any(|e| e.contains("stats_sample_interval_secs")));
+}
+```
+
+`rustfmt` wants this in the canonical `assert!(\n    <expr>\n);` shape:
+
+```rust
+assert!(
+    errs.0
+        .iter()
+        .any(|e| e.contains("stats_sample_interval_secs"))
+);
+```
+
+**Recommended fix**
+
+Run `cargo fmt --all` once and commit the result. The change is mechanical and
+touches exactly the seven sites listed above.
+
+```bash
+cargo fmt --all
+git add crates/core/src/config.rs
+git commit -m "cargo fmt"
+```
+
+**Why this fix**
+
+The mandatory post-change checklist in `CLAUDE.md` explicitly lists
+`cargo fmt --all` as the first step after every edit. Shipping an unformatted
+tree silently violates that contract and will break any CI step that gates on
+`rustfmt`.
+
+---
+
+### Finding 26 — `stats_sample_interval_secs` has no lower-bound sanity check
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/config.rs:622-624` |
+| **Severity** | Low |
+| **Category** | Config |
+
+**Problem**
+
+`AppConfig::validate` rejects `stats_sample_interval_secs == 0` but accepts any
+positive value. Finding 20's motivation was that polling every 5 s issues
+three or four heavy aggregate scans against `outbox_deliveries` and burns DB
+CPU on large deployments. With no minimum, an operator can reintroduce
+exactly that problem by setting `stats_sample_interval_secs = 1` (e.g. for
+fast local-dev feedback) and then deploy that config to prod by mistake.
+
+The closely related `dispatch.external_timeout_sweep_interval_secs` enforces a
+10 s minimum (`config.rs:565-570` via `MIN_SWEEP_INTERVAL_SECS`); the same
+pattern would apply here.
+
+**Context** (`crates/core/src/config.rs:622-624`)
+
+```rust
+if self.observability.stats_sample_interval_secs == 0 {
+    errors.push("observability.stats_sample_interval_secs must be > 0".to_string());
+}
+```
+
+**Recommended fix**
+
+Add a small minimum (10 s is conservative and still leaves dev workflows
+usable) and surface the constant alongside the existing `MIN_*` constants:
+
+```rust
+const MIN_STATS_SAMPLE_INTERVAL_SECS: u64 = 10;
+
+// in validate()
+if self.observability.stats_sample_interval_secs < MIN_STATS_SAMPLE_INTERVAL_SECS {
+    errors.push(format!(
+        "observability.stats_sample_interval_secs must be >= {MIN_STATS_SAMPLE_INTERVAL_SECS} \
+         (sub-10s sampling re-introduces sustained DB load — see review F20)"
+    ));
+}
+```
+
+**Why this fix**
+
+Validation is the only place where the rationale of F20 can be enforced
+across deployments. A bare `> 0` check leaves the foot-gun fully loaded.
+
+---
+
+### Finding 27 — `[observability]` section missing from base env config; new knob has no discovery surface
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `envs/app_config.toml`, `envs/app_config_dev.toml`, `envs/app_config_local.toml` |
+| **Severity** | Low |
+| **Category** | Config |
+
+**Problem**
+
+None of the three checked-in env configs (`envs/app_config.toml`,
+`app_config_dev.toml`, `app_config_local.toml`) contain an `[observability]`
+section. All three observability knobs — `metrics_bind`, `otel_endpoint`,
+and the newly-added `stats_sample_interval_secs` — are populated entirely from
+`#[serde(default = "...")]` fallbacks in `ObservabilityConfig` (`config.rs:357-380`).
+This pre-dates phase 7 for the first two keys, but landing a third unannotated
+knob compounds the problem: operators tuning observability have no visible
+reference to copy from, no comment on what the default means, and no signal
+that the knob exists at all without grepping the Rust source.
+
+**Context** (`envs/app_config.toml` — no `[observability]` block anywhere)
+
+```toml
+[retention]
+enabled = false
+processed_retention_days = 7
+dead_letter_retention_days = 30
+cleanup_interval_secs = 3600
+batch_limit = 1000
+
+# Signing keys: maps key id -> env var name holding the base64-encoded HMAC secret.
+# Example:
+# [signing_keys]
+# "welcome-v1" = { secret_env = "WELCOME_HMAC_SECRET" }
+[signing_keys]
+```
+
+**Recommended fix**
+
+Add a commented `[observability]` block to `envs/app_config.toml` so the
+defaults are self-documenting:
+
+```toml
+[observability]
+# Address the Prometheus /metrics HTTP listener binds to.
+metrics_bind = "0.0.0.0:9091"
+# OTLP gRPC endpoint for traces. Empty disables OpenTelemetry export.
+otel_endpoint = ""
+# How often the stats sampler runs heavy aggregate queries (events/deliveries
+# counts, oldest-pending age, external-pending ages). Defaults to 30 s to
+# align with typical Prometheus scrape cadence — see review finding F20.
+stats_sample_interval_secs = 30
+```
+
+`app_config_dev.toml` and `app_config_local.toml` can override only the keys
+that differ.
+
+**Why this fix**
+
+`envs/app_config.toml` is the file CLAUDE.md describes as "Base defaults for
+all envs"; operators reading it should be able to discover every operator-
+facing knob without consulting source. The keys still work fine via defaults,
+so this is documentation-only.
+
+---
+
+## Updated summary
+
+| # | Title | File:Line | Severity | Category | Status | Notes |
+|---|-------|-----------|----------|----------|--------|-------|
+| 25 | `cargo fmt --all --check` fails on seven test assertions in `config.rs` | `crates/core/src/config.rs:1034-1704` (7 sites) | High | Idiom / CI | TODO | Run `cargo fmt --all` and commit; CLAUDE.md mandates this after every change |
+| 26 | `stats_sample_interval_secs` has no lower-bound sanity check | `crates/core/src/config.rs:622-624` | Low | Config | TODO | Add a `MIN_STATS_SAMPLE_INTERVAL_SECS` (e.g. 10 s) and reject below it, mirroring `MIN_SWEEP_INTERVAL_SECS` |
+| 27 | `[observability]` block missing from base env config | `envs/app_config.toml`, `app_config_dev.toml`, `app_config_local.toml` | Low | Config | TODO | Add a documented `[observability]` block to `app_config.toml`; per-env files only override what differs |
+
+> **Instructions for the implementing LLM:** same conventions — `TODO` → `DONE`
+> on resolution, `SKIPPED` with a reason if intentionally not applied. Do not
+> delete rows.
+
+---
+
+## PR state (sixth pass — 2026-05-15)
+
+**Status: NOT READY TO MERGE — blocked on Finding 25 (one mechanical commit).**
+
+All twenty-four prior findings are addressed and verified on `phase7`
+HEAD `3c2628d`. The full workspace is functionally correct:
+
+- `cargo check --workspace`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo sort --workspace --check`,
+  `cargo test --workspace` all pass on the current HEAD — **335 tests green**.
+
+The single blocker is **Finding 25**: `cargo fmt --all -- --check` exits
+non-zero because seven test assertions in `crates/core/src/config.rs` were
+edited mid-PR without re-running `cargo fmt`. CLAUDE.md explicitly mandates
+`cargo fmt --all` as the first post-change step, and any CI gate following
+that contract will fail. Resolution is one `cargo fmt --all && git commit -am`.
+
+After F25 is landed:
+
+- **Findings 26 / 27 (Low)** are documentation / defence-in-depth and can ship
+  in a follow-up. F26 hardens validation against operators reintroducing the
+  F20 problem; F27 surfaces the observability knobs in the base env config.
+  Neither affects runtime behaviour with current configs.
+
+Once F25 is fixed and pushed, this PR is ready to merge. Suggested follow-up
+order: F25 (this commit) → F26 → F27.
