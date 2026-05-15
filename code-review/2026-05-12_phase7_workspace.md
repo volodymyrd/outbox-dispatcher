@@ -1424,3 +1424,414 @@ The four new findings are non-blocking:
 
 If the maintainer prefers to land all 19 findings before merge, the suggested order
 is F16 → F19 → F17 → F18 (F18 is the largest behavioural change).
+
+---
+
+## Fifth-pass review (2026-05-14T14:23:10Z)
+
+Findings 1–19 verified as DONE on a fresh re-read of the resulting code on `phase7`
+(HEAD `61c1d40`). The full workspace still builds cleanly:
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+  pass with no warnings.
+- `cargo test --workspace` — **334 tests green** (278 core + 23 admin +
+  20 http-callback + 9 scheduler-integration + 4 dispatch-integration).
+
+Five new findings emerged on this pass — one Medium and four Low. None are
+regressions of the previous fixes; all are observability / DB-load concerns that
+are now visible *because* the metrics/sampler wiring is in place.
+
+### Finding 20 — Stats sampler issues 3–4 heavy aggregate queries every `poll_interval`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:507-566`, `crates/core/src/repo.rs:787-902` |
+| **Severity** | Medium |
+| **Category** | Performance |
+
+**Problem**
+
+`run_stats_sampler` calls `repo.fetch_stats()` and `repo.sample_external_pending_ages(1000)`
+every `interval` (which is `config.dispatch.poll_interval` — **5 seconds by default**).
+`fetch_stats` issues three SQL statements, each of which sequential-scans (or
+index-scans without a covering predicate) the entire `outbox_deliveries` table:
+
+1. `SELECT COUNT(*) FROM outbox_events`
+2. Global `COUNT(*) FILTER (...)` aggregation with four conditional aggregates and a
+   `MIN(available_at) FILTER (...)` on `outbox_deliveries`.
+3. Per-callback `COUNT(*) FILTER (...) GROUP BY callback_name` on `outbox_deliveries`.
+
+Then `sample_external_pending_ages` runs a fourth statement scanning external rows
+ordered by `dispatched_at`. For a deployment with a 10 M-row deliveries table, each
+of those `COUNT FILTER` aggregations is O(N) and can take hundreds of milliseconds —
+yet they run **12× per minute, 24/7**, regardless of whether anything changed. The
+practical effect is sustained DB CPU pressure that scales with table size, not with
+event arrival rate.
+
+The stats sampler's purpose is to populate Prometheus gauges that are scraped
+typically every 15–60 s; sampling more aggressively than the scrape interval yields
+no operator benefit and only adds load.
+
+**Context** (`crates/bin/src/main.rs:502-512`)
+
+```rust
+async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: CancellationToken) {
+    let mut last_callbacks: HashSet<String> = HashSet::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        match repo.fetch_stats().await {
+            // …
+```
+
+**Recommended fix**
+
+Decouple the stats sampler cadence from `poll_interval`. Either:
+
+- Add a dedicated `observability.stats_sample_interval_secs` config knob, defaulting
+  to 30 s or 60 s (matching typical Prometheus scrape cadence). Pass that into
+  `run_stats_sampler` instead of `poll_interval`.
+- Or sample lazily on the `/metrics` scrape itself by integrating a recorder that
+  invokes a callback at scrape time (the `metrics-exporter-prometheus` crate supports
+  this via `set_describe`/`pre_render` hooks). That eliminates the polling loop and
+  guarantees sample frequency tracks scrape frequency exactly.
+
+A minimal patch:
+
+```rust
+// crates/core/src/config.rs (ObservabilityConfig)
+#[serde(default = "default_stats_sample_interval_secs")]
+pub stats_sample_interval_secs: u64,
+
+fn default_stats_sample_interval_secs() -> u64 { 30 }
+
+// crates/bin/src/main.rs (None command branch)
+let stats_interval = Duration::from_secs(config.observability.stats_sample_interval_secs);
+workers.spawn(async move { run_stats_sampler(stats_repo, stats_interval, stats_shutdown).await });
+```
+
+**Why this fix**
+
+Polling every 5 s is hostile to large outboxes; aligning sample cadence to scrape
+cadence (~30 s) cuts DB load by 6× with no observable change in dashboard fidelity.
+
+---
+
+### Finding 21 — Histogram bucket boundaries are exporter defaults; `outbox_external_pending_seconds` is unreadable above ~10 s
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:476-491`, `crates/core/src/metrics.rs:141-147` |
+| **Severity** | Low |
+| **Category** | Observability |
+
+**Problem**
+
+`PrometheusBuilder::new().with_http_listener(addr).install()` is the entire metrics
+exporter configuration — no `set_buckets_for_metric` or `set_buckets` is called. The
+`metrics_exporter_prometheus` crate's default bucket boundaries cover roughly
+`[0.005 s, 10 s]` (the same defaults Prometheus client libraries traditionally use
+for "request latency"). Three of the four histograms in `metrics.rs` fit that range:
+
+- `outbox_dispatch_duration_seconds` — typically 50 ms – 30 s ✓ default OK
+- `outbox_cycle_duration_seconds` — typically 1 ms – 1 s ✓ default OK
+- `outbox_retention_cycle_duration_seconds` — typically 10 ms – 10 s ✓ default OK
+
+But `outbox_external_pending_seconds` records the **age** of external-mode
+deliveries awaiting confirmation, which the TDD describes as ranging from seconds
+to multiple days (§8.4 — `external_completion_timeout` may be `7 * 86_400`). With
+the default buckets, every observation above 10 s falls in the `+Inf` overflow
+bucket, so `histogram_quantile(0.5, …)` returns either ≤10 s or `+Inf`. The
+histogram is functionally unusable for the metric's intended purpose.
+
+**Recommended fix**
+
+Configure dedicated buckets per histogram at exporter installation time:
+
+```rust
+fn init_metrics(obs: &ObservabilityConfig) -> Result<()> {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    let addr: std::net::SocketAddr = obs
+        .metrics_bind
+        .parse()
+        .context("parsing observability.metrics_bind")?;
+
+    PrometheusBuilder::new()
+        .with_http_listener(addr)
+        // dispatch + cycle + retention duration: ms .. tens of seconds
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Suffix("_duration_seconds".to_string()),
+            &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+        )?
+        // external-pending age: seconds .. 7 days
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                outbox_dispatcher_core::metrics::EXTERNAL_PENDING_SECONDS.to_string(),
+            ),
+            &[5.0, 30.0, 60.0, 300.0, 900.0, 3600.0, 21_600.0, 86_400.0, 259_200.0, 604_800.0],
+        )?
+        .install()
+        .context("installing Prometheus metrics exporter")?;
+
+    info!(bind = %addr, "Prometheus metrics endpoint listening");
+    Ok(())
+}
+```
+
+**Why this fix**
+
+`metric_label()` and `set_lag_seconds` already advertise a contract via the metric
+registry; without bucket configuration, the `outbox_external_pending_seconds`
+histogram's `_bucket{le=…}` series can never report anything above 10 s, which is
+the entire interesting range of the metric. Cheap, one-time configuration; large
+visibility improvement.
+
+---
+
+### Finding 22 — `outbox_lag_seconds` measures next-retry lag, not event age
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/repo.rs:810-816`, `crates/bin/src/main.rs:518` |
+| **Severity** | Low |
+| **Category** | Correctness |
+
+**Problem**
+
+The stats sampler publishes `outbox_lag_seconds` from `Stats.oldest_pending_age_seconds`,
+which the SQL computes as `now() - MIN(available_at) FILTER (... pending ...)`. The
+`available_at` column is **updated on every retry** to encode the next-retry deadline,
+so a delivery that has been retried N times appears `backoff_secs[N]` younger than
+its actual age. A 12-hour-old event whose next retry is scheduled for 30 s from now
+contributes `0` (or even negative — clamped to `0`) to the gauge, not `43 200`.
+
+Operators alerting on `outbox_lag_seconds > 600` ("nothing has been pending more
+than 10 minutes") will silently miss a queue with many old-but-currently-backed-off
+rows.
+
+**Context** (`crates/core/src/repo.rs:810-816`)
+
+```sql
+EXTRACT(EPOCH FROM (
+    now() - MIN(available_at) FILTER (
+        WHERE dispatched_at IS NULL
+          AND processed_at  IS NULL
+          AND dead_letter   = FALSE
+    )
+))::float8 AS oldest_pending_age_seconds
+```
+
+**Recommended fix**
+
+Two options depending on intended semantics:
+
+- **Event age (recommended)** — `MIN(e.created_at)` joined from `outbox_events`, so
+  the gauge reports "how long has the oldest still-pending event been waiting":
+  ```sql
+  EXTRACT(EPOCH FROM (
+      now() - MIN(e.created_at) FILTER (
+          WHERE d.dispatched_at IS NULL
+            AND d.processed_at  IS NULL
+            AND d.dead_letter   = FALSE
+      )
+  ))::float8 AS oldest_pending_age_seconds
+  FROM outbox_deliveries d
+  JOIN outbox_events e ON e.event_id = d.event_id
+  ```
+- **Two distinct gauges** — keep `outbox_lag_seconds` as "next-retry lag" and
+  add `outbox_oldest_pending_event_age_seconds` for event age. More work, but
+  preserves the existing meaning for any dashboards already built on it.
+
+**Why this fix**
+
+`outbox_lag_seconds` is the canonical lag SLO metric; consensus interpretation is
+"how old is the oldest unprocessed thing". Reporting `now() - available_at` instead
+of `now() - created_at` is a documented Prometheus anti-pattern (a delivery in
+1-day backoff doesn't make the queue "fresh"). Spec §12.1 lists `outbox_lag_seconds`
+without elaboration, so either fix is spec-compliant; the event-age interpretation
+matches the metric's name and operator expectations.
+
+---
+
+### Finding 23 — Retention worker first cycle delayed by `[interval, 2 × interval)`, not `[0, interval)`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/core/src/retention.rs:71-95` |
+| **Severity** | Low |
+| **Category** | Concurrency / UX |
+
+**Problem**
+
+Finding 8's fix added a startup jitter to prevent multi-replica thundering, but
+the jitter is *added to* the regular interval sleep rather than replacing the first
+one:
+
+```rust
+// startup jitter
+if config.cleanup_interval_secs > 0 {
+    let jitter_secs = rand::rng().random_range(0..config.cleanup_interval_secs);
+    tokio::time::sleep(Duration::from_secs(jitter_secs)).await;   // 0 .. interval-1
+}
+
+loop {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => { … }
+        _ = tokio::time::sleep(interval) => {}                    // another full interval
+    }
+    // … run cycle …
+}
+```
+
+Total wait before the first deletion runs: `jitter + interval`, i.e.
+`[interval, 2 × interval)`. At the default `cleanup_interval_secs = 3600`, the first
+cycle fires 1–2 hours after startup. Operators redeploying a service that's been
+accumulating dead-lettered events will be surprised that retention "does nothing"
+for an hour.
+
+The thundering-herd protection wants spreads over `[0, interval)`, not
+`[interval, 2 × interval)`.
+
+**Recommended fix**
+
+Apply jitter as the *first* sleep, then loop with the regular interval:
+
+```rust
+let mut next_sleep = if config.cleanup_interval_secs > 0 {
+    use rand::RngExt;
+    Duration::from_secs(rand::rng().random_range(0..config.cleanup_interval_secs))
+} else {
+    Duration::ZERO
+};
+
+loop {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => { …; return; }
+        _ = tokio::time::sleep(next_sleep) => {}
+    }
+
+    // … run cycle …
+
+    next_sleep = interval;
+}
+```
+
+**Why this fix**
+
+`[0, interval)` is the canonical jitter pattern: replicas spread out over one full
+interval and the first cycle runs promptly after startup. The current
+`[interval, 2 × interval)` shape both delays the first deletion and shifts the
+spread window without buying anything.
+
+---
+
+### Finding 24 — Ctrl-C handler task is orphaned from the JoinSet
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:221-228` |
+| **Severity** | Low |
+| **Category** | Idiom |
+
+**Problem**
+
+Finding 16 collected the admin server, retention worker, and stats sampler into a
+`JoinSet` that is awaited before `tracer_provider.shutdown()`. The earlier-spawned
+signal-handler task is **not** in the set:
+
+```rust
+let shutdown_clone = shutdown.clone();
+tokio::spawn(async move {
+    if let Ok(()) = tokio::signal::ctrl_c().await {
+        info!("received SIGINT/SIGTERM, requesting shutdown");
+        shutdown_clone.cancel();
+    }
+});
+```
+
+After the scheduler exits cleanly (e.g. because the admin server bound failed and
+called `admin_shutdown_trigger.cancel()`, or because some future code path triggers
+shutdown), this task is still parked on `ctrl_c()`. When `run()` returns and
+`#[tokio::main]` drops the runtime, the task is aborted. Functionally harmless —
+the task has nothing to drain — but it's the one outstanding background spawn that
+violates the "wait for everything before exit" contract Finding 16 established.
+
+**Recommended fix**
+
+Use a `select!` against the cancellation token so the task exits naturally on any
+shutdown path, and collect its handle into the same JoinSet:
+
+```rust
+{
+    let shutdown_clone = shutdown.clone();
+    workers.spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT/SIGTERM, requesting shutdown");
+                shutdown_clone.cancel();
+            }
+            _ = shutdown_clone.cancelled() => {
+                // some other path triggered shutdown — exit cleanly
+            }
+        }
+    });
+}
+```
+
+**Why this fix**
+
+Tiny, but it removes the last "spawn-and-forget" in the main flow and makes the
+shutdown contract uniform across all background tasks. Especially relevant once a
+SIGTERM handler is added (today only SIGINT/Ctrl-C is wired).
+
+---
+
+## Updated summary
+
+| # | Title | File:Line | Severity | Category | Status | Notes |
+|---|-------|-----------|----------|----------|--------|-------|
+| 20 | Stats sampler runs 3–4 heavy queries every `poll_interval` | `crates/bin/src/main.rs:507-566` + `crates/core/src/repo.rs:787-902` | Medium | Performance | TODO | Add `observability.stats_sample_interval_secs` (default 30 s) or sample-on-scrape; current 5 s cadence is hostile to large outboxes |
+| 21 | Histogram bucket boundaries not configured | `crates/bin/src/main.rs:476-491` | Low | Observability | TODO | `outbox_external_pending_seconds` unreadable above ~10 s; configure via `set_buckets_for_metric` |
+| 22 | `outbox_lag_seconds` measures next-retry lag, not event age | `crates/core/src/repo.rs:810-816` | Low | Correctness | TODO | Join `outbox_events` and use `MIN(e.created_at)`; current `MIN(available_at)` hides backed-off rows |
+| 23 | Retention first cycle delayed by interval + jitter | `crates/core/src/retention.rs:71-95` | Low | Concurrency / UX | TODO | Jitter should replace, not precede, the first interval sleep — spread `[0, interval)` not `[interval, 2 × interval)` |
+| 24 | Ctrl-C handler task is orphaned from the JoinSet | `crates/bin/src/main.rs:221-228` | Low | Idiom | TODO | Move into the `workers` JoinSet to make shutdown uniform across all spawned tasks |
+
+> **Instructions for the implementing LLM:** same conventions — `TODO` → `DONE` on
+> resolution, `SKIPPED` with a reason if intentionally not applied. Do not delete rows.
+
+---
+
+## PR state (fifth pass — 2026-05-14)
+
+**Status: READY TO MERGE (with follow-ups recommended)**
+
+Findings 1–19 are fully addressed and verified; the workspace builds and tests
+cleanly on `phase7` (HEAD `61c1d40`):
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+  pass with no warnings.
+- `cargo test --workspace` — 278 core + 23 admin + 20 http-callback + 9 + 4
+  integration = **334 tests green**.
+
+The five new findings are **non-blocking**:
+
+- **Finding 20 (Medium)** — stats sampler DB load. Only material on large
+  deployments; default configuration is still functional, just chatty against the
+  database. Worth fixing before scaling beyond a few hundred thousand deliveries,
+  but not a merge gate for the phase-7 milestone.
+- **Findings 21 / 22 / 23 / 24 (Low)** — histogram buckets, lag semantics,
+  retention startup delay, signal-handler orphaning. All observability /
+  ergonomics polish; none affect correctness of dispatch, retention, admin, or
+  shutdown paths.
+
+If the maintainer prefers to land all 24 findings before merge, suggested order is
+F22 → F20 → F21 → F23 → F24 (F22 changes a metric's semantic; do it first so any
+follow-up alert tuning is built on the final shape).
