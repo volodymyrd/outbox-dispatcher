@@ -2091,3 +2091,296 @@ After F25 is landed:
 
 Once F25 is fixed and pushed, this PR is ready to merge. Suggested follow-up
 order: F25 (this commit) → F26 → F27.
+
+---
+
+## Seventh-pass review (2026-05-15T16:01:15Z)
+
+Findings 1–27 verified as DONE on a fresh re-read of `phase7` (HEAD `7b80774`,
+PR #6). The sixth-pass items are all resolved with working implementations:
+
+- **F25** — `cargo fmt --all -- --check` passes cleanly across the workspace.
+- **F26** — `MIN_STATS_SAMPLE_INTERVAL_SECS = 10` (`config.rs:412`) enforces a
+  10 s floor on `stats_sample_interval_secs` (`config.rs:623-628`); three new
+  tests cover `0`, `5` (below-min), and `10` (at-min)
+  (`config.rs:1706-1734`).
+- **F27** — `envs/app_config.toml` now contains a documented `[observability]`
+  block with `metrics_bind`, `otel_endpoint`, and `stats_sample_interval_secs`
+  (lines 49-57); a default-roundtrip test covers it (`config.rs:1736-1742`).
+
+Build/test status on `phase7` HEAD `7b80774`:
+
+- `cargo fmt --all -- --check` — clean
+- `cargo check --workspace` — clean
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo sort --workspace --check` — clean
+- `cargo test --workspace` — **337 tests green** (281 core + 23 admin +
+  20 http-callback + 9 + 4 integration)
+
+Two new findings emerged on this pass — one Medium, one Low. Both are
+graceful-shutdown / first-sample UX issues that are visible *because* the
+F16/F20/F23/F26 wiring is now in place, but neither blocks the phase-7
+milestone.
+
+### Finding 28 — Worker JoinSet skipped on scheduler-error exit path
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:305-325` |
+| **Severity** | Medium |
+| **Category** | Concurrency / Correctness |
+
+**Problem**
+
+Finding 16 collected the admin server, retention worker, stats sampler, and
+signal-handler tasks into a `JoinSet` that is drained after the scheduler
+exits and *before* `tracer_provider.shutdown()`. The drain loop only runs
+when `run_scheduler_with_cycle_tracker` returns `Ok(())`. If the scheduler
+returns `Err(...)` — for example, when `listener.listen()` fails on a
+transient DB error during startup, or any future code path inside the
+scheduler bubbles up an unexpected error — the `?` propagates the error
+out of `run()` before `workers.join_next().await` runs. The `JoinSet` is
+then dropped, and its `Drop` impl calls `abort_all()` — every background
+task is aborted abruptly rather than draining via its cancellation token.
+
+Concrete consequences:
+
+1. The admin server's `with_graceful_shutdown` future never fires (the task
+   is *dropped*, not *cancelled*) — any open connection at that instant is
+   reset, not closed cleanly.
+2. The retention worker, if mid-`delete_terminal_events`, has its future
+   aborted, losing the `"retention cycle completed"` log line for the
+   in-flight batch.
+3. The OTel tracer never gets `provider.shutdown()` called on this path
+   (the `if let Some(provider) = tracer_provider` block is after the `?`),
+   so any spans buffered by the batch exporter — including the spans for
+   the very error that caused the exit — are lost.
+4. The cancellation token established earlier (`let shutdown =
+   CancellationToken::new();`) was moved into the scheduler, so even if we
+   wanted to gracefully cancel from the error path, there is no remaining
+   handle.
+
+This violates the contract Finding 16 established — `"info!(\"outbox-
+dispatcher stopped cleanly\")"` no longer fires on the error path, and the
+intent of "drain workers, then flush tracer, then exit" is silently
+inverted to "abort workers, drop tracer, exit".
+
+**Context** (`crates/bin/src/main.rs:305-325`)
+
+```rust
+info!("starting scheduler");
+run_scheduler_with_cycle_tracker(
+    repo,
+    callback,
+    dispatch_config,
+    listener,
+    listener_status,
+    shutdown,                              // ← moved in by value
+    Some(last_cycle_at),
+)
+.await
+.context("scheduler exited with error")?;  // ← Err here skips the drain below
+
+// Wait for the admin server, retention worker, and stats sampler to drain
+// before flushing the tracer. This ensures spans emitted during the workers'
+// final drain step are queued before the batch exporter is shut down.
+while let Some(res) = workers.join_next().await {
+    if let Err(e) = res {
+        warn!(error = ?e, "background worker exited abnormally during shutdown");
+    }
+}
+
+// Flush any buffered spans before the process exits.
+if let Some(provider) = tracer_provider
+    && let Err(e) = provider.shutdown()
+{
+    warn!(error = ?e, "OpenTelemetry tracer shutdown failed");
+}
+```
+
+**Recommended fix**
+
+Keep a `shutdown` clone in the main flow, then run the drain unconditionally
+via a single `?`-free sequence. Easiest with a small helper closure or by
+inlining the drain in both branches of a match:
+
+```rust
+// Clone the token before moving the original into the scheduler so the
+// error path can still signal shutdown to the workers.
+let shutdown_main = shutdown.clone();
+
+let scheduler_result = run_scheduler_with_cycle_tracker(
+    repo,
+    callback,
+    dispatch_config,
+    listener,
+    listener_status,
+    shutdown,
+    Some(last_cycle_at),
+)
+.await;
+
+// Always cancel and drain the workers, regardless of how the scheduler
+// exited. On the Ok path the token is already cancelled (the scheduler
+// only returns Ok when it sees the cancellation); on the Err path we
+// cancel here so the workers can break out of their loops cleanly.
+shutdown_main.cancel();
+while let Some(res) = workers.join_next().await {
+    if let Err(e) = res {
+        warn!(error = ?e, "background worker exited abnormally during shutdown");
+    }
+}
+
+// Always flush the tracer, even on error — the buffered spans for the
+// failure path are exactly what an operator wants to inspect.
+if let Some(provider) = tracer_provider
+    && let Err(e) = provider.shutdown()
+{
+    warn!(error = ?e, "OpenTelemetry tracer shutdown failed");
+}
+
+// Now propagate the scheduler's error (if any).
+scheduler_result.context("scheduler exited with error")?;
+
+info!("outbox-dispatcher stopped cleanly");
+```
+
+**Why this fix**
+
+The F16 contract — "spawn-and-drain, then flush tracer" — should not depend
+on the scheduler's success. The error path is precisely where the trailing
+spans and the admin-server final responses matter most for debugging.
+Moving the drain + flush above the `?` makes the contract unconditional.
+
+---
+
+### Finding 29 — Stats sampler first tick delayed by full `stats_sample_interval_secs`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:535-545` |
+| **Severity** | Low |
+| **Category** | Observability / UX |
+
+**Problem**
+
+`run_stats_sampler` enters its loop, then immediately `select!`s between
+`shutdown.cancelled()` and `tokio::time::sleep(interval)` — i.e. it sleeps
+for the full `stats_sample_interval_secs` before the first `fetch_stats`
+call. With F20's default of `30`, no queue-state gauges
+(`outbox_lag_seconds`, `outbox_pending_deliveries{...}`,
+`outbox_external_pending_deliveries{...}`,
+`outbox_external_pending_seconds`) are published for the first 30 s after
+process start.
+
+Operators redeploying with a Grafana dashboard up will see "No data" for
+those panels for half a minute and may misread that as the dispatcher
+having failed to start. This is the same first-tick-delay pattern F23
+fixed for the retention worker — there it caused the first deletion cycle
+to be delayed by a full hour at default config.
+
+**Context** (`crates/bin/src/main.rs:535-545`)
+
+```rust
+async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: CancellationToken) {
+    let mut last_callbacks: HashSet<String> = HashSet::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+
+        match repo.fetch_stats().await {
+            // ...
+```
+
+**Recommended fix**
+
+Mirror F23's pattern: track a `next_sleep` outside the loop, initialise it
+to a small initial delay (or zero) so the first sample fires immediately,
+and reset to `interval` after each cycle:
+
+```rust
+async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: CancellationToken) {
+    let mut last_callbacks: HashSet<String> = HashSet::new();
+    // Run the first sample immediately so Prometheus has data on the very
+    // first scrape after process start; subsequent cycles sleep `interval`.
+    let mut next_sleep = Duration::ZERO;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(next_sleep) => {}
+        }
+        next_sleep = interval;
+
+        // ... fetch_stats + sample_external_pending_ages as today ...
+    }
+}
+```
+
+If multi-replica thundering on `fetch_stats` (read-only but still
+N replicas × 4 aggregate queries per tick) is a concern, replace
+`Duration::ZERO` with a `[0, interval)` jitter exactly as F23 does for the
+retention worker.
+
+**Why this fix**
+
+`fetch_stats` is read-only and indexed (the partial index
+`idx_outbox_deliveries_external_pending` covers
+`sample_external_pending_ages`); the first call at process start is cheap
+and the user-visible win — gauges populated on the first scrape after
+restart — is large. The pattern is already established by F23.
+
+---
+
+## Updated summary
+
+| # | Title | File:Line | Severity | Category | Status | Notes |
+|---|-------|-----------|----------|----------|--------|-------|
+| 28 | Worker JoinSet skipped on scheduler-error exit path | `crates/bin/src/main.rs:305-325` | Medium | Concurrency | TODO | Move worker-drain + tracer-flush above the `scheduler_result?` propagation and cancel `shutdown` unconditionally on both Ok and Err paths |
+| 29 | Stats sampler first tick delayed by full `stats_sample_interval_secs` | `crates/bin/src/main.rs:535-545` | Low | Observability | TODO | Mirror F23: introduce `next_sleep` initialised to `Duration::ZERO` (or a `[0, interval)` jitter), reset to `interval` after the first cycle |
+
+> **Instructions for the implementing LLM:** same conventions — `TODO` → `DONE`
+> on resolution, `SKIPPED` with a reason if intentionally not applied. Do not
+> delete rows.
+
+---
+
+## PR state (seventh pass — 2026-05-15)
+
+**Status: READY TO MERGE (with follow-ups recommended).**
+
+All twenty-seven prior findings are addressed and verified on `phase7`
+HEAD `7b80774`. The full workspace is clean against every mandatory check
+in CLAUDE.md:
+
+- `cargo fmt --all -- --check` — clean
+- `cargo check --workspace` — clean
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean
+- `cargo sort --workspace --check` — clean
+- `cargo test --workspace` — **337 tests green** (281 core + 23 admin +
+  20 http-callback + 9 + 4 integration)
+
+The two new findings are **non-blocking**:
+
+- **Finding 28 (Medium)** — graceful-shutdown completeness on the scheduler
+  error path. The Ok path drains workers correctly (F16); the Err path
+  drops the JoinSet and aborts in-flight workers. Functionally only
+  visible during startup-error scenarios, but a regression of the F16
+  contract that's worth fixing before the next release tag.
+- **Finding 29 (Low)** — first-sample delay for queue-state gauges. After
+  a restart, the first `stats_sample_interval_secs` window (30 s default)
+  shows "no data" on dashboards. Easily fixed in the same pattern F23
+  established for the retention worker.
+
+Neither finding affects correctness of dispatch, retention, admin, or the
+happy-path shutdown sequence. Phase 7 deliverables (Prometheus metrics,
+structured logging, OpenTelemetry, retention worker) are all implemented,
+tested, and operating to spec.
+
+Suggested follow-up order: F28 → F29 (F28 is the more impactful fix; F29
+is a small UX improvement piggybacking on F23's existing pattern).
