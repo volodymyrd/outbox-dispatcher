@@ -1,6 +1,6 @@
 # Code Review — Phase 8 (PR #7)
 
-**Date:** 2026-05-15T17:07:47Z
+**Date:** 2026-05-15T17:07:47Z (initial), 2026-05-15T20:45:36Z (follow-up: findings 9–10)
 **Branch:** phase8
 **Reviewed by:** Claude (review command)
 **Scope:** PR #7 — Dockerfile, GitHub Actions CI/CD, example configs, deployment/ops/protocol docs
@@ -447,6 +447,411 @@ A baseline image-level healthcheck means `docker ps` / orchestrator-agnostic dep
 
 ---
 
+### Finding 9 — Operations runbook lists Prometheus metrics that do not exist in the code
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docs/operations.md:138-153`, `docs/operations.md:160`, `docs/operations.md:247` |
+| **Severity** | High |
+| **Category** | Documentation |
+
+**Problem**
+
+The "Key metrics" table in `docs/operations.md` (and the alerting/retention sections that reference it) names many metrics that **don't exist** in the actual exporter (`crates/core/src/metrics.rs`). Dashboards, alerts, and queries built from this guide will silently return empty series. The drift includes both wrong metric names and wrong / missing labels:
+
+| Doc says (operations.md) | Actual (metrics.rs) |
+|---|---|
+| `outbox_dispatched_total{callback,mode}` | Does not exist. Use `outbox_deliveries_total{callback,mode,result="ok"}` |
+| `outbox_dispatch_failures_total{callback,reason}` | Does not exist. Use `outbox_deliveries_total{result="transient"\|"timeout"\|"invalid"\|"external_reset"}` |
+| `outbox_dead_lettered_total{callback,reason}` | `outbox_dead_letters_total{callback}` (no `reason` label) |
+| `outbox_dispatch_duration_seconds{callback}` | `outbox_dispatch_duration_seconds{callback,mode}` (missing `mode` in doc) |
+| `outbox_lag_seconds{callback}` | `outbox_lag_seconds` (no labels) |
+| `outbox_pending_deliveries{callback}` | `outbox_pending_deliveries{callback,mode}` (missing `mode` in doc) |
+| `outbox_signing_key_resolution_failures_total{key_id,callback}` | `…{signing_key_id,callback}` (label name is `signing_key_id`, not `key_id`) |
+| `outbox_scheduler_cycles_total` | Does not exist. Closest signals: `outbox_cycle_duration_seconds` (histogram → `_count` is the counter) and `outbox_listener_connection_status` (gauge, 1/0) |
+| `outbox_retention_deleted_total{reason}` (also referenced in §Retention) | `outbox_retention_deletions_total{reason}` |
+| `outbox_oldest_terminal_event_age_seconds` (§Retention) | `outbox_retention_oldest_event_age_seconds` |
+
+The alerting recommendation `No outbox_scheduler_cycles_total increase for 2× poll_interval` is therefore unimplementable as written.
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/core/src/metrics.rs lines 34-53 — authoritative metric names
+pub const EVENTS_TOTAL: &str = "outbox_events_total";
+pub const DELIVERIES_TOTAL: &str = "outbox_deliveries_total";
+pub const DISPATCH_DURATION_SECONDS: &str = "outbox_dispatch_duration_seconds";
+pub const LAG_SECONDS: &str = "outbox_lag_seconds";
+pub const PENDING_DELIVERIES: &str = "outbox_pending_deliveries";
+pub const EXTERNAL_PENDING_DELIVERIES: &str = "outbox_external_pending_deliveries";
+pub const EXTERNAL_PENDING_SECONDS: &str = "outbox_external_pending_seconds";
+pub const DEAD_LETTERS_TOTAL: &str = "outbox_dead_letters_total";
+pub const EXTERNAL_TIMEOUT_RESETS_TOTAL: &str = "outbox_external_timeout_resets_total";
+pub const COMPLETION_CYCLES_EXHAUSTED_TOTAL: &str = "outbox_completion_cycles_exhausted_total";
+pub const SIGNING_KEY_RESOLUTION_FAILURES_TOTAL: &str =
+    "outbox_signing_key_resolution_failures_total";
+pub const INVALID_CALLBACKS_TOTAL: &str = "outbox_invalid_callbacks_total";
+pub const PAYLOAD_SIZE_REJECTIONS_TOTAL: &str = "outbox_payload_size_rejections_total";
+pub const RETENTION_DELETIONS_TOTAL: &str = "outbox_retention_deletions_total";
+pub const RETENTION_CYCLE_DURATION_SECONDS: &str = "outbox_retention_cycle_duration_seconds";
+pub const RETENTION_OLDEST_EVENT_AGE_SECONDS: &str = "outbox_retention_oldest_event_age_seconds";
+pub const CORRUPTED_ROWS_TOTAL: &str = "outbox_corrupted_rows_total";
+pub const CYCLE_DURATION_SECONDS: &str = "outbox_cycle_duration_seconds";
+pub const LISTENER_CONNECTION_STATUS: &str = "outbox_listener_connection_status";
+```
+
+**Recommended fix**
+
+Rewrite the §Key metrics table in `docs/operations.md` to mirror the constants and labels declared in `crates/core/src/metrics.rs`. A correct replacement is:
+
+```markdown
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `outbox_events_total` | Counter | `kind` | Events observed by the scheduler |
+| `outbox_deliveries_total` | Counter | `callback`, `mode`, `result` | All delivery outcomes (`result` ∈ `ok`/`transient`/`timeout`/`invalid`/`external_reset`) |
+| `outbox_dispatch_duration_seconds` | Histogram | `callback`, `mode` | HTTP round-trip duration |
+| `outbox_lag_seconds` | Gauge | — | Age of the oldest pending delivery |
+| `outbox_pending_deliveries` | Gauge | `callback`, `mode` | Current pending delivery count |
+| `outbox_external_pending_deliveries` | Gauge | `callback` | External deliveries awaiting completion |
+| `outbox_external_pending_seconds` | Histogram | `callback` | Age distribution of external-pending rows |
+| `outbox_dead_letters_total` | Counter | `callback` | Deliveries reaching dead-letter state |
+| `outbox_external_timeout_resets_total` | Counter | `callback` | External completions that timed out and were reset |
+| `outbox_completion_cycles_exhausted_total` | Counter | `callback` | External deliveries dead-lettered after max cycles |
+| `outbox_signing_key_resolution_failures_total` | Counter | `signing_key_id`, `callback` | Unknown signing key at dispatch time |
+| `outbox_invalid_callbacks_total` | Counter | `reason` | Schedule-time invalid callbacks |
+| `outbox_payload_size_rejections_total` | Counter | `kind` | Events rejected for exceeding `payload_size_limit_bytes` |
+| `outbox_retention_deletions_total` | Counter | `reason` | Rows deleted by the retention worker (`reason` ∈ `processed`/`dead_letter`) |
+| `outbox_retention_cycle_duration_seconds` | Histogram | — | Retention worker cycle duration |
+| `outbox_retention_oldest_event_age_seconds` | Gauge | — | Age of oldest terminal event still on disk (NaN when none) |
+| `outbox_corrupted_rows_total` | Counter | `stage` | Poison-pill rows skipped (`stage` ∈ `schedule`/`dispatch`/`sweep`/`retention`) |
+| `outbox_cycle_duration_seconds` | Histogram | — | Scheduler loop duration (use `_count` as a liveness counter) |
+| `outbox_listener_connection_status` | Gauge | — | LISTEN connection up (1) or down (0) |
+```
+
+And in the alerting list, replace the scheduler-cycle alert with one based on the listener gauge:
+
+```markdown
+| Listener down | `outbox_listener_connection_status == 0 for 2m` | Critical |
+| Scheduler stalled | `rate(outbox_cycle_duration_seconds_count[2 * poll_interval]) == 0` | Critical |
+```
+
+And in §Retention:
+
+```markdown
+Monitor via `outbox_retention_deletions_total{reason}` and `outbox_retention_oldest_event_age_seconds`.
+```
+
+**Why this fix**
+
+Every alert and dashboard built from a runbook needs the metric names to match the exporter byte-for-byte. The current drift turns the entire alerting section into silently-failing config — worse than having no alerts at all, because it implies coverage that does not exist.
+
+---
+
+### Finding 10 — `README.md` is a two-line stub with no project overview
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `README.md:1-3` |
+| **Severity** | High |
+| **Category** | Documentation |
+
+**Problem**
+
+The repository root `README.md` currently contains only:
+
+```markdown
+# outbox-dispatcher
+Outbox Dispatcher
+```
+
+This is the first page anyone (users, contributors, GHCR consumers, CI scanners, anyone landing from a search result) sees. For an open-source project shipping in Phase 8 with a Docker image, a release workflow, deployment/operations/protocol guides, and a Cloud Run story, the README needs to actually introduce the service, show how to run it, and link out to the deeper docs. The TDD (`../outbox/TDDs/04-outbox-dispatcher-tdd.md`) already contains every fact required — none of this needs to be invented, just summarised.
+
+**Context** (surrounding code as it exists today)
+
+```markdown
+<!-- README.md — entire current contents -->
+# outbox-dispatcher
+Outbox Dispatcher
+```
+
+**Recommended fix**
+
+Replace `README.md` with a structured, open-source-idiomatic README. Distill from the TDD and the existing `docs/deployment.md` / `docs/operations.md` / `docs/webhook-protocol.md`. Suggested skeleton (adapt content; do not invent claims that the code does not back):
+
+```markdown
+# outbox-dispatcher
+
+[![CI](https://github.com/volodymyrd/outbox-dispatcher/actions/workflows/ci.yml/badge.svg)](https://github.com/volodymyrd/outbox-dispatcher/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/volodymyrd/outbox-dispatcher)](https://github.com/volodymyrd/outbox-dispatcher/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+<!-- Add badges only for things that actually exist. Drop the License badge until LICENSE is added. -->
+
+A standalone Rust microservice that turns a Postgres outbox table into a reliable,
+at-least-once HTTP webhook delivery service.
+
+`outbox-dispatcher` watches `outbox_events` via `LISTEN/NOTIFY`, schedules one
+`outbox_deliveries` row per callback, signs each request with HMAC-SHA256, and
+delivers it with bounded retries and jittered exponential backoff. Multiple
+replicas can run safely against the same database — row-level `locked_until`
+prevents duplicate dispatch.
+
+## Why
+
+Implementing the transactional outbox pattern correctly is fiddly: you need a
+durable cursor, idempotent retries, signed webhooks, dead-letter handling,
+SSRF guards, and observability. `outbox-dispatcher` packages all of that as a
+single binary so publishing services only need to `INSERT` into one table.
+
+## Features
+
+- **Reliable delivery** — at-least-once webhooks with bounded retries and
+  ±25 % jittered exponential backoff.
+- **Multi-replica safe** — row-level `locked_until` and `FOR UPDATE SKIP LOCKED`
+  prevent duplicate dispatch across replicas.
+- **Two completion modes** — `managed` (dispatcher marks the row done on 2xx)
+  and `external` (receiver writes `processed_at` asynchronously).
+- **HMAC-SHA256 signing** — keys rotated via config + env-var indirection;
+  resolved at dispatch time, not schedule time, so deploys can be skewed.
+- **SSRF guard** — denylist of private CIDRs; opt-out for trusted internal
+  networks via `allow_private_ip_targets`.
+- **Admin HTTP API** — bearer-token-protected endpoints for stats,
+  dead-letter inspection, retry / complete / abandon, and event detail.
+- **Prometheus metrics + OpenTelemetry traces** — first-class observability
+  out of the box.
+- **Retention worker** — optional auto-pruning of terminal events.
+
+## Architecture at a glance
+
+```
+┌──────────────┐   INSERT    ┌────────────────┐   pg_notify   ┌────────────────┐
+│  Publisher   │ ──────────► │ outbox_events  │ ─────────────►│   Scheduler    │
+└──────────────┘             └────────────────┘               └───────┬────────┘
+                                                                      │ INSERT
+                                                                      ▼
+                                                              ┌────────────────┐
+                                                              │outbox_deliveries│
+                                                              └───────┬────────┘
+                                                                      │ FOR UPDATE
+                                                                      │ SKIP LOCKED
+                                                                      ▼
+                                                              ┌────────────────┐
+                                                              │   Dispatcher   │── HTTPS ─► Receiver
+                                                              └────────────────┘  (signed)
+```
+
+See `../outbox/TDDs/04-outbox-dispatcher-tdd.md` for the full design.
+
+## Quick start
+
+```bash
+# 1. Start Postgres + dispatcher with a single compose command
+export ADMIN_TOKEN="$(openssl rand -hex 32)"
+docker compose -f examples/docker-compose.with-postgres.yml up -d
+
+# 2. Verify
+curl http://localhost:9090/ready
+```
+
+To run from source:
+
+```bash
+docker compose up -d    # local Postgres on :5434
+cargo run -- migrate    # apply schema
+cargo run               # start the dispatcher
+```
+
+## Configuration
+
+Config is layered (later wins):
+
+1. `envs/app_config.toml` — baked-in defaults
+2. `envs/app_config_${APP_ENV}.toml` — per-env overrides
+3. `.env.toml` — local secrets (gitignored)
+4. `APP__*` env vars — highest priority
+
+Required at runtime:
+
+| Setting | How to set |
+|---------|-----------|
+| `database.url` | `DATABASE_URL` env var |
+| `admin.auth_token` | `ADMIN_TOKEN` env var |
+| Each `[signing_keys]` entry | One env var per key |
+
+Two example configs ship with the project:
+
+- `examples/config.minimal.toml` — dev / low-traffic, no signing.
+- `examples/config.production.toml` — fully populated production template.
+
+## Webhook protocol
+
+The dispatcher POSTs JSON to each callback URL with these reserved headers:
+
+```
+X-Outbox-Event-Id:        <uuid>
+X-Outbox-Delivery-Id:     <i64>
+X-Outbox-Callback-Name:   <string>
+X-Outbox-Kind:            <event kind>
+X-Outbox-Mode:            managed | external
+X-Outbox-Attempt:         <1-based integer>
+X-Outbox-Signing-Key-Id:  <id>                 (omitted when unsigned)
+X-Outbox-Signature:       t=<unix_ts>,v1=<hex> (omitted when unsigned)
+```
+
+The signature is `HMAC-SHA256(secret, "{ts}.{raw_body}")`. Verify with a
+constant-time comparison; tolerate `|now - ts| ≤ 300s` by default.
+
+Full protocol and edge cases: [`docs/webhook-protocol.md`](docs/webhook-protocol.md).
+
+## Operations
+
+- **Liveness:** `GET /health` (no auth)
+- **Readiness:** `GET /ready` (no auth) — checks DB, LISTEN, scheduler heartbeat
+- **Admin API:** `/v1/stats`, `/v1/dead-letters`, `/v1/external-pending`,
+  `/v1/events/<id>`, `POST /v1/deliveries/<id>/{retry,complete,abandon}`
+- **Metrics:** Prometheus scrape on `:9091/metrics` (no auth)
+
+See [`docs/operations.md`](docs/operations.md) for the runbook and
+[`docs/deployment.md`](docs/deployment.md) for Docker / Cloud Run / Kubernetes
+deployment recipes.
+
+## Documentation
+
+| Doc | Audience |
+|-----|----------|
+| [`docs/deployment.md`](docs/deployment.md) | Operators deploying the service |
+| [`docs/operations.md`](docs/operations.md) | Day-2 runbook, metrics, common issues |
+| [`docs/webhook-protocol.md`](docs/webhook-protocol.md) | Webhook receiver implementers |
+| [`CLAUDE.md`](CLAUDE.md) | Project conventions and key design notes |
+| `../outbox/TDDs/04-outbox-dispatcher-tdd.md` | Full design (out-of-tree) |
+
+## Development
+
+Required tooling: stable Rust (1.87+), Docker.
+
+```bash
+cargo fmt --all
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+`.sqlx/` is a checked-in query cache so builds work without a live database.
+After changing any sqlx query macro:
+
+```bash
+DATABASE_URL=postgres://outbox:outbox@localhost:5434/outbox_dispatcher \
+  cargo sqlx prepare --workspace
+```
+
+Integration tests use `testcontainers` and spin up an ephemeral Postgres per
+test — Docker must be running locally.
+
+## Roadmap
+
+The implementation phases tracked in [`CLAUDE.md`](CLAUDE.md) are all complete
+(phases 1–8). Future work (v2+):
+
+- Per-callback rate limiting
+- Pluggable signing schemes (ed25519, JWT)
+- Schema v2 migration tooling
+
+## Contributing
+
+Issues and pull requests are welcome. Please run the mandatory pre-commit
+checks (above) before opening a PR. For substantive design changes, open an
+issue first to discuss the approach.
+
+## License
+
+<!-- Add a LICENSE file (MIT or Apache-2.0 are conventional for Rust) and
+     reference it here. The current repo has no LICENSE; that should be
+     addressed before promoting the README. -->
+```
+
+The exact wording can vary, but the README must at minimum cover: a one-paragraph elevator pitch, a feature list, a quick-start, a configuration summary, the webhook contract, a link map into `docs/`, dev-tooling commands, and a license note. Drop any badge whose target does not exist.
+
+**Why this fix**
+
+A README is the cover of the project. Open-source consumers form a first impression of trustworthiness in seconds based on whether the README looks maintained. The current two-line stub signals "abandoned / WIP" even though the project is feature-complete through Phase 8 — that mismatch costs adoption. Every fact needed for the new README already exists in the TDD and the in-tree `docs/`; this is purely a packaging change.
+
+---
+
+### Finding 11 — Release workflow produces duplicate artifact name `outbox-dispatcher-linux-x86_64`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `.github/workflows/ci.yml:96-99`, `.github/workflows/release.yml:30-34, 78-82` |
+| **Severity** | Medium |
+| **Category** | Correctness |
+
+**Problem**
+
+`release.yml` calls `ci.yml` via `workflow_call` (the gate added for Finding 4). `ci.yml`'s `build` job uploads an artifact named **`outbox-dispatcher-linux-x86_64`**. The `build-binaries` matrix in `release.yml` *also* uploads an artifact named **`outbox-dispatcher-linux-x86_64`** (the first matrix entry). With `actions/upload-artifact@v4`, two uploads with the same name in the same workflow run fail the second one with HTTP 409 (`an artifact with this name already exists on the workflow run`). Every tag push will therefore fail in the `build-binaries (x86_64-unknown-linux-gnu)` job, blocking releases entirely.
+
+**Context** (surrounding code as it exists today)
+
+```yaml
+# .github/workflows/ci.yml lines 94-99 — runs whenever ci.yml is invoked,
+# including via workflow_call from release.yml
+- name: Upload binary artifact
+  uses: actions/upload-artifact@v4
+  with:
+    name: outbox-dispatcher-linux-x86_64
+    path: target/release/outbox-dispatcher
+    retention-days: 7
+```
+
+```yaml
+# .github/workflows/release.yml lines 30-34 (matrix entry) and 78-82 (upload step)
+- os: ubuntu-latest
+  target: x86_64-unknown-linux-gnu
+  asset_name: outbox-dispatcher-linux-x86_64
+
+# …
+
+- name: Upload binary artifact
+  uses: actions/upload-artifact@v4
+  with:
+    name: ${{ matrix.asset_name }}    # == outbox-dispatcher-linux-x86_64
+    path: ${{ matrix.asset_name }}
+```
+
+**Recommended fix**
+
+Skip the CI workflow's `build` job when invoked via `workflow_call` — it is redundant with `release.yml`'s `build-binaries`, which produces the artefact the release actually consumes. Either:
+
+Option A — gate the `build` job in `ci.yml` so it only runs on push/PR, not via `workflow_call`:
+
+```yaml
+# .github/workflows/ci.yml — adjust the `build` job
+  build:
+    name: Build Release Binary
+    if: github.event_name != 'workflow_call'
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration]
+    # … existing steps …
+```
+
+Option B — rename the CI artifact so it doesn't collide with the release matrix entry:
+
+```yaml
+# .github/workflows/ci.yml lines 96-99
+- name: Upload binary artifact
+  uses: actions/upload-artifact@v4
+  with:
+    name: outbox-dispatcher-linux-x86_64-ci
+    path: target/release/outbox-dispatcher
+    retention-days: 7
+```
+
+Option A is preferred — duplicating the build wastes ~2 min of runner time on every tag push for no benefit.
+
+**Why this fix**
+
+Reusable workflows share the artifact namespace with the caller, and `upload-artifact@v4` no longer allows duplicate names. Either de-duplicate (Option A) or namespace (Option B); silently failing release builds is the worst outcome.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
@@ -459,6 +864,9 @@ A baseline image-level healthcheck means `docker ps` / orchestrator-agnostic dep
 | 6 | Cloud Run docs claim `PORT=8080` is respected, but the binary ignores it | `docs/deployment.md:149` | Medium | Config | DONE | Replaced misleading `Set PORT=8080` sentence with accurate guidance |
 | 7 | Compose comment names `.yaml` file that doesn't exist | `docker/docker-compose.example.yml:44` | Low | Documentation | DONE | Fixed `.yaml` → `.toml` in comment |
 | 8 | Dockerfile declares no `HEALTHCHECK` | `docker/Dockerfile:42-69` | Low | Config | DONE | Added `HEALTHCHECK` instruction using `wget` (now present in image) |
+| 9 | Operations runbook lists Prometheus metrics that do not exist in code | `docs/operations.md:138-153, 160, 247` | High | Documentation | TODO | Doc drift vs `crates/core/src/metrics.rs` — many wrong names and labels |
+| 10 | `README.md` is a two-line stub with no project overview | `README.md:1-3` | High | Documentation | TODO | Replace with a proper open-source README distilled from the TDD — pitch, features, quick-start, config, webhook protocol, doc map, license |
+| 11 | Release workflow uploads duplicate artifact name `outbox-dispatcher-linux-x86_64` | `.github/workflows/ci.yml:96-99`, `.github/workflows/release.yml:78-82` | Medium | Correctness | TODO | `upload-artifact@v4` will 409 on second upload — blocks releases |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
