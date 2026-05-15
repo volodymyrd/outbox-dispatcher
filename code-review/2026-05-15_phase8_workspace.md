@@ -864,9 +864,9 @@ Reusable workflows share the artifact namespace with the caller, and `upload-art
 | 6 | Cloud Run docs claim `PORT=8080` is respected, but the binary ignores it | `docs/deployment.md:149` | Medium | Config | DONE | Replaced misleading `Set PORT=8080` sentence with accurate guidance |
 | 7 | Compose comment names `.yaml` file that doesn't exist | `docker/docker-compose.example.yml:44` | Low | Documentation | DONE | Fixed `.yaml` → `.toml` in comment |
 | 8 | Dockerfile declares no `HEALTHCHECK` | `docker/Dockerfile:42-69` | Low | Config | DONE | Added `HEALTHCHECK` instruction using `wget` (now present in image) |
-| 9 | Operations runbook lists Prometheus metrics that do not exist in code | `docs/operations.md:138-153, 160, 247` | High | Documentation | TODO | Doc drift vs `crates/core/src/metrics.rs` — many wrong names and labels |
-| 10 | `README.md` is a two-line stub with no project overview | `README.md:1-3` | High | Documentation | TODO | Replace with a proper open-source README distilled from the TDD — pitch, features, quick-start, config, webhook protocol, doc map, license |
-| 11 | Release workflow uploads duplicate artifact name `outbox-dispatcher-linux-x86_64` | `.github/workflows/ci.yml:96-99`, `.github/workflows/release.yml:78-82` | Medium | Correctness | TODO | `upload-artifact@v4` will 409 on second upload — blocks releases |
+| 9 | Operations runbook lists Prometheus metrics that do not exist in code | `docs/operations.md:138-153, 160, 247` | High | Documentation | DONE | Rewrote §Key metrics table and §Alerting to match `crates/core/src/metrics.rs`; fixed retention monitoring line |
+| 10 | `README.md` is a two-line stub with no project overview | `README.md:1-3` | High | Documentation | DONE | Replaced stub with full README: pitch, features, architecture diagram, quick-start, config, webhook protocol, operations links, dev commands |
+| 11 | Release workflow uploads duplicate artifact name `outbox-dispatcher-linux-x86_64` | `.github/workflows/ci.yml:96-99`, `.github/workflows/release.yml:78-82` | Medium | Correctness | DONE | Added `if: github.event_name != 'workflow_call'` guard to `build` job in `ci.yml` (Option A) |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

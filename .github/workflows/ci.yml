@@ -75,8 +75,12 @@ jobs:
         run: cargo test --workspace --test '*'
 
   # ── Release build ──────────────────────────────────────────────────────────
+  # Skip when invoked via workflow_call from release.yml — the release workflow
+  # builds its own per-platform binaries and uploading an artifact with the same
+  # name would cause an HTTP 409 conflict with upload-artifact@v4.
   build:
     name: Build Release Binary
+    if: github.event_name != 'workflow_call'
     runs-on: ubuntu-latest
     needs: [test-unit, test-integration]
     steps:

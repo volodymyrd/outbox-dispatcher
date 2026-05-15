@@ -133,31 +133,36 @@ Scrape endpoint: `http://dispatcher:9091/metrics` (no auth)
 
 ### Key metrics
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `outbox_dispatched_total{callback,mode}` | Counter | Successful webhook deliveries |
-| `outbox_dispatch_failures_total{callback,reason}` | Counter | Transient delivery failures |
-| `outbox_dead_lettered_total{callback,reason}` | Counter | Deliveries reaching dead-letter state |
-| `outbox_dispatch_duration_seconds{callback}` | Histogram | HTTP round-trip duration |
-| `outbox_lag_seconds{callback}` | Gauge | Age of the oldest pending delivery |
-| `outbox_pending_deliveries{callback}` | Gauge | Current pending delivery count |
-| `outbox_external_pending_deliveries{callback}` | Gauge | External deliveries awaiting completion |
-| `outbox_external_pending_seconds{callback}` | Histogram | Age distribution of external-pending rows |
-| `outbox_external_timeout_resets_total{callback}` | Counter | External completions that timed out and were reset |
-| `outbox_completion_cycles_exhausted_total{callback}` | Counter | External deliveries dead-lettered after max cycles |
-| `outbox_invalid_callbacks_total{reason}` | Counter | Schedule-time invalid callbacks |
-| `outbox_signing_key_resolution_failures_total{key_id,callback}` | Counter | Unknown signing key at dispatch time |
-| `outbox_corrupted_rows_total{stage}` | Counter | Poison-pill rows skipped at each pipeline stage |
-| `outbox_scheduler_cycles_total` | Counter | Total scheduler loop iterations |
-| `outbox_retention_deleted_total{reason}` | Counter | Rows deleted by the retention worker |
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `outbox_events_total` | Counter | `kind` | Events observed by the scheduler |
+| `outbox_deliveries_total` | Counter | `callback`, `mode`, `result` | All delivery outcomes (`result` ∈ `ok`/`transient`/`timeout`/`invalid`/`external_reset`) |
+| `outbox_dispatch_duration_seconds` | Histogram | `callback`, `mode` | HTTP round-trip duration |
+| `outbox_lag_seconds` | Gauge | — | Age of the oldest pending delivery |
+| `outbox_pending_deliveries` | Gauge | `callback`, `mode` | Current pending delivery count |
+| `outbox_external_pending_deliveries` | Gauge | `callback` | External deliveries awaiting completion |
+| `outbox_external_pending_seconds` | Histogram | `callback` | Age distribution of external-pending rows |
+| `outbox_dead_letters_total` | Counter | `callback` | Deliveries reaching dead-letter state |
+| `outbox_external_timeout_resets_total` | Counter | `callback` | External completions that timed out and were reset |
+| `outbox_completion_cycles_exhausted_total` | Counter | `callback` | External deliveries dead-lettered after max cycles |
+| `outbox_signing_key_resolution_failures_total` | Counter | `signing_key_id`, `callback` | Unknown signing key at dispatch time |
+| `outbox_invalid_callbacks_total` | Counter | `reason` | Schedule-time invalid callbacks |
+| `outbox_payload_size_rejections_total` | Counter | `kind` | Events rejected for exceeding `payload_size_limit_bytes` |
+| `outbox_retention_deletions_total` | Counter | `reason` | Rows deleted by the retention worker (`reason` ∈ `processed`/`dead_letter`) |
+| `outbox_retention_cycle_duration_seconds` | Histogram | — | Retention worker cycle duration |
+| `outbox_retention_oldest_event_age_seconds` | Gauge | — | Age of oldest terminal event still on disk (NaN when none) |
+| `outbox_corrupted_rows_total` | Counter | `stage` | Poison-pill rows skipped (`stage` ∈ `schedule`/`dispatch`/`sweep`/`retention`) |
+| `outbox_cycle_duration_seconds` | Histogram | — | Scheduler loop duration (use `_count` as a liveness counter) |
+| `outbox_listener_connection_status` | Gauge | — | LISTEN connection up (1) or down (0) |
 
 ### Alerting recommendations
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
-| Dead letters accumulating | `rate(outbox_dead_lettered_total[5m]) > 0` | Warning |
+| Dead letters accumulating | `rate(outbox_dead_letters_total[5m]) > 0` | Warning |
 | High dispatch lag | `outbox_lag_seconds > 300` | Warning |
-| Listener down | No `outbox_scheduler_cycles_total` increase for 2× `poll_interval` | Critical |
+| Listener down | `outbox_listener_connection_status == 0 for 2m` | Critical |
+| Scheduler stalled | `rate(outbox_cycle_duration_seconds_count[2 * poll_interval]) == 0` | Critical |
 | Signing key drift | `rate(outbox_signing_key_resolution_failures_total[5m]) > 0` | Warning |
 | Corrupted rows | `rate(outbox_corrupted_rows_total[5m]) > 0` | Warning |
 
@@ -244,7 +249,7 @@ batch_limit = 1000               # max rows per cycle
 
 The worker deletes `outbox_events` rows whose deliveries are all in a terminal state (all `processed_at != NULL`, or all `dead_letter = TRUE`) older than the configured retention window. ON DELETE CASCADE removes the corresponding `outbox_deliveries` rows.
 
-Monitor via `outbox_retention_deleted_total{reason}` and `outbox_oldest_terminal_event_age_seconds`.
+Monitor via `outbox_retention_deletions_total{reason}` and `outbox_retention_oldest_event_age_seconds`.
 
 ## SIGHUP (hot reload)
 
