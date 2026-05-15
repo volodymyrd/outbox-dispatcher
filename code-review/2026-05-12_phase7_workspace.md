@@ -2054,9 +2054,9 @@ so this is documentation-only.
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 25 | `cargo fmt --all --check` fails on seven test assertions in `config.rs` | `crates/core/src/config.rs:1034-1704` (7 sites) | High | Idiom / CI | TODO | Run `cargo fmt --all` and commit; CLAUDE.md mandates this after every change |
-| 26 | `stats_sample_interval_secs` has no lower-bound sanity check | `crates/core/src/config.rs:622-624` | Low | Config | TODO | Add a `MIN_STATS_SAMPLE_INTERVAL_SECS` (e.g. 10 s) and reject below it, mirroring `MIN_SWEEP_INTERVAL_SECS` |
-| 27 | `[observability]` block missing from base env config | `envs/app_config.toml`, `app_config_dev.toml`, `app_config_local.toml` | Low | Config | TODO | Add a documented `[observability]` block to `app_config.toml`; per-env files only override what differs |
+| 25 | `cargo fmt --all --check` fails on seven test assertions in `config.rs` | `crates/core/src/config.rs:1034-1704` (7 sites) | High | Idiom / CI | DONE | Ran `cargo fmt --all`; seven chained-assert blocks reformatted to canonical shape |
+| 26 | `stats_sample_interval_secs` has no lower-bound sanity check | `crates/core/src/config.rs:622-624` | Low | Config | DONE | Added `MIN_STATS_SAMPLE_INTERVAL_SECS = 10`; validation now rejects values below 10 s, mirroring `MIN_SWEEP_INTERVAL_SECS`; added tests for `0`, `5` (below-min), and `10` (at-min) |
+| 27 | `[observability]` block missing from base env config | `envs/app_config.toml`, `app_config_dev.toml`, `app_config_local.toml` | Low | Config | DONE | Added documented `[observability]` block with `metrics_bind`, `otel_endpoint`, and `stats_sample_interval_secs` to `envs/app_config.toml`; dev/local configs unchanged (inherit base defaults) |
 
 > **Instructions for the implementing LLM:** same conventions — `TODO` → `DONE`
 > on resolution, `SKIPPED` with a reason if intentionally not applied. Do not

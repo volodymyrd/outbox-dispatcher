@@ -46,6 +46,16 @@ dead_letter_retention_days = 30
 cleanup_interval_secs = 3600
 batch_limit = 1000
 
+[observability]
+# Address the Prometheus /metrics HTTP listener binds to.
+metrics_bind = "0.0.0.0:9091"
+# OTLP gRPC endpoint for traces. Empty disables OpenTelemetry export.
+otel_endpoint = ""
+# How often the stats sampler runs heavy aggregate queries (events/deliveries
+# counts, oldest-pending age, external-pending ages). Must be >= 10 s to avoid
+# sustained DB load on large outboxes — see review finding F20/F26.
+stats_sample_interval_secs = 30
+
 # Signing keys: maps key id -> env var name holding the base64-encoded HMAC secret.
 # Example:
 # [signing_keys]

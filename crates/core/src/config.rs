@@ -409,6 +409,7 @@ const MAX_PAYLOAD_SIZE_BYTES: i64 = 100 * 1_024 * 1_024;
 const MIN_SWEEP_INTERVAL_SECS: u64 = 10;
 const MIN_RETENTION_CLEANUP_SECS: u64 = 60;
 const MAX_RETENTION_BATCH: u64 = 10_000;
+const MIN_STATS_SAMPLE_INTERVAL_SECS: u64 = 10;
 
 impl AppConfig {
     /// Load config by layering (later sources override earlier ones):
@@ -619,8 +620,11 @@ impl AppConfig {
                 self.observability.metrics_bind
             ));
         }
-        if self.observability.stats_sample_interval_secs == 0 {
-            errors.push("observability.stats_sample_interval_secs must be > 0".to_string());
+        if self.observability.stats_sample_interval_secs < MIN_STATS_SAMPLE_INTERVAL_SECS {
+            errors.push(format!(
+                "observability.stats_sample_interval_secs must be >= {MIN_STATS_SAMPLE_INTERVAL_SECS} \
+                 (sub-10s sampling re-introduces sustained DB load — see review F20)"
+            ));
         }
 
         if errors.is_empty() {
@@ -1035,10 +1039,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.external_timeout_sweep_interval_secs = 9;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("external_timeout_sweep_interval_secs")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("external_timeout_sweep_interval_secs"))
+        );
     }
 
     #[test]
@@ -1053,10 +1058,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 1023;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("payload_size_limit_bytes")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("payload_size_limit_bytes"))
+        );
     }
 
     #[test]
@@ -1226,10 +1232,11 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.processed_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("processed_retention_days")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("processed_retention_days"))
+        );
     }
 
     #[test]
@@ -1238,10 +1245,11 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.dead_letter_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("dead_letter_retention_days")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("dead_letter_retention_days"))
+        );
     }
 
     #[test]
@@ -1369,10 +1377,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 104_857_601;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("payload_size_limit_bytes")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("payload_size_limit_bytes"))
+        );
     }
 
     #[test]
@@ -1434,10 +1443,11 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.dispatch_concurrency = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("dispatch_concurrency must be > 0")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("dispatch_concurrency must be > 0"))
+        );
     }
 
     #[test]
@@ -1697,10 +1707,30 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.observability.stats_sample_interval_secs = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(errs
-            .0
-            .iter()
-            .any(|e| e.contains("stats_sample_interval_secs")));
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("stats_sample_interval_secs"))
+        );
+    }
+
+    #[test]
+    fn test_validate_observability_stats_sample_interval_below_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.stats_sample_interval_secs = 5;
+        let errs = cfg.validate().unwrap_err();
+        assert!(
+            errs.0
+                .iter()
+                .any(|e| e.contains("stats_sample_interval_secs"))
+        );
+    }
+
+    #[test]
+    fn test_validate_observability_stats_sample_interval_at_minimum() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.stats_sample_interval_secs = 10;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
