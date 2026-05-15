@@ -1,0 +1,60 @@
+# Full example: outbox-dispatcher + Postgres, ready to run.
+#
+# Suitable for staging environments, demos, and quick evaluations.
+# For development against a local Postgres, use docker-compose.yml in the root.
+#
+# Usage:
+#   export ADMIN_TOKEN="$(openssl rand -hex 32)"
+#   export MY_SERVICE_HMAC_SECRET="$(openssl rand -base64 48)"
+#   docker compose -f examples/docker-compose.with-postgres.yml up -d
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: outbox
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-outbox}
+      POSTGRES_DB: outbox_dispatcher
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U outbox -d outbox_dispatcher"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Postgres is intentionally not exposed to the host in this example.
+    # Expose port 5432 locally only if you need direct psql access during testing.
+
+  dispatcher:
+    image: ghcr.io/volodymyrd/outbox-dispatcher:latest
+    # Or build locally:
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgres://outbox:${POSTGRES_PASSWORD:-outbox}@postgres:5432/outbox_dispatcher
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN is required}
+      # Add one env var per signing key defined in [signing_keys].
+      # MY_SERVICE_HMAC_SECRET: ${MY_SERVICE_HMAC_SECRET}
+    ports:
+      - "9090:9090"   # admin API — do not expose publicly without a reverse proxy + TLS
+      - "9091:9091"   # Prometheus /metrics scrape endpoint
+    volumes:
+      # Production config overlay — overrides baked-in defaults.
+      # The file must exist; copy and edit examples/config.production.toml.
+      - ./config.prod.toml:/app/envs/app_config_prod.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  postgres_data:

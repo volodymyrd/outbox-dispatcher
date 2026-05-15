@@ -1,0 +1,55 @@
+# Example: run outbox-dispatcher alongside a standalone Postgres instance.
+# This is a minimal reference — copy and adjust for your environment.
+#
+# Usage:
+#   cp .env.example .env          # fill in secrets
+#   docker compose -f docker/docker-compose.example.yml up -d
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: outbox
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-outbox}
+      POSTGRES_DB: outbox_dispatcher
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U outbox -d outbox_dispatcher"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dispatcher:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgres://outbox:${POSTGRES_PASSWORD:-outbox}@postgres:5432/outbox_dispatcher
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      # Add your signing key secrets here, e.g.:
+      # MY_SERVICE_HMAC_SECRET: ${MY_SERVICE_HMAC_SECRET}
+    ports:
+      - "9090:9090"   # admin API
+      - "9091:9091"   # Prometheus metrics
+    volumes:
+      # Mount your production config (see examples/config.production.yaml).
+      # The base envs/ baked into the image are used as fallback defaults.
+      - ./config.prod.toml:/app/envs/app_config_prod.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres_data:

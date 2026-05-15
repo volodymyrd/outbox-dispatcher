@@ -116,13 +116,13 @@ cargo test --test '*'
 | Phase | Status   | Description                                                                       |
 |-------|----------|-----------------------------------------------------------------------------------|
 | 1     | **DONE** | Workspace scaffold, migration SQL, `Repo` trait, full `PgRepo`, migration runner  |
-| 2     | Todo     | YAML config parsing, domain types, `parse_callbacks`, payload-size helper         |
-| 3     | Todo     | `LISTEN/NOTIFY` wake source, cursor recovery, scheduler                           |
-| 4     | Todo     | `Callback` trait, `HttpCallback`, managed dispatch, HMAC signing at dispatch time |
-| 5     | Todo     | External mode, completion sweeper                                                 |
-| 6     | Todo     | Admin HTTP API (axum)                                                             |
-| 7     | Todo     | Prometheus metrics, structured logging, OpenTelemetry, retention worker           |
-| 8     | Todo     | Docker, CI/CD, docs                                                               |
+| 2     | **DONE** | Config parsing, domain types, `parse_callbacks`, SSRF denylist, keyring           |
+| 3     | **DONE** | `LISTEN/NOTIFY` wake source, cursor recovery, scheduler loop                      |
+| 4     | **DONE** | `Callback` trait, `HttpCallback`, managed dispatch, HMAC signing at dispatch time |
+| 5     | **DONE** | External mode, completion sweeper, `reset_hung_external` CTE                      |
+| 6     | **DONE** | Admin HTTP API (axum), bearer-token auth middleware                                |
+| 7     | **DONE** | Prometheus metrics, structured logging, OpenTelemetry, retention worker            |
+| 8     | **DONE** | Dockerfile, GitHub Actions CI/CD, example configs, deployment/ops/protocol docs   |
 
 ## Key design notes
 
