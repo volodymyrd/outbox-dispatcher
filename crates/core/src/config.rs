@@ -351,6 +351,10 @@ fn default_metrics_bind() -> String {
     "0.0.0.0:9091".to_string()
 }
 
+fn default_stats_sample_interval_secs() -> u64 {
+    30
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
@@ -360,6 +364,11 @@ pub struct ObservabilityConfig {
     /// OTLP gRPC endpoint for OpenTelemetry traces. If empty, tracing is disabled.
     #[serde(default)]
     pub otel_endpoint: String,
+    /// How often the stats sampler runs heavy aggregate queries against the DB,
+    /// in seconds. Defaults to 30 s to align with typical Prometheus scrape cadence
+    /// and avoid sustained DB pressure on large deployments.
+    #[serde(default = "default_stats_sample_interval_secs")]
+    pub stats_sample_interval_secs: u64,
 }
 
 impl Default for ObservabilityConfig {
@@ -367,6 +376,7 @@ impl Default for ObservabilityConfig {
         Self {
             metrics_bind: default_metrics_bind(),
             otel_endpoint: String::new(),
+            stats_sample_interval_secs: default_stats_sample_interval_secs(),
         }
     }
 }
@@ -608,6 +618,9 @@ impl AppConfig {
                  (expected IP:port, e.g. 0.0.0.0:9091 or [::]:9091)",
                 self.observability.metrics_bind
             ));
+        }
+        if self.observability.stats_sample_interval_secs == 0 {
+            errors.push("observability.stats_sample_interval_secs must be > 0".to_string());
         }
 
         if errors.is_empty() {
@@ -1022,11 +1035,10 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.external_timeout_sweep_interval_secs = 9;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("external_timeout_sweep_interval_secs"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("external_timeout_sweep_interval_secs")));
     }
 
     #[test]
@@ -1041,11 +1053,10 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 1023;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("payload_size_limit_bytes"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("payload_size_limit_bytes")));
     }
 
     #[test]
@@ -1215,11 +1226,10 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.processed_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("processed_retention_days"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("processed_retention_days")));
     }
 
     #[test]
@@ -1228,11 +1238,10 @@ filter = "info"
         cfg.retention.enabled = true;
         cfg.retention.dead_letter_retention_days = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("dead_letter_retention_days"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("dead_letter_retention_days")));
     }
 
     #[test]
@@ -1360,11 +1369,10 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.payload_size_limit_bytes = 104_857_601;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("payload_size_limit_bytes"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("payload_size_limit_bytes")));
     }
 
     #[test]
@@ -1426,11 +1434,10 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.dispatch.dispatch_concurrency = 0;
         let errs = cfg.validate().unwrap_err();
-        assert!(
-            errs.0
-                .iter()
-                .any(|e| e.contains("dispatch_concurrency must be > 0"))
-        );
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("dispatch_concurrency must be > 0")));
     }
 
     #[test]
@@ -1660,13 +1667,6 @@ filter = "info"
     // ── ObservabilityConfig ───────────────────────────────────────────────────
 
     #[test]
-    fn test_observability_defaults_when_absent() {
-        let cfg = build_config(full_toml());
-        assert_eq!(cfg.observability.metrics_bind, "0.0.0.0:9091");
-        assert_eq!(cfg.observability.otel_endpoint, "");
-    }
-
-    #[test]
     fn test_observability_config_from_toml() {
         let toml = format!(
             "{}\n\n[observability]\nmetrics_bind = \"127.0.0.1:9091\"\notel_endpoint = \"http://localhost:4317\"",
@@ -1690,5 +1690,24 @@ filter = "info"
         let mut cfg = build_config(full_toml());
         cfg.observability.metrics_bind = "0.0.0.0:9091".to_string();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_observability_stats_sample_interval_zero() {
+        let mut cfg = build_config(full_toml());
+        cfg.observability.stats_sample_interval_secs = 0;
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs
+            .0
+            .iter()
+            .any(|e| e.contains("stats_sample_interval_secs")));
+    }
+
+    #[test]
+    fn test_observability_defaults_when_absent() {
+        let cfg = build_config(full_toml());
+        assert_eq!(cfg.observability.stats_sample_interval_secs, 30);
+        assert_eq!(cfg.observability.metrics_bind, "0.0.0.0:9091");
+        assert!(cfg.observability.otel_endpoint.is_empty());
     }
 }

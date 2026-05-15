@@ -68,21 +68,17 @@ pub async fn run_retention_worker(
         "retention worker started"
     );
 
-    // Apply a random initial delay (up to one full interval) so that multiple
-    // replicas starting simultaneously do not all wake at the same instant.
-    if config.cleanup_interval_secs > 0 {
+    // Apply a random initial delay in [0, interval) so that multiple replicas
+    // starting simultaneously do not all wake at the same instant. The jitter
+    // *replaces* the first interval sleep; subsequent cycles use the full interval.
+    // This spreads replicas over [0, interval), not [interval, 2 × interval).
+    let initial_sleep = if config.cleanup_interval_secs > 0 {
         use rand::RngExt;
-        let jitter_secs = rand::rng().random_range(0..config.cleanup_interval_secs);
-        let initial_jitter = Duration::from_secs(jitter_secs);
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                info!("retention worker received shutdown signal during startup jitter, stopping");
-                return;
-            }
-            _ = tokio::time::sleep(initial_jitter) => {}
-        }
-    }
+        Duration::from_secs(rand::rng().random_range(0..config.cleanup_interval_secs))
+    } else {
+        Duration::ZERO
+    };
+    let mut next_sleep = initial_sleep;
 
     loop {
         tokio::select! {
@@ -91,8 +87,9 @@ pub async fn run_retention_worker(
                 info!("retention worker received shutdown signal, stopping");
                 return;
             }
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(next_sleep) => {}
         }
+        next_sleep = interval;
 
         let cycle_start = std::time::Instant::now();
         match run_retention_cycle(repo.as_ref(), &config).await {

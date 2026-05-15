@@ -219,18 +219,29 @@ async fn run() -> Result<()> {
 
             // Graceful-shutdown token — wired to SIGTERM/SIGINT.
             let shutdown = CancellationToken::new();
-            let shutdown_clone = shutdown.clone();
-            tokio::spawn(async move {
-                if let Ok(()) = tokio::signal::ctrl_c().await {
-                    info!("received SIGINT/SIGTERM, requesting shutdown");
-                    shutdown_clone.cancel();
-                }
-            });
 
             // Collect background task handles so we can await them during graceful
             // shutdown. Each task watches `shutdown.cancelled()` internally — we just
             // need to wait for them to drain before flushing the tracer.
             let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+            // Signal handler: cancel the shutdown token on SIGINT/Ctrl-C. Also exits
+            // cleanly when the token is cancelled by any other path (e.g. admin bind
+            // failure) so the JoinSet can drain uniformly.
+            {
+                let shutdown_clone = shutdown.clone();
+                workers.spawn(async move {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("received SIGINT/SIGTERM, requesting shutdown");
+                            shutdown_clone.cancel();
+                        }
+                        _ = shutdown_clone.cancelled() => {
+                            // Another path triggered shutdown — exit cleanly.
+                        }
+                    }
+                });
+            }
 
             // Spawn the admin HTTP server on a separate task.
             let admin_bind = config.admin.bind.clone();
@@ -283,10 +294,11 @@ async fn run() -> Result<()> {
             // Spawn the periodic stats sampler that publishes queue-state gauges.
             {
                 let stats_repo = repo.clone();
-                let poll_interval = Duration::from_secs(config.dispatch.poll_interval_secs);
+                let stats_interval =
+                    Duration::from_secs(config.observability.stats_sample_interval_secs);
                 let stats_shutdown = shutdown.clone();
                 workers.spawn(async move {
-                    run_stats_sampler(stats_repo, poll_interval, stats_shutdown).await;
+                    run_stats_sampler(stats_repo, stats_interval, stats_shutdown).await;
                 });
             }
 
@@ -473,8 +485,13 @@ fn init_tracing(
 ///
 /// The exporter listens on `obs.metrics_bind` and serves the standard `/metrics`
 /// endpoint. The listener runs in a background thread managed by the exporter.
+///
+/// Histogram buckets are configured per-metric family:
+/// - `*_duration_seconds` (dispatch, cycle, retention): ms–tens-of-seconds range.
+/// - `outbox_external_pending_seconds`: seconds–7-days range (external completion
+///   timeouts can be configured up to 7 days per the TDD §8.4).
 fn init_metrics(obs: &ObservabilityConfig) -> Result<()> {
-    use metrics_exporter_prometheus::PrometheusBuilder;
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
     let addr: std::net::SocketAddr = obs
         .metrics_bind
@@ -483,6 +500,22 @@ fn init_metrics(obs: &ObservabilityConfig) -> Result<()> {
 
     PrometheusBuilder::new()
         .with_http_listener(addr)
+        // Dispatch, cycle, and retention durations: milliseconds to tens of seconds.
+        .set_buckets_for_metric(
+            Matcher::Suffix("_duration_seconds".to_string()),
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            ],
+        )
+        .context("configuring _duration_seconds histogram buckets")?
+        // External-pending age: seconds to 7 days (max external_completion_timeout per §8.4).
+        .set_buckets_for_metric(
+            Matcher::Full(outbox_dispatcher_core::metrics::EXTERNAL_PENDING_SECONDS.to_string()),
+            &[
+                5.0, 30.0, 60.0, 300.0, 900.0, 3_600.0, 21_600.0, 86_400.0, 259_200.0, 604_800.0,
+            ],
+        )
+        .context("configuring external_pending_seconds histogram buckets")?
         .install()
         .context("installing Prometheus metrics exporter")?;
 

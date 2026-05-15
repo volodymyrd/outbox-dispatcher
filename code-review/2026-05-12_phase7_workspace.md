@@ -1798,11 +1798,11 @@ SIGTERM handler is added (today only SIGINT/Ctrl-C is wired).
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 20 | Stats sampler runs 3–4 heavy queries every `poll_interval` | `crates/bin/src/main.rs:507-566` + `crates/core/src/repo.rs:787-902` | Medium | Performance | TODO | Add `observability.stats_sample_interval_secs` (default 30 s) or sample-on-scrape; current 5 s cadence is hostile to large outboxes |
-| 21 | Histogram bucket boundaries not configured | `crates/bin/src/main.rs:476-491` | Low | Observability | TODO | `outbox_external_pending_seconds` unreadable above ~10 s; configure via `set_buckets_for_metric` |
-| 22 | `outbox_lag_seconds` measures next-retry lag, not event age | `crates/core/src/repo.rs:810-816` | Low | Correctness | TODO | Join `outbox_events` and use `MIN(e.created_at)`; current `MIN(available_at)` hides backed-off rows |
-| 23 | Retention first cycle delayed by interval + jitter | `crates/core/src/retention.rs:71-95` | Low | Concurrency / UX | TODO | Jitter should replace, not precede, the first interval sleep — spread `[0, interval)` not `[interval, 2 × interval)` |
-| 24 | Ctrl-C handler task is orphaned from the JoinSet | `crates/bin/src/main.rs:221-228` | Low | Idiom | TODO | Move into the `workers` JoinSet to make shutdown uniform across all spawned tasks |
+| 20 | Stats sampler runs 3–4 heavy queries every `poll_interval` | `crates/bin/src/main.rs:507-566` + `crates/core/src/repo.rs:787-902` | Medium | Performance | DONE | Added `observability.stats_sample_interval_secs` (default 30 s); sampler interval decoupled from `poll_interval`; validation added for zero value |
+| 21 | Histogram bucket boundaries not configured | `crates/bin/src/main.rs:476-491` | Low | Observability | DONE | `init_metrics` now calls `set_buckets_for_metric` for `_duration_seconds` (ms–30 s) and `EXTERNAL_PENDING_SECONDS` (5 s–7 days) |
+| 22 | `outbox_lag_seconds` measures next-retry lag, not event age | `crates/core/src/repo.rs:810-816` | Low | Correctness | DONE | `fetch_stats` SQL now joins `outbox_events` and uses `MIN(e.created_at)` so the gauge reports true event age regardless of retry backoff |
+| 23 | Retention first cycle delayed by interval + jitter | `crates/core/src/retention.rs:71-95` | Low | Concurrency / UX | DONE | Replaced separate jitter sleep + loop sleep with a `next_sleep` variable initialised to jitter (`[0, interval)`) and reset to `interval` after the first cycle |
+| 24 | Ctrl-C handler task is orphaned from the JoinSet | `crates/bin/src/main.rs:221-228` | Low | Idiom | DONE | Signal handler moved into `workers` JoinSet with a `select!` that exits cleanly on either Ctrl-C or any other shutdown-token cancellation |
 
 > **Instructions for the implementing LLM:** same conventions — `TODO` → `DONE` on
 > resolution, `SKIPPED` with a reason if intentionally not applied. Do not delete rows.

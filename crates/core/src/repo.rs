@@ -794,27 +794,28 @@ impl Repo for PgRepo {
             r#"
             SELECT
                 COUNT(*) FILTER (
-                    WHERE dispatched_at IS NULL
-                      AND processed_at  IS NULL
-                      AND dead_letter   = FALSE
+                    WHERE d.dispatched_at IS NULL
+                      AND d.processed_at  IS NULL
+                      AND d.dead_letter   = FALSE
                 ) AS "pending!: i64",
                 COUNT(*) FILTER (
-                    WHERE completion_mode = 'external'
-                      AND dispatched_at   IS NOT NULL
-                      AND processed_at    IS NULL
-                      AND dead_letter     = FALSE
+                    WHERE d.completion_mode = 'external'
+                      AND d.dispatched_at   IS NOT NULL
+                      AND d.processed_at    IS NULL
+                      AND d.dead_letter     = FALSE
                 ) AS "external_pending!: i64",
                 COUNT(*) FILTER (
-                    WHERE dead_letter = TRUE
+                    WHERE d.dead_letter = TRUE
                 ) AS "dead_lettered!: i64",
                 EXTRACT(EPOCH FROM (
-                    now() - MIN(available_at) FILTER (
-                        WHERE dispatched_at IS NULL
-                          AND processed_at  IS NULL
-                          AND dead_letter   = FALSE
+                    now() - MIN(e.created_at) FILTER (
+                        WHERE d.dispatched_at IS NULL
+                          AND d.processed_at  IS NULL
+                          AND d.dead_letter   = FALSE
                     )
                 ))::float8 AS oldest_pending_age_seconds
-            FROM outbox_deliveries
+            FROM outbox_deliveries d
+            JOIN outbox_events e ON e.event_id = d.event_id
             "#
         )
         .fetch_one(&self.pool)
