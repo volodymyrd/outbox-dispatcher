@@ -16,9 +16,15 @@ permissions:
   packages: write      # push Docker image to GHCR
 
 jobs:
+  # ── Gate: run the full CI suite on the tagged commit ─────────────────────
+  ci:
+    name: Verify CI on tagged commit
+    uses: ./.github/workflows/ci.yml
+
   # ── Build binaries for each target platform ───────────────────────────────
   build-binaries:
     name: Build ${{ matrix.target }}
+    needs: ci
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -52,7 +58,9 @@ jobs:
 
       - name: Install cross (for cross-compilation)
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
       - name: Build (native)
         if: "!matrix.cross"
@@ -76,6 +84,7 @@ jobs:
   # ── Build and push Docker image ───────────────────────────────────────────
   docker:
     name: Docker Image
+    needs: ci
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

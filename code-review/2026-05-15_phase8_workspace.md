@@ -451,14 +451,14 @@ A baseline image-level healthcheck means `docker ps` / orchestrator-agnostic dep
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
 |---|-------|-----------|----------|----------|--------|-------|
-| 1 | Compose healthchecks use `wget`, missing from `bookworm-slim` | `docker/docker-compose.example.yml:48`, `examples/docker-compose.with-postgres.yml:53` | Critical | Correctness | TODO | |
-| 2 | Missing `.dockerignore`; build context includes `target/`, `.git/` | repo root | High | Performance | TODO | |
-| 3 | Dockerfile warmup swallows errors with `\|\| true` | `docker/Dockerfile:29` | High | Correctness | TODO | |
-| 4 | Release workflow does not gate on CI | `.github/workflows/release.yml:1-19` | Medium | Correctness | TODO | |
-| 5 | `cross` installed from unpinned git ref | `.github/workflows/release.yml:55` | Medium | Correctness | TODO | |
-| 6 | Cloud Run docs claim `PORT=8080` is respected, but the binary ignores it | `docs/deployment.md:149` | Medium | Config | TODO | |
-| 7 | Compose comment names `.yaml` file that doesn't exist | `docker/docker-compose.example.yml:44` | Low | Documentation | TODO | |
-| 8 | Dockerfile declares no `HEALTHCHECK` | `docker/Dockerfile:42-69` | Low | Config | TODO | |
+| 1 | Compose healthchecks use `wget`, missing from `bookworm-slim` | `docker/docker-compose.example.yml:48`, `examples/docker-compose.with-postgres.yml:53` | Critical | Correctness | DONE | Added `wget` to apt install in Dockerfile runtime stage |
+| 2 | Missing `.dockerignore`; build context includes `target/`, `.git/` | repo root | High | Performance | DONE | Added `.dockerignore` at workspace root |
+| 3 | Dockerfile warmup swallows errors with `\|\| true` | `docker/Dockerfile:29` | High | Correctness | DONE | Replaced with `cargo fetch --locked && cargo build ... || (echo ... && exit 1)` |
+| 4 | Release workflow does not gate on CI | `.github/workflows/release.yml:1-19` | Medium | Correctness | DONE | Added `ci` job using `workflow_call`; `build-binaries` and `docker` now `needs: ci` |
+| 5 | `cross` installed from unpinned git ref | `.github/workflows/release.yml:55` | Medium | Correctness | DONE | Replaced with `taiki-e/install-action@v2` pinned to `cross@0.2.5` |
+| 6 | Cloud Run docs claim `PORT=8080` is respected, but the binary ignores it | `docs/deployment.md:149` | Medium | Config | DONE | Replaced misleading `Set PORT=8080` sentence with accurate guidance |
+| 7 | Compose comment names `.yaml` file that doesn't exist | `docker/docker-compose.example.yml:44` | Low | Documentation | DONE | Fixed `.yaml` → `.toml` in comment |
+| 8 | Dockerfile declares no `HEALTHCHECK` | `docker/Dockerfile:42-69` | Low | Config | DONE | Added `HEALTHCHECK` instruction using `wget` (now present in image) |
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

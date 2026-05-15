@@ -26,7 +26,9 @@ RUN mkdir -p crates/core/src \
     echo "pub fn _stub() {}" > crates/admin-api/src/lib.rs && \
     echo "fn main() {}"      > crates/bin/src/main.rs
 
-RUN cargo build --release --bin outbox-dispatcher 2>/dev/null || true
+RUN cargo fetch --locked && \
+    cargo build --release --bin outbox-dispatcher || \
+    (echo "warm-up build failed — check Cargo.toml / toolchain before relying on layer cache" && exit 1)
 
 # Now copy the real source, sqlx offline cache, config, and migrations.
 COPY crates/              crates/
@@ -45,7 +47,7 @@ FROM debian:bookworm-slim AS runtime
 # Install TLS certificates (needed by reqwest's rustls backend to verify
 # receiver TLS certificates) and a minimal set of runtime libs.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates wget && \
     rm -rf /var/lib/apt/lists/*
 
 # Non-root user for least-privilege operation.
@@ -65,5 +67,8 @@ EXPOSE 9090
 EXPOSE 9091
 
 ENV APP_ENV=prod
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -qO- http://localhost:9090/health || exit 1
 
 ENTRYPOINT ["/app/outbox-dispatcher"]

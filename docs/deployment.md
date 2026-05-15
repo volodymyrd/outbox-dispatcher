@@ -146,7 +146,9 @@ dispatch_concurrency = 4   # stay comfortably below max_connections
 bind = "0.0.0.0:8080"      # Cloud Run routes traffic to $PORT (default 8080)
 ```
 
-Set `PORT=8080` or adjust `admin.bind` to match what Cloud Run expects.
+Cloud Run injects a `$PORT` env var (default `8080`). `outbox-dispatcher` does
+not read `$PORT` directly — set `admin.bind = "0.0.0.0:8080"` (or pass
+`APP__ADMIN__BIND=0.0.0.0:8080`) so the admin listener matches.
 
 ## Kubernetes
 
