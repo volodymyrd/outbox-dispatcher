@@ -1697,22 +1697,21 @@ Two examples that target the same audience should share their safety rails. The 
 | 17 | Quick-start `cp examples/config.production.toml config.prod.toml` puts the file at the workspace root, but the compose bind mount `./config.prod.toml` resolves relative to the compose file (`examples/`) — the prod overlay is silently absent | `docs/deployment.md:18`, `examples/docker-compose.with-postgres.yml:51`, `docker/docker-compose.example.yml:46` | High | Correctness | DONE | Changed `cp` destination to `examples/config.prod.toml` in docs/deployment.md and README.md; updated volume comment in examples/docker-compose.with-postgres.yml; updated docker/docker-compose.example.yml usage comment and volume comment to instruct `docker/config.prod.toml` |
 | 18 | Alerting table uses non-literal PromQL range selector (`[2 * poll_interval]`) and `for 2m` inside the expression — invalid PromQL | `docs/operations.md:164-165` | Low | Documentation | DONE | Fixed `[2 * poll_interval]` → `[1m]` with explanatory note; moved `for 2m` out of the PromQL expression into a prose annotation |
 | 19 | README "run from source" quick-start omits `DATABASE_URL` / `ADMIN_TOKEN` — both `cargo run` invocations will fail on a fresh clone | `README.md:70-76` | Low | Documentation | DONE | Added `export DATABASE_URL=...` and `export ADMIN_TOKEN=...` before the `cargo run` commands |
-| 20 | Dispatcher does not catch SIGTERM — `docker stop` and Kubernetes pod-termination skip graceful shutdown, leaving rows locked and dropping the final telemetry batch | `crates/bin/src/main.rs:233-243`, `docker/Dockerfile:59` | High | Correctness / Concurrency | TODO | Pre-existing in `main.rs` (not in PR diff) but becomes operationally relevant with Phase 8's Docker/K8s deployment story. Either add a `tokio::signal::unix::SignalKind::terminate()` handler in `main.rs`, or as a partial Docker-only mitigation add `STOPSIGNAL SIGINT` to the Dockerfile (does not help Kubernetes) |
-| 21 | Quick-start `docker compose up` references `ghcr.io/volodymyrd/outbox-dispatcher:latest`, which does not exist until the first release tag is pushed | `examples/docker-compose.with-postgres.yml:30`, `README.md:61-66`, `docs/deployment.md:10-22` | Medium | Documentation / Correctness | TODO | Default the compose file to `build:` and add `--build` to the README/deployment-quick-start command; flip to `image:` once a real release exists |
-| 22 | README architecture diagram `outbox_deliveries` box is one cell wider than its borders | `README.md:42-57` | Low | Documentation | TODO | Widen the top/bottom borders from 16 to 17 `─` glyphs |
-| 23 | `docker/docker-compose.example.yml` silently accepts an empty `ADMIN_TOKEN` (sibling `examples/docker-compose.with-postgres.yml` uses `${ADMIN_TOKEN:?…}`) | `docker/docker-compose.example.yml:39` | Low | Security / Config | TODO | Replace `${ADMIN_TOKEN}` with `${ADMIN_TOKEN:?ADMIN_TOKEN is required}` |
+| 20 | Dispatcher does not catch SIGTERM — `docker stop` and Kubernetes pod-termination skip graceful shutdown, leaving rows locked and dropping the final telemetry batch | `crates/bin/src/main.rs:233-243`, `docker/Dockerfile:59` | High | Correctness / Concurrency | DONE | Added `tokio::signal::unix::signal(SignalKind::terminate())` alongside the existing `ctrl_c()` handler; both now cancel the shutdown token. `#[cfg(unix)]` guard keeps Windows build working. |
+| 21 | Quick-start `docker compose up` references `ghcr.io/volodymyrd/outbox-dispatcher:latest`, which does not exist until the first release tag is pushed | `examples/docker-compose.with-postgres.yml:30`, `README.md:61-66`, `docs/deployment.md:10-22` | Medium | Documentation / Correctness | DONE | Defaulted compose file to `build:` (local build); image reference moved to a comment. Added `--build` flag to README and deployment quick-start commands. |
+| 22 | README architecture diagram `outbox_deliveries` box is one cell wider than its borders | `README.md:42-57` | Low | Documentation | DONE | Widened top/bottom borders from 16 to 17 `─` glyphs; also corrected the Dispatcher box below it for visual consistency. |
+| 23 | `docker/docker-compose.example.yml` silently accepts an empty `ADMIN_TOKEN` (sibling `examples/docker-compose.with-postgres.yml` uses `${ADMIN_TOKEN:?…}`) | `docker/docker-compose.example.yml:39` | Low | Security / Config | DONE | Replaced `${ADMIN_TOKEN}` with `${ADMIN_TOKEN:?ADMIN_TOKEN is required}` to match the sibling example. |
 
 ## Merge readiness
 
-**Status: READY TO MERGE — with one follow-up issue strongly recommended.**
+**Status: READY TO MERGE — all findings resolved.**
 
-Findings F1–F19 are all confirmed DONE in the current branch state. The four new findings from this follow-up pass (F20–F23) are not strict blockers for Phase 8's scope (Docker/CI/docs):
+Findings F1–F23 are all confirmed DONE. F20–F23 were addressed in the follow-up pass:
 
-- **F20 (High)** is a pre-existing bug in `crates/bin/src/main.rs` that this PR does not touch but makes operationally relevant. Strongly recommended as a follow-up issue/PR — without SIGTERM handling, every Kubernetes rollout or `docker stop` will leak `locked_until` time and drop the final telemetry batch. Phase 8 ships a working image, but not one that shuts down cleanly under the most common production termination signal.
-- **F21 (Medium)** breaks the README quick-start for every user before the first GHCR release — high visibility, easy fix.
-- **F22, F23 (Low)** are polish items.
-
-None of F20–F23 invalidates the work in this PR; F1–F19's fixes stand correctly. Recommend merging Phase 8 and filing F20 as an immediate follow-up (touches Rust source and a fresh `.sqlx`-free path, so it belongs in its own PR). F21–F23 can be folded into the same follow-up or fixed in-flight before merge if quick to land.
+- **F20 (High)** — SIGTERM handler added to `crates/bin/src/main.rs`. `docker stop` and Kubernetes pod-termination now trigger graceful shutdown.
+- **F21 (Medium)** — `examples/docker-compose.with-postgres.yml` now defaults to the local build path; README and deployment quick-start updated with `--build`.
+- **F22 (Low)** — README architecture diagram `outbox_deliveries` box borders corrected.
+- **F23 (Low)** — `docker/docker-compose.example.yml` `ADMIN_TOKEN` now uses `:?` validation.
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.

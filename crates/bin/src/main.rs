@@ -225,21 +225,19 @@ async fn run() -> Result<()> {
             // need to wait for them to drain before flushing the tracer.
             let mut workers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-            // Signal handler: cancel the shutdown token on SIGINT/Ctrl-C. Also exits
-            // cleanly when the token is cancelled by any other path (e.g. admin bind
-            // failure) so the JoinSet can drain uniformly.
+            // Signal handler: cancel the shutdown token on SIGINT or SIGTERM. Also
+            // exits cleanly when the token is cancelled by any other path (e.g. admin
+            // bind failure) so the JoinSet can drain uniformly.
+            //
+            // Both signals must be handled: SIGINT covers interactive Ctrl-C and most
+            // CI kill paths, while SIGTERM is what `docker stop` and the Kubernetes
+            // kubelet send at pod termination. Without a SIGTERM handler the default
+            // Linux disposition is "terminate immediately", which skips the JoinSet
+            // drain and the OpenTelemetry tracer flush.
             {
                 let shutdown_clone = shutdown.clone();
                 workers.spawn(async move {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("received SIGINT/SIGTERM, requesting shutdown");
-                            shutdown_clone.cancel();
-                        }
-                        _ = shutdown_clone.cancelled() => {
-                            // Another path triggered shutdown — exit cleanly.
-                        }
-                    }
+                    wait_for_shutdown_signal(shutdown_clone).await;
                 });
             }
 
@@ -598,4 +596,47 @@ async fn run_stats_sampler(repo: Arc<dyn Repo>, interval: Duration, shutdown: Ca
             }
         }
     }
+}
+
+// ── Signal handling ────────────────────────────────────────────────────────────
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM and cancel the shutdown token.
+///
+/// On Unix both signals are caught so that `docker stop` and the Kubernetes
+/// kubelet (which send SIGTERM) trigger the same graceful drain path as an
+/// interactive Ctrl-C. The `#[cfg(unix)]` / `#[cfg(not(unix))]` split is
+/// required because `tokio::select!` does not support `#[cfg(…)]` on individual
+/// branches.
+///
+/// Also exits cleanly when the token is cancelled by any other path (e.g. admin
+/// bind failure) so the JoinSet drains uniformly.
+async fn wait_for_shutdown_signal(shutdown: CancellationToken) {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT, requesting shutdown");
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, requesting shutdown");
+            }
+            _ = shutdown.cancelled() => {
+                return; // Another path triggered shutdown — exit cleanly.
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT, requesting shutdown");
+            }
+            _ = shutdown.cancelled() => {
+                return; // Another path triggered shutdown — exit cleanly.
+            }
+        }
+    }
+    shutdown.cancel();
 }

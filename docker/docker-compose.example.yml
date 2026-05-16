@@ -36,7 +36,7 @@ services:
     environment:
       APP_ENV: prod
       DATABASE_URL: postgres://outbox:${POSTGRES_PASSWORD:-outbox}@postgres:5432/outbox_dispatcher
-      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN is required}
       # Add your signing key secrets here, e.g.:
       # MY_SERVICE_HMAC_SECRET: ${MY_SERVICE_HMAC_SECRET}
     ports:

@@ -18,8 +18,8 @@ export MY_HMAC_SECRET="$(openssl rand -base64 48)"
 cp examples/config.production.toml examples/config.prod.toml
 # Edit examples/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
 
-# Start Postgres + dispatcher
-docker compose -f examples/docker-compose.with-postgres.yml up -d
+# Start Postgres + dispatcher (first run builds the image locally — ~3 min)
+docker compose -f examples/docker-compose.with-postgres.yml up -d --build
 
 # Check readiness
 curl http://localhost:9090/ready

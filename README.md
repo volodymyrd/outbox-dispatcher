@@ -45,25 +45,25 @@ single binary so publishing services only need to `INSERT` into one table.
 └──────────────┘             └────────────────┘               └───────┬────────┘
                                                                       │ INSERT
                                                                       ▼
-                                                              ┌────────────────┐
-                                                              │outbox_deliveries│
-                                                              └───────┬────────┘
-                                                                      │ FOR UPDATE
-                                                                      │ SKIP LOCKED
-                                                                      ▼
-                                                              ┌────────────────┐
-                                                              │   Dispatcher   │── HTTPS ─► Receiver
-                                                              └────────────────┘  (signed)
+                                                               ┌─────────────────┐
+                                                               │outbox_deliveries│
+                                                               └─────────────────┘
+                                                                       │ FOR UPDATE
+                                                                       │ SKIP LOCKED
+                                                                       ▼
+                                                               ┌─────────────────┐
+                                                               │   Dispatcher    │── HTTPS ─► Receiver
+                                                               └─────────────────┘   (signed)
 ```
 
 ## Quick start
 
 ```bash
-# 1. Start Postgres + dispatcher with a single compose command
+# 1. Start Postgres + dispatcher (first run builds the image locally — ~3 min)
 export ADMIN_TOKEN="$(openssl rand -hex 32)"
 cp examples/config.production.toml examples/config.prod.toml
 # Edit examples/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
-docker compose -f examples/docker-compose.with-postgres.yml up -d
+docker compose -f examples/docker-compose.with-postgres.yml up -d --build
 
 # 2. Verify
 curl http://localhost:9090/ready

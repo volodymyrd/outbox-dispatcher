@@ -27,11 +27,13 @@ services:
     # Expose port 5432 locally only if you need direct psql access during testing.
 
   dispatcher:
-    image: ghcr.io/volodymyrd/outbox-dispatcher:latest
-    # Or build locally:
-    # build:
-    #   context: ..
-    #   dockerfile: docker/Dockerfile
+    # Build locally (always works, even before the first GHCR release).
+    # First run takes ~3 min; subsequent runs use the layer cache.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # To use the published image instead (requires a tagged release to exist):
+    # image: ghcr.io/volodymyrd/outbox-dispatcher:latest
     restart: unless-stopped
     depends_on:
       postgres:
