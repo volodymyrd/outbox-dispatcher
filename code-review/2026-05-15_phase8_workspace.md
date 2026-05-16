@@ -1,6 +1,6 @@
 # Code Review — Phase 8 (PR #7)
 
-**Date:** 2026-05-15T17:07:47Z (initial), 2026-05-15T20:45:36Z (follow-up: findings 9–10), 2026-05-15T21:18:00Z (follow-up: findings 12–15), 2026-05-15T21:42:51Z (follow-up: verify F1–F15, findings 16–19)
+**Date:** 2026-05-15T17:07:47Z (initial), 2026-05-15T20:45:36Z (follow-up: findings 9–10), 2026-05-15T21:18:00Z (follow-up: findings 12–15), 2026-05-15T21:42:51Z (follow-up: verify F1–F15, findings 16–19), 2026-05-15T22:24:35Z (follow-up: verify F1–F19, findings 20–23)
 **Branch:** phase8
 **Reviewed by:** Claude (review command)
 **Scope:** PR #7 — Dockerfile, GitHub Actions CI/CD, example configs, deployment/ops/protocol docs
@@ -1403,6 +1403,277 @@ A first-time contributor copying these three lines hits a config error within se
 
 ---
 
+### Finding 20 — Dispatcher does not catch SIGTERM; production `docker stop` and Kubernetes pod-termination skip graceful shutdown
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `crates/bin/src/main.rs:233-243`, `docker/Dockerfile:59` |
+| **Severity** | High |
+| **Category** | Correctness / Concurrency |
+
+**Problem**
+
+Phase 8's whole purpose is to package the dispatcher as a production-ready container image, and both `docker/Dockerfile` and `docs/deployment.md` set up Docker + Kubernetes deployment paths. Those paths rely on **SIGTERM** for graceful shutdown:
+
+- `docker stop` sends `SIGTERM` to PID 1 by default, then `SIGKILL` after the grace period (default 10 s).
+- The Kubernetes kubelet sends `SIGTERM` at pod termination, then `SIGKILL` after `terminationGracePeriodSeconds` (default 30 s).
+
+The signal-handling task installed in `crates/bin/src/main.rs` only listens via `tokio::signal::ctrl_c()`, which on Unix is documented to register a handler for **`SIGINT` only** — `SIGTERM` is not caught. The default Linux disposition for an uncaught `SIGTERM` is "terminate," so the kernel kills the process without running the shutdown token, the JoinSet drain, or the tracer flush. Net effect under Docker/Kubernetes:
+
+- In-flight HTTP webhook deliveries are aborted mid-call; their rows stay locked until `locked_until` expires, delaying retry by `handler_timeout + lock_buffer` seconds.
+- The LISTEN connection is dropped without an unsubscribe.
+- Buffered OpenTelemetry spans for the final cycle are discarded (`tracer_provider.shutdown()` never runs).
+- The reassuring log line `"received SIGINT/SIGTERM, requesting shutdown"` is itself misleading — only SIGINT can fire it.
+
+The Rust source for this lives outside the PR's diff, so this is technically a pre-existing bug, but Phase 8 is what makes it operationally relevant (no one was running this as PID 1 before).
+
+**Context** (surrounding code as it exists today)
+
+```rust
+// crates/bin/src/main.rs lines 228-244
+// Signal handler: cancel the shutdown token on SIGINT/Ctrl-C. Also exits
+// cleanly when the token is cancelled by any other path (e.g. admin bind
+// failure) so the JoinSet can drain uniformly.
+{
+    let shutdown_clone = shutdown.clone();
+    workers.spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT/SIGTERM, requesting shutdown");
+                shutdown_clone.cancel();
+            }
+            _ = shutdown_clone.cancelled() => {
+                // Another path triggered shutdown — exit cleanly.
+            }
+        }
+    });
+}
+```
+
+```dockerfile
+# docker/Dockerfile lines 56-59 — no STOPSIGNAL override, defaults to SIGTERM
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD wget -qO- http://localhost:9090/health || exit 1
+
+ENTRYPOINT ["/app/outbox-dispatcher"]
+```
+
+**Recommended fix**
+
+Add an explicit SIGTERM handler alongside the existing SIGINT one. Use `tokio::select!` to race them so whichever arrives first cancels the shutdown token:
+
+```rust
+// crates/bin/src/main.rs — replace the signal-handler block
+{
+    let shutdown_clone = shutdown.clone();
+    workers.spawn(async move {
+        #[cfg(unix)]
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        )
+        .expect("install SIGTERM handler");
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT, requesting shutdown");
+                shutdown_clone.cancel();
+            }
+            #[cfg(unix)]
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, requesting shutdown");
+                shutdown_clone.cancel();
+            }
+            _ = shutdown_clone.cancelled() => {
+                // Another path triggered shutdown — exit cleanly.
+            }
+        }
+    });
+}
+```
+
+The `#[cfg(unix)]` guard keeps the Windows build working (Windows uses CTRL-BREAK instead). As a much smaller but partial alternative, the Dockerfile can declare `STOPSIGNAL SIGINT` so `docker stop` sends SIGINT instead of SIGTERM — that addresses Docker but not Kubernetes (kubelet always sends SIGTERM regardless of `STOPSIGNAL`).
+
+**Why this fix**
+
+Linux production environments deliver `SIGTERM` for orderly shutdown; not catching it means every replica replacement, rolling restart, or `docker stop` leaves a few in-flight deliveries locked for the full `handler_timeout + lock_buffer` window and silently drops the final batch of telemetry spans. This is exactly the failure mode the rest of Phase 7/8 was built to prevent.
+
+---
+
+### Finding 21 — Quick-start `docker compose up` references a published image that does not exist before the first release
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `examples/docker-compose.with-postgres.yml:30`, `README.md:61-66`, `docs/deployment.md:10-22` |
+| **Severity** | Medium |
+| **Category** | Documentation / Correctness |
+
+**Problem**
+
+The headline quick-start in both `README.md` and `docs/deployment.md` is:
+
+```bash
+docker compose -f examples/docker-compose.with-postgres.yml up -d
+```
+
+`examples/docker-compose.with-postgres.yml` sets `image: ghcr.io/volodymyrd/outbox-dispatcher:latest` (with the `build:` stanza commented out). `release.yml` publishes that image only when a tag `v*.*.*` is pushed — until the first release exists, `:latest` is a 404. Every new user who runs the quick-start before the first GHCR release sees a `manifest unknown` / `pull access denied` error on `docker compose up`. The two-line workaround ("Or build locally: build: context: ..") is commented out in the compose file but never mentioned in the README/deployment quick-start prose, so users have to read the YAML to discover it.
+
+This compounds with the project being open-source and pre-1.0: the **first** thing a curious visitor tries is the quick-start, and on a fresh clone the most likely outcome is a failure that has nothing to do with the dispatcher itself.
+
+**Context** (surrounding code as it exists today)
+
+```yaml
+# examples/docker-compose.with-postgres.yml lines 29-34
+  dispatcher:
+    image: ghcr.io/volodymyrd/outbox-dispatcher:latest
+    # Or build locally:
+    # build:
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
+```
+
+```markdown
+<!-- README.md lines 61-66 -->
+```bash
+# 1. Start Postgres + dispatcher with a single compose command
+export ADMIN_TOKEN="$(openssl rand -hex 32)"
+cp examples/config.production.toml examples/config.prod.toml
+# Edit examples/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
+docker compose -f examples/docker-compose.with-postgres.yml up -d
+```
+```
+
+**Recommended fix**
+
+Either pin a known-existing image tag in the compose file and document publishing as a prerequisite, or default to the local-build path so the quick-start always works. The latter has zero failure modes pre-release:
+
+```yaml
+# examples/docker-compose.with-postgres.yml lines 29-34
+  dispatcher:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # Or, to consume the published image instead:
+    # image: ghcr.io/volodymyrd/outbox-dispatcher:1.0.0
+```
+
+And update the README quick-start to note the first-run build:
+
+```markdown
+# 1. Start Postgres + dispatcher (first run builds the image locally — ~3 min)
+export ADMIN_TOKEN="$(openssl rand -hex 32)"
+cp examples/config.production.toml examples/config.prod.toml
+# Edit examples/config.prod.toml: set [signing_keys] entries, tune [dispatch], etc.
+docker compose -f examples/docker-compose.with-postgres.yml up -d --build
+```
+
+Once a real release exists, flip the comment so `image:` is the default and the local build is the fallback.
+
+**Why this fix**
+
+The README quick-start is the project's first impression. A copy-paste-able command that fails for everyone for the entire pre-release window is worse than no quick-start at all — and `cargo-chef` plus the new `.dockerignore` make the local build genuinely fast.
+
+---
+
+### Finding 22 — README architecture diagram has a one-character misalignment on the `outbox_deliveries` box
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `README.md:42-57` |
+| **Severity** | Low |
+| **Category** | Documentation |
+
+**Problem**
+
+The ASCII architecture diagram uses 16 `─` glyphs for the box borders, but the `outbox_deliveries` text inside one box is 17 characters wide, so the right-hand border sticks out by one cell in any monospace renderer:
+
+```
+┌────────────────┐    ← 16 chars
+│outbox_deliveries│   ← 17 chars
+└────────────────┘    ← 16 chars
+```
+
+Purely cosmetic, but a misaligned diagram on the README's "Architecture at a glance" section subtly undermines the visual polish the rest of the README invests in.
+
+**Context** (surrounding code as it exists today)
+
+```markdown
+<!-- README.md lines 42-57 -->
+                                                              ┌────────────────┐
+                                                              │outbox_deliveries│
+                                                              └────────────────┘
+```
+
+**Recommended fix**
+
+Widen the box borders to 17 cells (or shorten the label). Widening keeps the table layout consistent with the other boxes which have small interior padding:
+
+```markdown
+                                                              ┌─────────────────┐
+                                                              │outbox_deliveries│
+                                                              └─────────────────┘
+```
+
+**Why this fix**
+
+A one-character extension fixes the alignment without re-flowing the rest of the diagram.
+
+---
+
+### Finding 23 — `docker/docker-compose.example.yml` silently accepts an empty `ADMIN_TOKEN`
+
+| Field | Value |
+|-------|-------|
+| **File:Line** | `docker/docker-compose.example.yml:39` |
+| **Severity** | Low |
+| **Category** | Security / Config |
+
+**Problem**
+
+`examples/docker-compose.with-postgres.yml:42` correctly fails fast if `ADMIN_TOKEN` is unset:
+
+```yaml
+ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN is required}
+```
+
+But the sibling example at `docker/docker-compose.example.yml:39` uses the unchecked form:
+
+```yaml
+ADMIN_TOKEN: ${ADMIN_TOKEN}
+```
+
+If the operator forgets to `export ADMIN_TOKEN=…` before `docker compose up`, the variable expands to an empty string, the dispatcher starts with an empty admin token, and the admin API becomes effectively unauthenticated (depending on how `AdminConfig::validate()` handles empty tokens — even if startup is refused, the diagnostic is "admin token is empty" not "ADMIN_TOKEN env var not set", which is harder to debug). The two compose files should be consistent, and the safer behavior is to fail at compose-time with a clear error.
+
+**Context** (surrounding code as it exists today)
+
+```yaml
+# docker/docker-compose.example.yml lines 36-41
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgres://outbox:${POSTGRES_PASSWORD:-outbox}@postgres:5432/outbox_dispatcher
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      # Add your signing key secrets here, e.g.:
+      # MY_SERVICE_HMAC_SECRET: ${MY_SERVICE_HMAC_SECRET}
+```
+
+**Recommended fix**
+
+Mirror the sibling example's validation:
+
+```yaml
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgres://outbox:${POSTGRES_PASSWORD:-outbox}@postgres:5432/outbox_dispatcher
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?ADMIN_TOKEN is required}
+      # Add your signing key secrets here, e.g.:
+      # MY_SERVICE_HMAC_SECRET: ${MY_SERVICE_HMAC_SECRET}
+```
+
+**Why this fix**
+
+Two examples that target the same audience should share their safety rails. The `:?…` form turns a silent footgun into a one-line compose error that names the variable to set.
+
+---
+
 ## Summary
 
 | # | Title | File:Line | Severity | Category | Status | Notes |
@@ -1426,12 +1697,22 @@ A first-time contributor copying these three lines hits a config error within se
 | 17 | Quick-start `cp examples/config.production.toml config.prod.toml` puts the file at the workspace root, but the compose bind mount `./config.prod.toml` resolves relative to the compose file (`examples/`) — the prod overlay is silently absent | `docs/deployment.md:18`, `examples/docker-compose.with-postgres.yml:51`, `docker/docker-compose.example.yml:46` | High | Correctness | DONE | Changed `cp` destination to `examples/config.prod.toml` in docs/deployment.md and README.md; updated volume comment in examples/docker-compose.with-postgres.yml; updated docker/docker-compose.example.yml usage comment and volume comment to instruct `docker/config.prod.toml` |
 | 18 | Alerting table uses non-literal PromQL range selector (`[2 * poll_interval]`) and `for 2m` inside the expression — invalid PromQL | `docs/operations.md:164-165` | Low | Documentation | DONE | Fixed `[2 * poll_interval]` → `[1m]` with explanatory note; moved `for 2m` out of the PromQL expression into a prose annotation |
 | 19 | README "run from source" quick-start omits `DATABASE_URL` / `ADMIN_TOKEN` — both `cargo run` invocations will fail on a fresh clone | `README.md:70-76` | Low | Documentation | DONE | Added `export DATABASE_URL=...` and `export ADMIN_TOKEN=...` before the `cargo run` commands |
+| 20 | Dispatcher does not catch SIGTERM — `docker stop` and Kubernetes pod-termination skip graceful shutdown, leaving rows locked and dropping the final telemetry batch | `crates/bin/src/main.rs:233-243`, `docker/Dockerfile:59` | High | Correctness / Concurrency | TODO | Pre-existing in `main.rs` (not in PR diff) but becomes operationally relevant with Phase 8's Docker/K8s deployment story. Either add a `tokio::signal::unix::SignalKind::terminate()` handler in `main.rs`, or as a partial Docker-only mitigation add `STOPSIGNAL SIGINT` to the Dockerfile (does not help Kubernetes) |
+| 21 | Quick-start `docker compose up` references `ghcr.io/volodymyrd/outbox-dispatcher:latest`, which does not exist until the first release tag is pushed | `examples/docker-compose.with-postgres.yml:30`, `README.md:61-66`, `docs/deployment.md:10-22` | Medium | Documentation / Correctness | TODO | Default the compose file to `build:` and add `--build` to the README/deployment-quick-start command; flip to `image:` once a real release exists |
+| 22 | README architecture diagram `outbox_deliveries` box is one cell wider than its borders | `README.md:42-57` | Low | Documentation | TODO | Widen the top/bottom borders from 16 to 17 `─` glyphs |
+| 23 | `docker/docker-compose.example.yml` silently accepts an empty `ADMIN_TOKEN` (sibling `examples/docker-compose.with-postgres.yml` uses `${ADMIN_TOKEN:?…}`) | `docker/docker-compose.example.yml:39` | Low | Security / Config | TODO | Replace `${ADMIN_TOKEN}` with `${ADMIN_TOKEN:?ADMIN_TOKEN is required}` |
 
 ## Merge readiness
 
-**Status: READY TO MERGE.**
+**Status: READY TO MERGE — with one follow-up issue strongly recommended.**
 
-All findings (F1–F19) are confirmed DONE. The blocking issues (F16, F17) and the non-blocking issues (F18, F19) have all been addressed.
+Findings F1–F19 are all confirmed DONE in the current branch state. The four new findings from this follow-up pass (F20–F23) are not strict blockers for Phase 8's scope (Docker/CI/docs):
+
+- **F20 (High)** is a pre-existing bug in `crates/bin/src/main.rs` that this PR does not touch but makes operationally relevant. Strongly recommended as a follow-up issue/PR — without SIGTERM handling, every Kubernetes rollout or `docker stop` will leak `locked_until` time and drop the final telemetry batch. Phase 8 ships a working image, but not one that shuts down cleanly under the most common production termination signal.
+- **F21 (Medium)** breaks the README quick-start for every user before the first GHCR release — high visibility, easy fix.
+- **F22, F23 (Low)** are polish items.
+
+None of F20–F23 invalidates the work in this PR; F1–F19's fixes stand correctly. Recommend merging Phase 8 and filing F20 as an immediate follow-up (touches Rust source and a fresh `.sqlx`-free path, so it belongs in its own PR). F21–F23 can be folded into the same follow-up or fixed in-flight before merge if quick to land.
 
 > **Instructions for the implementing LLM:**
 > - Change `TODO` to `DONE` once a finding is fully addressed.
