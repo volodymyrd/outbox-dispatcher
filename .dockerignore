@@ -1,0 +1,25 @@
+# Build artefacts
+target/
+**/target/
+
+# VCS / IDE / OS
+.git/
+.gitignore
+.idea/
+.vscode/
+.DS_Store
+
+# Local secrets — never bake into images
+.env
+.env.toml
+
+# Docs and examples are not needed inside the image
+docs/
+examples/
+code-review/
+GEMINI.md
+README.md
+CLAUDE.md
+
+# Test fixtures / logs
+**/*.log

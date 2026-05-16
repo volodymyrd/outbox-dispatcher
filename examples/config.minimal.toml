@@ -1,0 +1,40 @@
+# Minimal outbox-dispatcher configuration.
+#
+# Suitable for development or low-traffic deployments where defaults are fine.
+# Set required secrets via environment variables before starting.
+#
+# Required environment variables:
+#   DATABASE_URL   postgres://user:pass@host:5432/dbname
+#   ADMIN_TOKEN    any random string (protects the admin API)
+#
+# Usage (local dev):
+#   cp examples/config.minimal.toml envs/app_config_local.toml
+#   DATABASE_URL=... ADMIN_TOKEN=... cargo run
+#
+# Usage (Docker):
+#   DATABASE_URL=... ADMIN_TOKEN=... \
+#     docker run -v $(pwd)/examples/config.minimal.toml:/app/envs/app_config_prod.toml \
+#     ghcr.io/your-org/outbox-dispatcher
+
+[database]
+# Set via DATABASE_URL env var or directly here (not recommended for secrets).
+url = ""
+
+[admin]
+bind = "0.0.0.0:9090"
+# auth_token: set via ADMIN_TOKEN env var.
+
+[log]
+format = "pretty"   # use "json" in production
+filter = "info"
+
+[dispatch]
+# Disable security checks for local dev convenience.
+# Remove both flags in production.
+allow_unsigned_callbacks = true
+allow_insecure_urls = true
+
+# No signing keys needed when allow_unsigned_callbacks = true.
+# To enable HMAC signing, remove the flag above and add:
+# [signing_keys]
+# "my-key-v1" = { secret_env = "MY_HMAC_SECRET" }

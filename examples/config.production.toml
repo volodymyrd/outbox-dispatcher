@@ -1,0 +1,79 @@
+# Production outbox-dispatcher configuration.
+#
+# Copy to your deployment and override values via environment variables or
+# a secrets manager. Never commit secrets (signing key values, tokens) to VCS.
+#
+# Required environment variables:
+#   DATABASE_URL          postgres://user:pass@host:5432/dbname
+#   ADMIN_TOKEN           long random string — protects the admin API
+#   <key>.secret_env      one env var per signing key listed in [signing_keys]
+#
+# The dispatcher loads config in this priority order (last wins):
+#   1. envs/app_config.toml       — baked-in defaults
+#   2. envs/app_config_prod.toml  — this file (APP_ENV=prod)
+#   3. .env.toml                  — local secrets (gitignored, optional)
+#   4. APP__* env vars            — highest-priority overrides
+
+[database]
+url = ""               # set via DATABASE_URL env var
+max_connections = 20
+acquire_timeout_secs = 10
+
+[dispatch]
+poll_interval_secs = 5
+batch_size = 50
+dispatch_concurrency = 16
+schedule_batch_size = 500
+max_attempts = 6
+backoff_secs = [30, 120, 600, 3600, 21600, 86400]
+handler_timeout_secs = 30
+lock_buffer_secs = 10
+external_timeout_sweep_interval_secs = 60
+max_completion_cycles = 20
+payload_size_limit_bytes = 1048576   # 1 MiB
+notify_channel = "outbox_events_new"
+allow_insecure_urls = false
+allow_unsigned_callbacks = false
+allow_private_ip_targets = false
+max_callbacks_per_event = 32
+
+[log]
+format = "json"
+filter = "info,sqlx=warn"
+
+[admin]
+bind = "0.0.0.0:9090"
+# auth_token: set via ADMIN_TOKEN env var — never hardcode here.
+
+[http_client]
+connect_timeout_secs = 5
+user_agent = "outbox-dispatcher/1.0"
+allow_insecure_tls = false   # never enable in production
+
+[retention]
+enabled = true
+processed_retention_days = 7
+dead_letter_retention_days = 30
+cleanup_interval_secs = 3600
+batch_limit = 1000
+
+[observability]
+metrics_bind = "0.0.0.0:9091"
+# otel_endpoint: OTLP gRPC endpoint for distributed traces, e.g.:
+# otel_endpoint = "http://otel-collector:4317"
+otel_endpoint = ""
+stats_sample_interval_secs = 30
+
+# ── Signing keys ──────────────────────────────────────────────────────────────
+# Map each key id used in publisher callbacks to the env var that holds the
+# base64-encoded HMAC-SHA256 secret (≥32 decoded bytes).
+#
+# Example: a publisher writes `"signing_key_id": "payments-v1"` in its
+# callback definition.  Add it here and export the secret at runtime:
+#
+#   export PAYMENTS_HMAC_SECRET="$(openssl rand -base64 48)"
+#
+# [signing_keys]
+# "payments-v1" = { secret_env = "PAYMENTS_HMAC_SECRET" }
+# "notifications-v1" = { secret_env = "NOTIFICATIONS_HMAC_SECRET" }
+[signing_keys]
